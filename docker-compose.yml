@@ -1,0 +1,30 @@
+# Docker Compose for local testing
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - DATABASE_URL=${DATABASE_URL}
+      - LOG_CHANNEL_ID=${LOG_CHANNEL_ID}
+      - NAME_SIMILARITY_THRESHOLD=${NAME_SIMILARITY_THRESHOLD:-85}
+      - PFP_HASH_THRESHOLD=${PFP_HASH_THRESHOLD:-10}
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=anti_impersonator_bot
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

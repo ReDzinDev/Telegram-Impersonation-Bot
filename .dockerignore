@@ -1,0 +1,11 @@
+# Add Docker-specific ignores
+.dockerignore
+docker-compose.yml
+.git
+.gitignore
+*.md
+__pycache__
+*.pyc
+.env
+.venv
+venv/
