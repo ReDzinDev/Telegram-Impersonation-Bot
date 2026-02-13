@@ -5,14 +5,21 @@ from src.config import DATABASE_URL, logging
 
 logger = logging.getLogger(__name__)
 
-def get_connection():
-    """Establishes connection to the database."""
-    try:
-        conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
-        return conn
-    except Exception as e:
-        logger.error(f"Error connecting to database: {e}")
-        return None
+import time
+
+def get_connection(retries=5, delay=2):
+    """Establishes connection to the database with retries for sleeping instances."""
+    for attempt in range(retries):
+        try:
+            conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+            return conn
+        except Exception as e:
+            if attempt < retries - 1:
+                logger.warning(f"Database connection failed (attempt {attempt + 1}/{retries}). It might be sleeping. Retrying in {delay}s... Error: {e}")
+                time.sleep(delay)
+            else:
+                logger.error(f"Error connecting to database after {retries} attempts: {e}")
+                return None
 
 def init_db():
     """Initializes database tables."""
