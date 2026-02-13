@@ -78,29 +78,47 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
             # full_name already computed
             match, matched_val, score = check_name_similarity(full_name, names, NAME_SIMILARITY_THRESHOLD)
             logger.info(f"Name check result: match={match}, score={score}, matched='{matched_val}', threshold={NAME_SIMILARITY_THRESHOLD}")
-            if match:
+            
+            # Heuristic: Match is "weak" if either name is a single word
+            is_weak_name_match = match and (len(full_name.split()) <= 1 or len(matched_val.split()) <= 1)
+            
+            if match and not is_weak_name_match:
+                 logger.info(f"Strong name match detected ('{full_name}' vs '{matched_val}'). Banning.")
                  await ban_and_log(update, context, user, "name", matched_val, score, whitelisted, conn)
                  return
 
             # 3. Check PFP
             photos = await user.get_profile_photos(limit=1)
             logger.info(f"User has {photos.total_count} profile photos")
-            if photos.total_count > 0:
-                photo_file = await photos.photos[0][-1].get_file()
-                file_content = await photo_file.download_as_bytearray()
-                target_hash = compute_pfp_hash_bytes(bytes(file_content))
-                
-                logger.info(f"Computed PFP hash: {target_hash}")
-                
-                if target_hash:
-                    # check_pfp_similarity returns (match, matched_hash, distance)
-                    # Note: score here is distance (lower is better check logic in utils)
-                    match, matched_val, dist = check_pfp_similarity(target_hash, pfp_hashes, PFP_HASH_THRESHOLD)
-                    logger.info(f"PFP check result: match={match}, distance={dist}, threshold={PFP_HASH_THRESHOLD}")
-                    if match:
-                         await ban_and_log(update, context, user, "pfp", matched_val, dist, whitelisted, conn)
-                         return
             
+            target_hash = None
+            pfp_match = False
+            pfp_matched_val = None
+            pfp_dist = 100
+            
+            if photos.total_count > 0:
+                try:
+                    photo_file = await photos.photos[0][-1].get_file()
+                    file_content = await photo_file.download_as_bytearray()
+                    target_hash = compute_pfp_hash_bytes(bytes(file_content))
+                    logger.info(f"Computed PFP hash: {target_hash}")
+                    
+                    if target_hash:
+                        pfp_match, pfp_matched_val, pfp_dist = check_pfp_similarity(target_hash, pfp_hashes, PFP_HASH_THRESHOLD)
+                        logger.info(f"PFP check result: match={pfp_match}, distance={pfp_dist}, threshold={PFP_HASH_THRESHOLD}")
+                except Exception as e:
+                    logger.error(f"Error processing PFP: {e}")
+
+            if pfp_match:
+                 logger.info(f"PFP match detected. Banning.")
+                 await ban_and_log(update, context, user, "pfp", pfp_matched_val, pfp_dist, whitelisted, conn)
+                 return
+            
+            # If it was a weak name match but no PFP match, we let them in
+            if is_weak_name_match:
+                logger.info(f"Weak name match ('{full_name}' vs '{matched_val}') but no PFP match. Allowing user.")
+                return
+
             logger.info(f"No impersonation detected for user {user.id}")
 
     except Exception as e:
