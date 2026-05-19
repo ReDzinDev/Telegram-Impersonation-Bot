@@ -2,10 +2,10 @@
 import asyncio
 import logging
 
-from telegram import BotCommand, Update
+from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, Update
 from telegram.ext import (
     ApplicationBuilder, CallbackQueryHandler, CommandHandler, ChatMemberHandler,
-    MessageHandler, filters,
+    MessageHandler, PicklePersistence, filters,
 )
 
 from src.config import (
@@ -33,10 +33,12 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 
 def build_ptb_app(pyro_client=None):
+    persistence = PicklePersistence(filepath="bot_persistence")
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .concurrent_updates(True)
+        .persistence(persistence)
         .build()
     )
 
@@ -111,14 +113,14 @@ async def main():
 
     # Start PTB (non-blocking polling)
     await ptb_app.initialize()
-    await ptb_app.bot.set_my_commands([
+    commands = [
         BotCommand("import_admins",   "Whitelist all current group admins"),
-        BotCommand("whitelist",       "Whitelist a user (reply)"),
+        BotCommand("whitelist",       "Whitelist a user (reply or ID)"),
         BotCommand("unwhitelist",     "Remove from whitelist (reply or ID)"),
         BotCommand("watch",           "Protect a non-admin VIP (reply or ID)"),
         BotCommand("listwhitelist",   "Show all protected users"),
         BotCommand("exportwhitelist", "Download whitelist as CSV"),
-        BotCommand("check",           "Manually check a user (reply)"),
+        BotCommand("check",           "Manually check a user (reply or ID)"),
         BotCommand("ban",             "Manually ban a user (reply or ID)"),
         BotCommand("unban",           "Unban a user by ID"),
         BotCommand("sweep",           "Run a full member scan"),
@@ -126,7 +128,10 @@ async def main():
         BotCommand("setaction",       "Set detection action: ban, kick, or alert"),
         BotCommand("setlogchannel",   "Set per-group log channel"),
         BotCommand("stats",           "Show detection and ban stats"),
-    ])
+    ]
+    # Register commands for both private chats and groups
+    await ptb_app.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
+    await ptb_app.bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
     await ptb_app.start()
     await ptb_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 

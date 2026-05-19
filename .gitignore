@@ -59,6 +59,9 @@ htmlcov/
 *.session
 *.session-journal
 
+# PTB persistence file (stores user_data across restarts)
+bot_persistence
+
 # Railway
 .railway/
 

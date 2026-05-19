@@ -34,11 +34,14 @@ logger = logging.getLogger(__name__)
 def register_event_handlers(pyro: Client, bot: Bot, log_channel_id: str | None):
     """Attach raw-update handlers to the Pyrogram client."""
 
+    # UpdateUserPhoto was removed in newer Telegram API layers; guard with getattr
+    _UpdateUserPhoto = getattr(raw.types, "UpdateUserPhoto", None)
+
     @pyro.on_raw_update()
     async def on_raw_update(client: Client, update, users, chats):
         if isinstance(update, raw.types.UpdateUserName):
             await _handle_name_change(client, bot, update, log_channel_id)
-        elif isinstance(update, raw.types.UpdateUserPhoto):
+        elif _UpdateUserPhoto and isinstance(update, _UpdateUserPhoto):
             await _handle_photo_change(client, bot, update, log_channel_id)
 
 
