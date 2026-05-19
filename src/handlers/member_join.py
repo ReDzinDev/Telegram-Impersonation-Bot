@@ -4,8 +4,9 @@ from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ChatMemberStatus
 
-from src.db import upsert_group, is_whitelisted, get_group
+from src.db import upsert_group, is_whitelisted, get_group, upsert_whitelisted_user, mark_seen
 from src.utils.checker import UserSnapshot, check_user, ban_and_log
+from src.utils.image import compute_pfp_hash_bytes
 from src.config import LOG_CHANNEL_ID
 
 logger = logging.getLogger(__name__)
@@ -50,22 +51,51 @@ async def on_bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TY
 async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = update.chat_member
     new_member = result.new_chat_member
+    old_member = result.old_chat_member
+    user = new_member.user
+    group_id = update.effective_chat.id
 
-    # Only trigger when someone transitions from outside → member/restricted
-    if result.old_chat_member.status not in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED]:
+    # Auto-whitelist when a member is promoted to admin (handles ongoing admin changes
+    # that /import_admins would miss since it's a one-time snapshot).
+    if (
+        new_member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
+        and old_member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
+        and not user.is_bot
+    ):
+        upsert_group(group_id, title=update.effective_chat.title)
+        pfp_hash = None
+        try:
+            photos = await user.get_profile_photos(limit=1)
+            if photos.total_count > 0:
+                f = await photos.photos[0][-1].get_file()
+                pfp_hash = compute_pfp_hash_bytes(bytes(await f.download_as_bytearray()))
+        except Exception:
+            pass
+        upsert_whitelisted_user(
+            group_id=group_id,
+            user_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            pfp_hash=pfp_hash,
+            whitelisted_by=0,
+            user_type="admin",
+        )
+        mark_seen(group_id, user.id)
+        logger.info(f"Auto-whitelisted promoted admin {user.full_name} ({user.id}) in group {group_id}.")
+        return
+
+    # Only continue for fresh joins (not kicks/unbans/demotions)
+    if old_member.status not in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED]:
         return
     if new_member.status not in [ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED]:
         return
 
-    user = new_member.user
     if user.is_bot:
         return
 
-    group_id = update.effective_chat.id
-    group_title = update.effective_chat.title
-
     # Auto-register group if not yet in DB
-    upsert_group(group_id, title=group_title)
+    upsert_group(group_id, title=update.effective_chat.title)
 
     if is_whitelisted(group_id, user.id):
         return
@@ -110,8 +140,11 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     log_notify = None
     if log_channel:
-        async def log_notify(text: str):
-            await context.bot.send_message(chat_id=log_channel, text=text, parse_mode="HTML")
+        async def log_notify(text: str, markup=None, _lc=log_channel):
+            await context.bot.send_message(chat_id=_lc, text=text, parse_mode="HTML", reply_markup=markup)
+
+    async def _unban(gid: int, uid: int):
+        await context.bot.unban_chat_member(chat_id=gid, user_id=uid)
 
     await ban_and_log(
         result=detection,
@@ -120,6 +153,7 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
         trigger="join",
         ban_func=_ban,
         notify_func=_notify,
+        unban_func=_unban,
         log_channel_notify=log_notify,
         invite_link=invite_link,
     )

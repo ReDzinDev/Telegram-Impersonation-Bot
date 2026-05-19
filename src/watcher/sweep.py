@@ -87,8 +87,11 @@ async def sweep_group(
 
                     log_notify = None
                     if log_channel_id:
-                        async def log_notify(text: str, _lcid=log_channel_id):
-                            await bot.send_message(chat_id=_lcid, text=text, parse_mode="HTML")
+                        async def log_notify(text: str, markup=None, _lcid=log_channel_id):
+                            await bot.send_message(chat_id=_lcid, text=text, parse_mode="HTML", reply_markup=markup)
+
+                    async def _unban(gid: int, uid: int):
+                        await bot.unban_chat_member(chat_id=gid, user_id=uid)
 
                     await ban_and_log(
                         result=result,
@@ -97,6 +100,7 @@ async def sweep_group(
                         trigger="sweep",
                         ban_func=_ban,
                         notify_func=_notify,
+                        unban_func=_unban,
                         log_channel_notify=log_notify,
                     )
                 else:
@@ -154,14 +158,15 @@ async def refresh_whitelist_pfps(pyro: Client, group_id: int):
 
 
 async def run_periodic_sweeps(pyro: Client, bot: Bot, log_channel_id: Optional[str] = None):
-    """Background task: sweeps all registered groups every SWEEP_INTERVAL_HOURS hours."""
+    """Background task: sweeps all registered groups on startup and every SWEEP_INTERVAL_HOURS hours."""
+    await asyncio.sleep(30)  # short warmup — let Pyrogram finish auth before first get_chat_members()
     while True:
-        await asyncio.sleep(SWEEP_INTERVAL_HOURS * 3600)
         group_ids = get_all_group_ids()
-        logger.info(f"Starting periodic sweep of {len(group_ids)} group(s).")
+        logger.info(f"Starting sweep of {len(group_ids)} group(s).")
         for gid in group_ids:
             result = await sweep_group(pyro, bot, gid, log_channel_id)
             logger.info(f"Sweep complete for {gid}: {result}")
+        await asyncio.sleep(SWEEP_INTERVAL_HOURS * 3600)
 
 
 async def _fetch_pfp(pyro: Client, user_id: int) -> Optional[bytes]:

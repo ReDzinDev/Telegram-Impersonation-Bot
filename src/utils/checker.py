@@ -9,6 +9,8 @@ import logging
 from dataclasses import dataclass
 from typing import Optional, Callable, Awaitable
 
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+
 from src.db import (
     get_whitelist, is_whitelisted, insert_log, get_group,
     mark_seen, unmark_seen,
@@ -18,6 +20,14 @@ from src.utils.image import compute_pfp_hash_bytes, check_pfp_similarity
 from src.config import NAME_SIMILARITY_THRESHOLD, PFP_HASH_THRESHOLD, LOG_CHANNEL_ID
 
 logger = logging.getLogger(__name__)
+
+# Telegram sentinel accounts that post on behalf of groups/channels.
+# Both have is_bot=True but we guard here as belt-and-suspenders for any
+# path (e.g. raw Pyrogram updates) that may not have checked is_bot first.
+_SKIP_USER_IDS: frozenset[int] = frozenset({
+    1087968824,  # GroupAnonymousBot  — anonymous admin messages
+    136817688,   # Channel Bot        — linked-channel posts in groups
+})
 
 
 @dataclass
@@ -48,6 +58,9 @@ async def check_user(
     Run all impersonation checks for a user against the group's whitelist.
     Returns a DetectionResult — does NOT ban; callers decide what to do.
     """
+    if snapshot.user_id in _SKIP_USER_IDS:
+        return DetectionResult(flagged=False)
+
     if is_whitelisted(group_id, snapshot.user_id):
         return DetectionResult(flagged=False)
 
@@ -123,29 +136,42 @@ async def ban_and_log(
     trigger: str,
     ban_func: Callable[[int, int], Awaitable],
     notify_func: Callable[[int, str], Awaitable],
-    log_channel_notify: Optional[Callable[[str], Awaitable]] = None,
+    unban_func: Optional[Callable[[int, int], Awaitable]] = None,
+    log_channel_notify: Optional[Callable[[str, Optional[InlineKeyboardMarkup]], Awaitable]] = None,
     invite_link: Optional[str] = None,
 ):
     """
-    Execute a ban, write to the DB log, and send notifications.
+    Execute a ban/kick/alert based on the group's action_mode, write to DB log,
+    and send notifications with inline action buttons on the log channel message.
 
-    ban_func(group_id, user_id) — framework-agnostic; pass a lambda wrapping
-        either context.bot.ban_chat_member or pyro_client.ban_chat_member.
-    notify_func(group_id, html_text) — sends a message to the group.
-    log_channel_notify(html_text) — optional, sends to the log channel.
-    invite_link — the invite link URL used to join (if available, join events only).
+    ban_func(group_id, user_id)   — wraps bot.ban_chat_member or pyro equivalent.
+    unban_func(group_id, user_id) — required for 'kick' mode (ban + immediate unban).
+    notify_func(group_id, html)   — sends a message to the group chat.
+    log_channel_notify(html, markup) — optional; sends to the log channel with buttons.
     """
     full_name = f"{snapshot.first_name} {snapshot.last_name or ''}".strip()
     target_display = result.target_name or "Unknown"
 
+    # Determine configured action for this group
+    group = get_group(group_id)
+    action_mode = (group.get("action_mode", "ban") if group else None) or "ban"
+
     action = "failed"
-    try:
-        await ban_func(group_id, snapshot.user_id)
-        action = "banned"
-        logger.info(f"Banned {snapshot.user_id} in {group_id} via {trigger} ({result.match_type})")
-    except Exception as e:
-        action = f"ban_failed: {e}"
-        logger.error(f"Failed to ban {snapshot.user_id} in {group_id}: {e}")
+    if action_mode == "alert":
+        action = "alerted"
+        logger.info(f"Alert (no ban) for {snapshot.user_id} in {group_id} via {trigger} ({result.match_type})")
+    else:
+        try:
+            await ban_func(group_id, snapshot.user_id)
+            if action_mode == "kick" and unban_func:
+                await unban_func(group_id, snapshot.user_id)
+                action = "kicked"
+            else:
+                action = "banned"
+            logger.info(f"{action.capitalize()} {snapshot.user_id} in {group_id} via {trigger} ({result.match_type})")
+        except Exception as e:
+            action = f"ban_failed: {e}"
+            logger.error(f"Failed to ban {snapshot.user_id} in {group_id}: {e}")
 
     insert_log(
         group_id=group_id,
@@ -162,9 +188,11 @@ async def ban_and_log(
         invite_link=invite_link,
     )
 
-    invite_line = f"\nInvite link: <code>{invite_link}</code>" if invite_link else ""
+    action_emoji = {"banned": "🚫", "kicked": "👟", "alerted": "⚠️"}.get(action, "❌")
+    action_verb  = {"banned": "banned", "kicked": "kicked", "alerted": "flagged (alert only)"}.get(action, action)
+    invite_line  = f"\nInvite link: <code>{invite_link}</code>" if invite_link else ""
     group_msg = (
-        f"🚫 <b>Impersonator banned</b>\n"
+        f"{action_emoji} <b>Impersonator {action_verb}</b>\n"
         f"User: <a href='tg://user?id={snapshot.user_id}'>{full_name}</a> (ID: <code>{snapshot.user_id}</code>)\n"
         f"Reason: Similar <b>{result.match_type}</b> to <b>{target_display}</b>\n"
         f"Match: <code>{result.matched_val}</code> | Score: <code>{result.score}</code>\n"
@@ -190,8 +218,21 @@ async def ban_and_log(
             f"<b>Invite link:</b> {invite_link or 'N/A'}\n"
             f"<b>Action:</b> {action}"
         )
+        # Attach action buttons only when the user was actually banned/kicked
+        keyboard = None
+        if action in ("banned", "kicked"):
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "✅ Unban + Whitelist",
+                    callback_data=f"unban_wl|{group_id}|{snapshot.user_id}",
+                ),
+                InlineKeyboardButton(
+                    "🗑 Dismiss",
+                    callback_data=f"dismiss|{group_id}|{snapshot.user_id}",
+                ),
+            ]])
         try:
-            await log_channel_notify(log_msg)
+            await log_channel_notify(log_msg, keyboard)
         except Exception as e:
             logger.error(f"Failed to send log channel notification: {e}")
 

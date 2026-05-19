@@ -7,7 +7,8 @@ from telegram.constants import ChatMemberStatus, ChatType
 from src.db import (
     get_group, upsert_group,
     upsert_whitelisted_user, remove_whitelisted_user,
-    set_group_check_mode, set_group_log_channel, get_stats, mark_seen,
+    set_group_check_mode, set_group_action_mode, set_group_log_channel,
+    get_stats, get_latest_log_entry, mark_seen,
 )
 from src.utils.image import compute_pfp_hash_bytes
 from src.config import LOG_CHANNEL_ID
@@ -56,9 +57,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/unban — Unban a user by ID\n"
             "/sweep — Run a full member scan\n"
             "/setmode strict|relaxed — Set message scan mode\n"
+            "/setaction ban|kick|alert — Set detection action\n"
             "/setlogchannel — Set a per-group log channel\n"
             "/watch — Protect a non-admin VIP's identity\n"
             "/listwhitelist — Show all protected users\n"
+            "/exportwhitelist — Download whitelist as CSV\n"
             "/stats — Show group protection stats",
             parse_mode="HTML",
             reply_markup=ReplyKeyboardMarkup(
@@ -373,6 +376,36 @@ async def setmode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ── /setaction ────────────────────────────────────────────────────────────────
+
+async def setaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_admin(update):
+        await update.message.reply_text("Only admins can use this command.")
+        return
+
+    valid = ("ban", "kick", "alert")
+    if not context.args or context.args[0].lower() not in valid:
+        await update.message.reply_text("Usage: /setaction ban|kick|alert\n\n"
+                                        "• ban — permanently ban the impersonator (default)\n"
+                                        "• kick — remove without a permanent ban (can rejoin)\n"
+                                        "• alert — notify only, no action taken")
+        return
+
+    mode = context.args[0].lower()
+    group_id = update.effective_chat.id
+    upsert_group(group_id, title=update.effective_chat.title)
+    set_group_action_mode(group_id, mode)
+
+    desc = {
+        "ban":   "impersonators will be permanently banned",
+        "kick":  "impersonators will be removed (not permanently banned)",
+        "alert": "detections are logged and notified — no action taken",
+    }[mode]
+    await update.message.reply_text(
+        f"✅ Action mode set to <b>{mode}</b> — {desc}.", parse_mode="HTML"
+    )
+
+
 # ── /listwhitelist ────────────────────────────────────────────────────────────
 
 async def list_whitelist(update: Update, _context: ContextTypes.DEFAULT_TYPE):
@@ -590,4 +623,96 @@ async def watch_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👁 <b>{full_name}</b> (ID: <code>{pyro_user.id}</code>) is now watched.",
         parse_mode="HTML",
+    )
+
+
+# ── Detection alert inline buttons ────────────────────────────────────────────
+
+async def handle_detection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles inline button presses on log-channel detection alerts.
+
+    Callback data format: "<action>|<group_id>|<user_id>"
+      unban_wl  — unban the user and add them to the whitelist
+      dismiss   — remove the buttons without taking action
+    """
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split("|")
+    if len(parts) != 3:
+        return
+
+    action, group_id, user_id = parts[0], int(parts[1]), int(parts[2])
+    admin_name = query.from_user.full_name
+
+    if action == "dismiss":
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.answer("Dismissed.", show_alert=False)
+        return
+
+    if action == "unban_wl":
+        try:
+            await context.bot.unban_chat_member(
+                chat_id=group_id, user_id=user_id, only_if_banned=True
+            )
+        except Exception as e:
+            await query.answer(f"Unban failed: {e}", show_alert=True)
+            return
+
+        # Reconstruct user info from the most recent log entry so we can whitelist them
+        entry = get_latest_log_entry(group_id, user_id)
+        if entry:
+            name_parts = (entry.get("full_name") or "").split(maxsplit=1)
+            first_name = name_parts[0] if name_parts else "Unknown"
+            last_name  = name_parts[1] if len(name_parts) > 1 else None
+            username   = entry.get("username")
+        else:
+            first_name, last_name, username = "Unknown", None, None
+
+        upsert_whitelisted_user(
+            group_id=group_id,
+            user_id=user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            pfp_hash=None,
+            whitelisted_by=query.from_user.id,
+            user_type="manual",
+        )
+
+        # Remove the buttons and append a status footer to the original message
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.answer(f"Unbanned + whitelisted by {admin_name}.", show_alert=False)
+
+
+# ── /exportwhitelist ──────────────────────────────────────────────────────────
+
+async def export_whitelist(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Export the group whitelist as a CSV file attachment."""
+    import csv
+    import io
+    from telegram import InputFile
+
+    if not await _is_admin(update):
+        await update.message.reply_text("Only admins can use this command.")
+        return
+
+    from src.db import get_whitelist
+    rows = get_whitelist(update.effective_chat.id)
+
+    if not rows:
+        await update.message.reply_text("No protected users yet. Run /import_admins first.")
+        return
+
+    buf = io.StringIO()
+    fieldnames = ["user_id", "username", "first_name", "last_name", "user_type", "created_at"]
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+
+    file_bytes = io.BytesIO(buf.getvalue().encode("utf-8"))
+    await update.message.reply_document(
+        document=InputFile(file_bytes, filename="whitelist.csv"),
+        caption=f"Whitelist export — {len(rows)} protected user(s).",
     )

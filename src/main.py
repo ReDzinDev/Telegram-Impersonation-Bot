@@ -4,7 +4,7 @@ import logging
 
 from telegram import BotCommand, Update
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ChatMemberHandler,
+    ApplicationBuilder, CallbackQueryHandler, CommandHandler, ChatMemberHandler,
     MessageHandler, filters,
 )
 
@@ -16,7 +16,8 @@ from src.db import init_db
 from src.handlers.commands import (
     start, handle_chat_shared, import_admins, whitelist_user,
     unwhitelist_user, check_user_cmd, ban_user, unban_user,
-    sweep, setmode, set_log_channel, list_whitelist, stats, watch_user,
+    sweep, setmode, setaction, set_log_channel, list_whitelist, stats,
+    watch_user, handle_detection_callback, export_whitelist,
 )
 from src.handlers.member_join import check_impersonation, on_bot_added_to_group
 from src.handlers.messages import scan_message_sender
@@ -53,10 +54,17 @@ def build_ptb_app(pyro_client=None):
     app.add_handler(CommandHandler("unban", unban_user))
     app.add_handler(CommandHandler("sweep", sweep))
     app.add_handler(CommandHandler("setmode", setmode))
+    app.add_handler(CommandHandler("setaction", setaction))
     app.add_handler(CommandHandler("setlogchannel", set_log_channel))
     app.add_handler(CommandHandler("listwhitelist", list_whitelist))
+    app.add_handler(CommandHandler("exportwhitelist", export_whitelist))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("watch", watch_user))
+
+    # Inline keyboard callbacks from log-channel detection alerts
+    app.add_handler(CallbackQueryHandler(
+        handle_detection_callback, pattern=r"^(unban_wl|dismiss)\|"
+    ))
 
     # Private group-picker flow
     app.add_handler(MessageHandler(filters.StatusUpdate.CHAT_SHARED, handle_chat_shared))
@@ -104,18 +112,20 @@ async def main():
     # Start PTB (non-blocking polling)
     await ptb_app.initialize()
     await ptb_app.bot.set_my_commands([
-        BotCommand("import_admins",  "Whitelist all current group admins"),
-        BotCommand("whitelist",      "Whitelist a user (reply)"),
-        BotCommand("unwhitelist",    "Remove from whitelist (reply or ID)"),
-        BotCommand("watch",          "Protect a non-admin VIP (reply or ID)"),
-        BotCommand("listwhitelist",  "Show all protected users"),
-        BotCommand("check",          "Manually check a user (reply)"),
-        BotCommand("ban",            "Manually ban a user (reply or ID)"),
-        BotCommand("unban",          "Unban a user by ID"),
-        BotCommand("sweep",          "Run a full member scan"),
-        BotCommand("setmode",        "Set scan mode: strict or relaxed"),
-        BotCommand("setlogchannel",  "Set per-group log channel"),
-        BotCommand("stats",          "Show detection and ban stats"),
+        BotCommand("import_admins",   "Whitelist all current group admins"),
+        BotCommand("whitelist",       "Whitelist a user (reply)"),
+        BotCommand("unwhitelist",     "Remove from whitelist (reply or ID)"),
+        BotCommand("watch",           "Protect a non-admin VIP (reply or ID)"),
+        BotCommand("listwhitelist",   "Show all protected users"),
+        BotCommand("exportwhitelist", "Download whitelist as CSV"),
+        BotCommand("check",           "Manually check a user (reply)"),
+        BotCommand("ban",             "Manually ban a user (reply or ID)"),
+        BotCommand("unban",           "Unban a user by ID"),
+        BotCommand("sweep",           "Run a full member scan"),
+        BotCommand("setmode",         "Set scan mode: strict or relaxed"),
+        BotCommand("setaction",       "Set detection action: ban, kick, or alert"),
+        BotCommand("setlogchannel",   "Set per-group log channel"),
+        BotCommand("stats",           "Show detection and ban stats"),
     ])
     await ptb_app.start()
     await ptb_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
@@ -144,12 +154,21 @@ async def main():
             run_health_check(pyro_client, ptb_app.bot, LOG_CHANNEL_ID)
         )
 
+    summary_task = None
+    if LOG_CHANNEL_ID:
+        from src.watcher.summary import run_daily_summary
+        summary_task = asyncio.create_task(
+            run_daily_summary(ptb_app.bot, LOG_CHANNEL_ID)
+        )
+
     try:
         await asyncio.Event().wait()  # run forever
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
         logger.info("Shutting down…")
+        if summary_task:
+            summary_task.cancel()
         if pyro_client:
             sweep_task.cancel()
             health_task.cancel()

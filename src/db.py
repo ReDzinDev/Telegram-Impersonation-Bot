@@ -40,6 +40,12 @@ def init_db():
                 );
             """)
 
+            # Migration guard: add action_mode if table already existed without it
+            cur.execute("""
+                ALTER TABLE groups
+                    ADD COLUMN IF NOT EXISTS action_mode TEXT NOT NULL DEFAULT 'ban';
+            """)
+
             # Per-group whitelist of protected users (admins + manual + watched VIPs)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS whitelisted_users (
@@ -200,6 +206,26 @@ def set_group_check_mode(group_id: int, mode: str) -> bool:
         return True
     except Exception as e:
         logger.error(f"set_group_check_mode error: {e}")
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
+
+def set_group_action_mode(group_id: int, mode: str) -> bool:
+    conn = get_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE groups SET action_mode = %s, updated_at = NOW() WHERE group_id = %s",
+                (mode, group_id)
+            )
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"set_group_action_mode error: {e}")
         conn.rollback()
         return False
     finally:
@@ -413,6 +439,25 @@ def insert_log(group_id: int, user_id: int, username: str, full_name: str,
     except Exception as e:
         logger.error(f"insert_log error: {e}")
         conn.rollback()
+    finally:
+        conn.close()
+
+
+def get_latest_log_entry(group_id: int, user_id: int) -> dict | None:
+    """Return the most recent log row for a user in a group (used by callback handlers)."""
+    conn = get_connection()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM logs WHERE group_id = %s AND user_id = %s ORDER BY created_at DESC LIMIT 1",
+                (group_id, user_id)
+            )
+            return cur.fetchone()
+    except Exception as e:
+        logger.error(f"get_latest_log_entry error: {e}")
+        return None
     finally:
         conn.close()
 

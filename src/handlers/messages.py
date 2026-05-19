@@ -105,8 +105,11 @@ async def scan_message_sender(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     log_notify = None
     if log_channel:
-        async def log_notify(text: str):
-            await context.bot.send_message(chat_id=log_channel, text=text, parse_mode="HTML")
+        async def log_notify(text: str, markup=None, _lc=log_channel):
+            await context.bot.send_message(chat_id=_lc, text=text, parse_mode="HTML", reply_markup=markup)
+
+    async def _unban(gid: int, uid: int):
+        await context.bot.unban_chat_member(chat_id=gid, user_id=uid)
 
     await ban_and_log(
         result=detection,
@@ -115,5 +118,6 @@ async def scan_message_sender(update: Update, context: ContextTypes.DEFAULT_TYPE
         trigger="message",
         ban_func=_ban,
         notify_func=_notify,
+        unban_func=_unban,
         log_channel_notify=log_notify,
     )
