@@ -1,184 +1,125 @@
 
+import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ChatMemberStatus
-from src.db import get_connection
-from src.utils.detector import check_username_similarity, check_name_similarity, check_homoglyph_danger
-from src.utils.image import compute_pfp_hash_bytes, check_pfp_similarity
-from src.config import NAME_SIMILARITY_THRESHOLD, PFP_HASH_THRESHOLD, LOG_CHANNEL_ID
-import logging
+
+from src.db import upsert_group, is_whitelisted, get_group
+from src.utils.checker import UserSnapshot, check_user, ban_and_log
+from src.config import LOG_CHANNEL_ID
 
 logger = logging.getLogger(__name__)
+
+
+async def on_bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Fires when the bot's own membership status changes (MY_CHAT_MEMBER updates).
+    Used to auto-register new groups the moment the bot is added.
+    """
+    my = update.my_chat_member
+    if not my:
+        return
+
+    bot_id = context.bot.id
+    if my.new_chat_member.user.id != bot_id:
+        return
+
+    new_status = my.new_chat_member.status
+    chat = update.effective_chat
+
+    if new_status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR]:
+        upsert_group(chat.id, title=chat.title)
+        logger.info(f"Bot added to group {chat.title} ({chat.id}) — registered.")
+
+        log_channel = context.bot_data.get("log_channel_id") or LOG_CHANNEL_ID
+        if log_channel:
+            try:
+                await context.bot.send_message(
+                    chat_id=log_channel,
+                    text=(
+                        f"➕ <b>Bot added to new group</b>\n"
+                        f"<b>{chat.title}</b> (<code>{chat.id}</code>)\n\n"
+                        f"Run /import_admins in that group to populate the whitelist."
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
 
 async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = update.chat_member
     new_member = result.new_chat_member
-    
-    # Trigger ONLY on new members joining from a 'left' or 'banned' state
+
+    # Only trigger when someone transitions from outside → member/restricted
     if result.old_chat_member.status not in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED]:
-        return 
-    
+        return
     if new_member.status not in [ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED]:
-        return 
+        return
 
     user = new_member.user
     if user.is_bot:
         return
-        
-    logger.info(f"Checking new member {user.full_name} ({user.id}) for impersonation.")
-    
-    conn = get_connection()
-    if not conn:
+
+    group_id = update.effective_chat.id
+    group_title = update.effective_chat.title
+
+    # Auto-register group if not yet in DB
+    upsert_group(group_id, title=group_title)
+
+    if is_whitelisted(group_id, user.id):
         return
 
+    # Capture the invite link used to join (None for public joins / admin adds)
+    invite_link: str | None = None
+    if update.chat_member.invite_link:
+        invite_link = update.chat_member.invite_link.invite_link
+
+    logger.info(f"New member {user.full_name} ({user.id}) in group {group_id} — running check.")
+
+    # Fetch profile photo
+    pfp_bytes = None
     try:
-        with conn.cursor() as cur:
-            # Check if user is already whitelisted
-            cur.execute("SELECT 1 FROM whitelisted_users WHERE user_id = %s", (user.id,))
-            if cur.fetchone():
-                logger.info(f"User {user.id} is whitelisted.")
-                return 
-
-            # Fetch all whitelisted users
-            cur.execute("SELECT user_id, username, first_name, last_name, pfp_hash FROM whitelisted_users")
-            whitelisted = cur.fetchall()
-            
-            # Prepare lists
-            # whitelisted is a list of dicts because we used RowFactory=dict_row
-            usernames = [w['username'] for w in whitelisted if w['username']]
-            names = [f"{w['first_name']} {w['last_name'] or ''}".strip() for w in whitelisted]
-            pfp_hashes = [w['pfp_hash'] for w in whitelisted if w['pfp_hash']]
-            
-            logger.info(f"Whitelist data: {len(usernames)} usernames, {len(names)} names, {len(pfp_hashes)} pfp hashes")
-            
-            # 1. Check Username
-            if user.username:
-                logger.info(f"Checking username: {user.username} against {len(usernames)} whitelisted usernames")
-                match, matched_val, score = check_username_similarity(user.username, usernames, NAME_SIMILARITY_THRESHOLD)
-                logger.info(f"Username check result: match={match}, score={score}, threshold={NAME_SIMILARITY_THRESHOLD}")
-                if match:
-                    await ban_and_log(update, context, user, "username", matched_val, score, whitelisted, conn)
-                    return
-
-            # 1.5 Check Homoglyphs
-            if user.username and check_homoglyph_danger(user.username):
-                 logger.info(f"Homoglyph detected in username: {user.username}")
-                 await ban_and_log(update, context, user, "homoglyph_username", user.username, 100, [], conn)
-                 return
-            
-            full_name = f"{user.first_name} {user.last_name or ''}".strip()
-            logger.info(f"Checking name: '{full_name}' against {len(names)} whitelisted names")
-            
-            if check_homoglyph_danger(full_name):
-                 logger.info(f"Homoglyph detected in name: {full_name}")
-                 await ban_and_log(update, context, user, "homoglyph_name", full_name, 100, [], conn)
-                 return
-
-            # 2. Check Display Name
-            # full_name already computed
-            match, matched_val, score = check_name_similarity(full_name, names, NAME_SIMILARITY_THRESHOLD)
-            logger.info(f"Name check result: match={match}, score={score}, matched='{matched_val}', threshold={NAME_SIMILARITY_THRESHOLD}")
-            
-            # Heuristic: Match is "weak" if either name is a single word
-            is_weak_name_match = match and (len(full_name.split()) <= 1 or len(matched_val.split()) <= 1)
-            
-            if match and not is_weak_name_match:
-                 logger.info(f"Strong name match detected ('{full_name}' vs '{matched_val}'). Banning.")
-                 await ban_and_log(update, context, user, "name", matched_val, score, whitelisted, conn)
-                 return
-
-            # 3. Check PFP
-            photos = await user.get_profile_photos(limit=1)
-            logger.info(f"User has {photos.total_count} profile photos")
-            
-            target_hash = None
-            pfp_match = False
-            pfp_matched_val = None
-            pfp_dist = 100
-            
-            if photos.total_count > 0:
-                try:
-                    photo_file = await photos.photos[0][-1].get_file()
-                    file_content = await photo_file.download_as_bytearray()
-                    target_hash = compute_pfp_hash_bytes(bytes(file_content))
-                    logger.info(f"Computed PFP hash: {target_hash}")
-                    
-                    if target_hash:
-                        pfp_match, pfp_matched_val, pfp_dist = check_pfp_similarity(target_hash, pfp_hashes, PFP_HASH_THRESHOLD)
-                        logger.info(f"PFP check result: match={pfp_match}, distance={pfp_dist}, threshold={PFP_HASH_THRESHOLD}")
-                except Exception as e:
-                    logger.error(f"Error processing PFP: {e}")
-
-            if pfp_match:
-                 logger.info(f"PFP match detected. Banning.")
-                 await ban_and_log(update, context, user, "pfp", pfp_matched_val, pfp_dist, whitelisted, conn)
-                 return
-            
-            # If it was a weak name match but no PFP match, we let them in
-            if is_weak_name_match:
-                logger.info(f"Weak name match ('{full_name}' vs '{matched_val}') but no PFP match. Allowing user.")
-                return
-
-            logger.info(f"No impersonation detected for user {user.id}")
-
+        photos = await user.get_profile_photos(limit=1)
+        if photos.total_count > 0:
+            photo_file = await photos.photos[0][-1].get_file()
+            pfp_bytes = bytes(await photo_file.download_as_bytearray())
     except Exception as e:
-        logger.error(f"Error checking user: {e}")
-    finally:
-        conn.close()
+        logger.warning(f"Could not fetch PFP for {user.id}: {e}")
 
-async def ban_and_log(update: Update, context: ContextTypes.DEFAULT_TYPE, user, match_type, matched_val, score, whitelisted_rows, conn):
-    chat = update.effective_chat
-    
-    # Determine who was impersonated
-    target_id = None
-    target_name = "Unknown"
-    
-    if match_type == 'username':
-        target = next((row for row in whitelisted_rows if row['username'] == matched_val), None)
-    elif match_type == 'name':
-        target = next((row for row in whitelisted_rows if f"{row['first_name']} {row['last_name'] or ''}".strip() == matched_val), None)
-    elif match_type == 'pfp':
-        target = next((row for row in whitelisted_rows if row['pfp_hash'] == matched_val), None)
-    else:
-        target = None
-        
-    if target:
-        target_id = target['user_id']
-        target_name = f"{target['first_name']} {target['last_name'] or ''}"
+    snapshot = UserSnapshot(
+        user_id=user.id,
+        username=user.username,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        pfp_bytes=pfp_bytes,
+    )
 
-    try:
-        await chat.ban_member(user.id)
-        action = "banned"
-        logger.info(f"Banned user {user.id} for {match_type} similarity.")
-        await chat.send_message(f"🚫 Banned {user.mention_html()} for impersonating {target_name}.", parse_mode='HTML')
-    except Exception as e:
-        action = f"failed_ban: {e}"
-        logger.error(f"Failed to ban user {user.id}: {e}")
+    detection = await check_user(snapshot, group_id)
+    if not detection.flagged:
+        return
 
-    # Log to DB
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO logs (user_id, target_user_id, detection_type, similarity_score, action_taken, details)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (user.id, target_id, match_type, score, action, f"Matched: {matched_val}"))
-            conn.commit()
-    except Exception as e:
-        logger.error(f"Failed to log to DB: {e}")
+    group = get_group(group_id)
+    log_channel = (group["log_channel_id"] if group else None) or context.bot_data.get("log_channel_id") or LOG_CHANNEL_ID
 
-    # Send log to channel
-    if LOG_CHANNEL_ID:
-        try:
-            await context.bot.send_message(
-                chat_id=LOG_CHANNEL_ID,
-                text=f"🚨 **Impersonation Detected** 🚨\n\n"
-                     f"User: {user.mention_html()} (ID: {user.id})\n"
-                     f"Target: {target_name} (ID: {target_id})\n"
-                     f"Reason: Similar {match_type}\n"
-                     f"Match: {matched_val}\n"
-                     f"Score: {score}\n"
-                     f"Action: {action}",
-                parse_mode='HTML'
-            )
-        except Exception as e:
-             logger.error(f"Failed to send log to channel: {e}")
+    async def _ban(gid: int, uid: int):
+        await context.bot.ban_chat_member(chat_id=gid, user_id=uid)
+
+    async def _notify(gid: int, text: str):
+        await context.bot.send_message(chat_id=gid, text=text, parse_mode="HTML")
+
+    log_notify = None
+    if log_channel:
+        async def log_notify(text: str):
+            await context.bot.send_message(chat_id=log_channel, text=text, parse_mode="HTML")
+
+    await ban_and_log(
+        result=detection,
+        snapshot=snapshot,
+        group_id=group_id,
+        trigger="join",
+        ban_func=_ban,
+        notify_func=_notify,
+        log_channel_notify=log_notify,
+        invite_link=invite_link,
+    )

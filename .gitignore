@@ -55,6 +55,10 @@ logs/
 htmlcov/
 .tox/
 
+# Pyrogram local session file (use session strings in env instead)
+*.session
+*.session-journal
+
 # Railway
 .railway/
 

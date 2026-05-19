@@ -1,78 +1,53 @@
 
+import logging
 import imagehash
 from PIL import Image
 from io import BytesIO
-import requests
-import logging
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-def get_image_as_pil(url: str) -> Image.Image:
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        return Image.open(BytesIO(response.content))
-    except Exception as e:
-        logger.error(f"Failed to fetch image from {url}: {e}")
-        return None
 
-
-def compute_pfp_hash_bytes(image_data: bytes) -> str:
-    """
-    Computes hash from image bytes.
-    """
+def compute_pfp_hash_bytes(image_data: bytes) -> Optional[str]:
     if not image_data:
         return None
     try:
         img = Image.open(BytesIO(image_data))
-        h = imagehash.phash(img)
-        return str(h)
+        return str(imagehash.phash(img))
     except Exception as e:
-        logger.error(f"Error computing hash from bytes: {e}")
-        return None
-
-def compute_pfp_hash(image_url: str) -> str:
-    """
-    Computes the perceptual hash of an image from a URL.
-    Returns the hash as a hexadecimal string.
-    """
-    try:
-        response = requests.get(image_url, timeout=10)
-        response.raise_for_status()
-        return compute_pfp_hash_bytes(response.content)
-    except Exception as e:
-        logger.error(f"Error computing hash from URL {image_url}: {e}")
+        logger.error(f"Error computing PFP hash: {e}")
         return None
 
 
-def check_pfp_similarity(target_hash_hex: str, stored_hashes: list[str], threshold: int = 10) -> tuple[bool, str, int]:
+def check_pfp_similarity(
+    target_hex: str, stored_hashes: list[str], threshold: int = 10
+) -> Tuple[bool, Optional[str], int]:
     """
-    Checks if a target hash is similar to any stored hashes.
-    Returns: (Match Found?, Matched Hash, Distance)
-    Lower distance = more similar.
+    Returns (match_found, matched_hash, hamming_distance).
+    Lower distance = more similar. Match when distance <= threshold.
     """
-    if not target_hash_hex:
+    if not target_hex:
         return False, None, 100
 
-    target_hash = imagehash.hex_to_hash(target_hash_hex)
-    
-    best_match = None
-    min_distance = 100 # Arbitrary high value
-    
+    try:
+        target_hash = imagehash.hex_to_hash(target_hex)
+    except ValueError:
+        return False, None, 100
+
+    best_match: Optional[str] = None
+    min_dist = 100
+
     for stored_hex in stored_hashes:
         if not stored_hex:
             continue
         try:
-            stored_hash = imagehash.hex_to_hash(stored_hex)
-            distance = target_hash - stored_hash
-            
-            if distance < min_distance:
-                min_distance = distance
+            dist = target_hash - imagehash.hex_to_hash(stored_hex)
+            if dist < min_dist:
+                min_dist = dist
                 best_match = stored_hex
-        except ValueError: 
-            continue # Invalid hash string in DB
-            
-    if min_distance <= threshold:
-        return True, best_match, min_distance
-        
-    return False, None, min_distance
+        except ValueError:
+            continue
+
+    if min_dist <= threshold:
+        return True, best_match, min_dist
+    return False, None, min_dist

@@ -1,9 +1,9 @@
 
 import os
 import logging
+from typing import Optional
 from dotenv import load_dotenv
 
-# Setup logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -12,35 +12,47 @@ logging.basicConfig(
 load_dotenv()
 
 
-from typing import Optional
-
-def get_env_variable(var_name: str, default: Optional[str] = None, required: bool = True) -> str:
-    value = os.getenv(var_name, default)
-    if required and not value:
-        raise ValueError(f"Environment variable {var_name} is required but missing.")
+def _require(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise ValueError(f"Required environment variable '{name}' is missing.")
     return value
 
-BOT_TOKEN = get_env_variable("BOT_TOKEN")
 
-# Railway provides individual PostgreSQL variables instead of DATABASE_URL
-# Auto-construct DATABASE_URL if not provided
+def _optional(name: str, default: Optional[str] = None) -> Optional[str]:
+    return os.getenv(name, default)
+
+
+BOT_TOKEN = _require("BOT_TOKEN")
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    # Try to build from Railway's individual variables
     pg_user = os.getenv("PGUSER", "postgres")
     pg_password = os.getenv("PGPASSWORD")
     pg_host = os.getenv("PGHOST")
     pg_port = os.getenv("PGPORT", "5432")
     pg_database = os.getenv("PGDATABASE", "railway")
-    
     if pg_host and pg_password:
         DATABASE_URL = f"postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_database}"
-        logging.info("DATABASE_URL constructed from individual PostgreSQL variables")
+        logging.info("DATABASE_URL constructed from individual PostgreSQL variables.")
     else:
-        raise ValueError("DATABASE_URL is required but missing. Please set DATABASE_URL or individual PostgreSQL variables (PGHOST, PGPASSWORD, etc.)")
+        raise ValueError(
+            "DATABASE_URL is required but missing. "
+            "Set DATABASE_URL or individual vars: PGHOST, PGPASSWORD, PGUSER, PGPORT, PGDATABASE."
+        )
 
-LOG_CHANNEL_ID = get_env_variable("LOG_CHANNEL_ID", required=False)
+# Global log channel (can be overridden per-group in DB)
+LOG_CHANNEL_ID: Optional[str] = _optional("LOG_CHANNEL_ID")
 
-# Thresholds
-NAME_SIMILARITY_THRESHOLD = int(get_env_variable("NAME_SIMILARITY_THRESHOLD", "85", required=False))
-PFP_HASH_THRESHOLD = int(get_env_variable("PFP_HASH_THRESHOLD", "10", required=False)) # Hamming distance
+# Pyrogram user client — needed for profile change events and full member sweeps.
+# Generate PYROGRAM_SESSION once locally with: python -c "from pyrogram import Client; ..."
+# See README for setup instructions.
+PYROGRAM_API_ID: Optional[str] = _optional("PYROGRAM_API_ID")
+PYROGRAM_API_HASH: Optional[str] = _optional("PYROGRAM_API_HASH")
+PYROGRAM_SESSION: Optional[str] = _optional("PYROGRAM_SESSION")  # session string
+
+PYROGRAM_ENABLED = bool(PYROGRAM_API_ID and PYROGRAM_API_HASH and PYROGRAM_SESSION)
+
+# Default detection thresholds (can be tuned via env)
+NAME_SIMILARITY_THRESHOLD = int(_optional("NAME_SIMILARITY_THRESHOLD", "85"))
+PFP_HASH_THRESHOLD = int(_optional("PFP_HASH_THRESHOLD", "10"))
