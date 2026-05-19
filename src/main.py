@@ -43,8 +43,6 @@ def build_ptb_app(pyro_client=None):
     )
 
     app.bot_data["log_channel_id"] = LOG_CHANNEL_ID
-    if pyro_client:
-        app.bot_data["pyro_client"] = pyro_client
 
     # Commands
     app.add_handler(CommandHandler("start", start))
@@ -113,6 +111,10 @@ async def main():
 
     # Start PTB (non-blocking polling)
     await ptb_app.initialize()
+    # Set pyro_client AFTER initialize() so PicklePersistence doesn't overwrite it
+    # (Pyrogram Client is not picklable — persisted bot_data would store None)
+    if pyro_client:
+        ptb_app.bot_data["pyro_client"] = pyro_client
     commands = [
         BotCommand("import_admins",   "Whitelist all current group admins"),
         BotCommand("whitelist",       "Whitelist a user (reply or ID)"),
@@ -151,6 +153,16 @@ async def main():
     if pyro_client:
         await pyro_client.start()
         logger.info("Pyrogram client started.")
+
+        # Warm up entity cache — without this, get_chat_members fails with
+        # PEER_ID_INVALID for groups the session has never interacted with.
+        logger.info("Warming up Pyrogram entity cache (iterating dialogs)…")
+        try:
+            async for _ in pyro_client.get_dialogs():
+                pass
+            logger.info("Entity cache ready.")
+        except Exception as e:
+            logger.warning(f"Could not warm up entity cache: {e}")
 
         sweep_task = asyncio.create_task(
             run_periodic_sweeps(pyro_client, ptb_app.bot, LOG_CHANNEL_ID)

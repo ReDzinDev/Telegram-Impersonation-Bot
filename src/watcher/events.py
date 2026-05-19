@@ -145,9 +145,6 @@ async def _check_and_act(
         async def _ban(gid: int, uid: int):
             await bot.ban_chat_member(chat_id=gid, user_id=uid)
 
-        async def _notify(gid: int, text: str):
-            await bot.send_message(chat_id=gid, text=text, parse_mode="HTML")
-
         log_notify = None
         if log_channel_id:
             async def log_notify(text: str, markup=None, _lcid=log_channel_id):
@@ -162,7 +159,6 @@ async def _check_and_act(
             group_id=group_id,
             trigger=trigger,
             ban_func=_ban,
-            notify_func=_notify,
             unban_func=_unban,
             log_channel_notify=log_notify,
         )

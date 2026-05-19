@@ -461,17 +461,29 @@ async def sweep(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    result = await sweep_group(pyro, context.bot, group_id, log_channel, progress_cb=progress)
+    try:
+        result = await sweep_group(pyro, context.bot, group_id, log_channel, progress_cb=progress)
+    except Exception as e:
+        logger.error(f"Sweep command error for {group_id}: {e}")
+        await status_msg.edit_text(f"❌ Sweep failed: <code>{e}</code>", parse_mode="HTML")
+        return
 
     if result.get("status") == "already_running":
-        await status_msg.edit_text("⚠️ A sweep is already running for this group.")
+        await status_msg.edit_text(
+            "⚠️ A background sweep is already running for this group. Try again in a moment."
+        )
         return
+
+    checked = result.get("checked", 0)
+    flagged = result.get("flagged", 0)
+    errors  = result.get("errors", 0)
+    note    = "\n<i>(Admins and already-whitelisted users are skipped.)</i>" if checked == 0 else ""
 
     await status_msg.edit_text(
         f"✅ <b>Sweep complete</b>\n"
-        f"Checked: <code>{result.get('checked', 0)}</code>\n"
-        f"Flagged & banned: <code>{result.get('flagged', 0)}</code>\n"
-        f"Errors: <code>{result.get('errors', 0)}</code>",
+        f"Checked: <code>{checked}</code>\n"
+        f"Flagged & banned: <code>{flagged}</code>\n"
+        f"Errors: <code>{errors}</code>{note}",
         parse_mode="HTML",
     )
 

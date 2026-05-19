@@ -17,6 +17,7 @@ from io import BytesIO
 from typing import Optional
 
 from pyrogram import Client
+from pyrogram.enums import ChatMemberStatus as PyroChatMemberStatus
 from pyrogram.errors import FloodWait, ChatAdminRequired, UserNotParticipant
 from telegram import Bot
 
@@ -27,6 +28,8 @@ from src.utils.image import compute_pfp_hash_bytes
 logger = logging.getLogger(__name__)
 
 SWEEP_INTERVAL_HOURS = 6
+
+
 _sweep_locks: dict[int, asyncio.Lock] = {}
 
 
@@ -54,6 +57,14 @@ async def sweep_group(
         errors = 0
 
         try:
+            # Resolve the peer first — required for new sessions where the entity
+            # isn't yet in Pyrogram's local cache.
+            await pyro.get_chat(group_id)
+        except Exception as e:
+            logger.error(f"Cannot resolve group {group_id} for sweep: {e}")
+            return {"checked": 0, "flagged": 0, "errors": 1}
+
+        try:
             async for member in pyro.get_chat_members(group_id):
                 user = member.user
                 if not user or user.is_bot or user.is_deleted:
@@ -61,6 +72,22 @@ async def sweep_group(
 
                 # Skip whitelisted users immediately
                 if is_whitelisted(group_id, user.id):
+                    continue
+
+                # Auto-whitelist current admins that /import_admins may have missed
+                if member.status in (PyroChatMemberStatus.ADMINISTRATOR, PyroChatMemberStatus.OWNER):
+                    pfp_bytes_admin = await _fetch_pfp(pyro, user.id)
+                    upsert_whitelisted_user(
+                        group_id=group_id,
+                        user_id=user.id,
+                        username=user.username,
+                        first_name=user.first_name or "",
+                        last_name=user.last_name,
+                        pfp_hash=compute_pfp_hash_bytes(pfp_bytes_admin) if pfp_bytes_admin else None,
+                        whitelisted_by=0,
+                        user_type="admin",
+                    )
+                    mark_seen(group_id, user.id)
                     continue
 
                 pfp_bytes = await _fetch_pfp(pyro, user.id)
@@ -82,9 +109,6 @@ async def sweep_group(
                     async def _ban(gid: int, uid: int):
                         await bot.ban_chat_member(chat_id=gid, user_id=uid)
 
-                    async def _notify(gid: int, text: str):
-                        await bot.send_message(chat_id=gid, text=text, parse_mode="HTML")
-
                     log_notify = None
                     if log_channel_id:
                         async def log_notify(text: str, markup=None, _lcid=log_channel_id):
@@ -99,18 +123,18 @@ async def sweep_group(
                         group_id=group_id,
                         trigger="sweep",
                         ban_func=_ban,
-                        notify_func=_notify,
                         unban_func=_unban,
                         log_channel_notify=log_notify,
                     )
                 else:
                     mark_seen(group_id, user.id)
 
-                if progress_cb and checked % 50 == 0:
+                if progress_cb and checked % 10 == 0:
                     await progress_cb(checked, flagged)
 
-                # Respect Telegram rate limits between members
-                await asyncio.sleep(0.05)
+                # Pace requests — PFP downloads hit Telegram's media CDN and
+                # trigger FLOOD_WAIT quickly if members are processed too fast.
+                await asyncio.sleep(0.5)
 
         except FloodWait as e:
             logger.warning(f"Sweep flood wait {e.value}s for group {group_id}")
@@ -158,11 +182,13 @@ async def refresh_whitelist_pfps(pyro: Client, group_id: int):
 
 
 async def run_periodic_sweeps(pyro: Client, bot: Bot, log_channel_id: Optional[str] = None):
-    """Background task: sweeps all registered groups on startup and every SWEEP_INTERVAL_HOURS hours."""
+    """Background task: sweeps all configured groups on startup and every SWEEP_INTERVAL_HOURS hours."""
     await asyncio.sleep(30)  # short warmup — let Pyrogram finish auth before first get_chat_members()
     while True:
-        group_ids = get_all_group_ids()
-        logger.info(f"Starting sweep of {len(group_ids)} group(s).")
+        all_ids = get_all_group_ids()
+        # Only sweep groups that have at least one whitelisted user — others have nothing to check against
+        group_ids = [gid for gid in all_ids if get_whitelist(gid)]
+        logger.info(f"Starting sweep of {len(group_ids)}/{len(all_ids)} group(s) (skipping unconfigured).")
         for gid in group_ids:
             result = await sweep_group(pyro, bot, gid, log_channel_id)
             logger.info(f"Sweep complete for {gid}: {result}")
@@ -178,6 +204,11 @@ async def _fetch_pfp(pyro: Client, user_id: int) -> Optional[bytes]:
             buf.write(chunk)
         return buf.getvalue() or None
     except StopAsyncIteration:
+        return None
+    except FloodWait as e:
+        # DC-level rate limit on media downloads — skip this PFP rather than
+        # blocking the entire sweep for potentially 20+ minutes.
+        logger.warning(f"PFP flood wait {e.value}s for user {user_id} — skipping photo check.")
         return None
     except Exception:
         return None

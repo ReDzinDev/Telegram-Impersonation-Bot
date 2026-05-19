@@ -14,9 +14,10 @@ import logging
 import time
 from telegram import Update
 from telegram.ext import ContextTypes
-from telegram.constants import ChatType
+from telegram.constants import ChatMemberStatus, ChatType
 
-from src.db import get_group, is_whitelisted, is_seen, mark_seen
+from src.db import get_group, is_whitelisted, is_seen, mark_seen, upsert_whitelisted_user
+from src.utils.image import compute_pfp_hash_bytes
 
 # In-memory cache: (group_id, user_id) -> last_checked unix timestamp
 # Only consulted in STRICT mode; RELAXED uses the persistent seen_members table.
@@ -95,13 +96,30 @@ async def scan_message_sender(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not detection.flagged:
         return
 
+    # Guard against false positives on first setup: if the flagged user is actually
+    # a current group admin, whitelist them silently instead of banning.
+    try:
+        member_info = await context.bot.get_chat_member(group_id, user.id)
+        if member_info.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            upsert_whitelisted_user(
+                group_id=group_id,
+                user_id=user.id,
+                username=user.username,
+                first_name=user.first_name,
+                last_name=user.last_name,
+                pfp_hash=compute_pfp_hash_bytes(pfp_bytes) if pfp_bytes else None,
+                whitelisted_by=0,
+                user_type="admin",
+            )
+            logger.info(f"Auto-whitelisted admin {user.id} after false-positive detection in group {group_id}.")
+            return
+    except Exception:
+        pass
+
     log_channel = (group["log_channel_id"] if group else None) or context.bot_data.get("log_channel_id") or LOG_CHANNEL_ID
 
     async def _ban(gid: int, uid: int):
         await context.bot.ban_chat_member(chat_id=gid, user_id=uid)
-
-    async def _notify(gid: int, text: str):
-        await context.bot.send_message(chat_id=gid, text=text, parse_mode="HTML")
 
     log_notify = None
     if log_channel:
@@ -117,7 +135,6 @@ async def scan_message_sender(update: Update, context: ContextTypes.DEFAULT_TYPE
         group_id=group_id,
         trigger="message",
         ban_func=_ban,
-        notify_func=_notify,
         unban_func=_unban,
         log_channel_notify=log_notify,
     )

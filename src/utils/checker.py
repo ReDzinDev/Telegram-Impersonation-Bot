@@ -13,11 +13,10 @@ from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 
 from src.db import (
     get_whitelist, is_whitelisted, insert_log, get_group,
-    mark_seen, unmark_seen,
 )
 from src.utils.detector import check_username_similarity, check_name_similarity, check_homoglyph_danger
 from src.utils.image import compute_pfp_hash_bytes, check_pfp_similarity
-from src.config import NAME_SIMILARITY_THRESHOLD, PFP_HASH_THRESHOLD, LOG_CHANNEL_ID
+from src.config import NAME_SIMILARITY_THRESHOLD, PFP_HASH_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -68,58 +67,71 @@ async def check_user(
     if not whitelist:
         return DetectionResult(flagged=False)
 
-    usernames  = [w["username"] for w in whitelist if w["username"]]
-    names      = [f"{w['first_name']} {w['last_name'] or ''}".strip() for w in whitelist]
-    pfp_hashes = [w["pfp_hash"] for w in whitelist if w["pfp_hash"]]
+    # Exclude the user's own whitelist entry so they can never match themselves
+    others = [w for w in whitelist if w["user_id"] != snapshot.user_id]
+    if not others:
+        return DetectionResult(flagged=False)
+
+    usernames  = [w["username"] for w in others if w["username"]]
+    names      = [f"{w['first_name']} {w['last_name'] or ''}".strip() for w in others]
+    pfp_hashes = [w["pfp_hash"] for w in others if w["pfp_hash"]]
 
     full_name = f"{snapshot.first_name} {snapshot.last_name or ''}".strip()
 
-    # 1 — Username similarity
-    if snapshot.username:
+    # 1 — Username similarity (username vs whitelist usernames only)
+    if snapshot.username and usernames:
         match, matched_val, score = check_username_similarity(
             snapshot.username, usernames, NAME_SIMILARITY_THRESHOLD
         )
         if match:
-            target = _find_by_username(whitelist, matched_val)
+            target = _find_by_username(others, matched_val)
             return DetectionResult(
                 flagged=True, match_type="username", matched_val=matched_val,
                 score=score, **_target_fields(target)
             )
 
-    # 2 — Homoglyph username
-    if snapshot.username and check_homoglyph_danger(snapshot.username):
-        return DetectionResult(
-            flagged=True, match_type="homoglyph_username",
-            matched_val=snapshot.username, score=100.0
+    # 2 — Homoglyph username: only flag if it also fuzzy-matches a whitelisted username
+    if snapshot.username and usernames and check_homoglyph_danger(snapshot.username):
+        match, matched_val, score = check_username_similarity(
+            snapshot.username, usernames, NAME_SIMILARITY_THRESHOLD
         )
+        if match:
+            target = _find_by_username(others, matched_val)
+            return DetectionResult(
+                flagged=True, match_type="homoglyph_username",
+                matched_val=matched_val, score=score, **_target_fields(target)
+            )
 
-    # 3 — Homoglyph name
+    # 3 — Homoglyph name: only flag if it also fuzzy-matches a whitelisted display name
     if check_homoglyph_danger(full_name):
-        return DetectionResult(
-            flagged=True, match_type="homoglyph_name",
-            matched_val=full_name, score=100.0
-        )
+        match, matched_val, score = check_name_similarity(full_name, names, NAME_SIMILARITY_THRESHOLD)
+        if match and not (len(full_name.split()) <= 1 or len(matched_val.split()) <= 1):
+            target = _find_by_name(others, matched_val)
+            return DetectionResult(
+                flagged=True, match_type="homoglyph_name",
+                matched_val=matched_val, score=score, **_target_fields(target)
+            )
 
-    # 4 — Display name similarity
+    # 4 — Display name similarity (name vs whitelist names only)
     match, matched_val, score = check_name_similarity(full_name, names, NAME_SIMILARITY_THRESHOLD)
     is_weak = match and (len(full_name.split()) <= 1 or len(matched_val.split()) <= 1)
 
     if match and not is_weak:
-        target = _find_by_name(whitelist, matched_val)
+        target = _find_by_name(others, matched_val)
         return DetectionResult(
             flagged=True, match_type="name", matched_val=matched_val,
             score=score, **_target_fields(target)
         )
 
     # 5 — PFP hash
-    if snapshot.pfp_bytes:
+    if snapshot.pfp_bytes and pfp_hashes:
         target_hash = compute_pfp_hash_bytes(snapshot.pfp_bytes)
         if target_hash:
             pfp_match, pfp_matched_val, pfp_dist = check_pfp_similarity(
                 target_hash, pfp_hashes, PFP_HASH_THRESHOLD
             )
             if pfp_match:
-                target = _find_by_pfp(whitelist, pfp_matched_val)
+                target = _find_by_pfp(others, pfp_matched_val)
                 return DetectionResult(
                     flagged=True, match_type="pfp", matched_val=pfp_matched_val,
                     score=pfp_dist, **_target_fields(target)
@@ -135,7 +147,6 @@ async def ban_and_log(
     group_id: int,
     trigger: str,
     ban_func: Callable[[int, int], Awaitable],
-    notify_func: Callable[[int, str], Awaitable],
     unban_func: Optional[Callable[[int, int], Awaitable]] = None,
     log_channel_notify: Optional[Callable[[str, Optional[InlineKeyboardMarkup]], Awaitable]] = None,
     invite_link: Optional[str] = None,
@@ -187,21 +198,6 @@ async def ban_and_log(
         trigger=trigger,
         invite_link=invite_link,
     )
-
-    action_emoji = {"banned": "🚫", "kicked": "👟", "alerted": "⚠️"}.get(action, "❌")
-    action_verb  = {"banned": "banned", "kicked": "kicked", "alerted": "flagged (alert only)"}.get(action, action)
-    invite_line  = f"\nInvite link: <code>{invite_link}</code>" if invite_link else ""
-    group_msg = (
-        f"{action_emoji} <b>Impersonator {action_verb}</b>\n"
-        f"User: <a href='tg://user?id={snapshot.user_id}'>{full_name}</a> (ID: <code>{snapshot.user_id}</code>)\n"
-        f"Reason: Similar <b>{result.match_type}</b> to <b>{target_display}</b>\n"
-        f"Match: <code>{result.matched_val}</code> | Score: <code>{result.score}</code>\n"
-        f"Trigger: <i>{trigger}</i>{invite_line}"
-    )
-    try:
-        await notify_func(group_id, group_msg)
-    except Exception as e:
-        logger.error(f"Failed to send group notification: {e}")
 
     if log_channel_notify:
         log_msg = (
