@@ -152,6 +152,29 @@ def init_db():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_aa_group ON admin_actions(group_id, created_at DESC);")
 
+            # Group identity: store the group's own PFP hash for detecting
+            # users who impersonate the group itself.
+            cur.execute("""
+                ALTER TABLE groups
+                    ADD COLUMN IF NOT EXISTS pfp_hash TEXT;
+            """)
+
+            # False-positive grace period: users cleared by an admin within
+            # the window are skipped by detection without being whitelisted.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS false_positives (
+                    group_id    BIGINT NOT NULL,
+                    user_id     BIGINT NOT NULL,
+                    cleared_by  BIGINT,
+                    cleared_at  TIMESTAMPTZ DEFAULT NOW(),
+                    expires_at  TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (group_id, user_id)
+                );
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fp_group ON false_positives(group_id, expires_at);"
+            )
+
         conn.commit()
         logger.info("Database initialized.")
     except Exception as e:
@@ -163,21 +186,51 @@ def init_db():
 
 # ── Group helpers ──────────────────────────────────────────────────────────────
 
+# Short-lived in-process caches so the sweep doesn't open a new DB connection
+# for every member.  get_group / get_reserved_keywords are called once per
+# checked member; without a cache a 1000-member sweep = 2000+ DB connections.
+_group_cache:    dict[int, tuple[float, dict | None]]        = {}
+_kw_cache:       dict[int, tuple[float, list[dict]]]          = {}
+_fp_cache:       dict[tuple[int, int], tuple[float, bool]]    = {}
+_GROUP_CACHE_TTL = 300   # 5 minutes — changes only via admin commands
+_KW_CACHE_TTL    = 300
+_FP_CACHE_TTL    = 300   # false-positive entries last 30 days; 5-min cache is fine
+
+
+def _invalidate_group_cache(group_id: int):
+    _group_cache.pop(group_id, None)
+
+
+def _invalidate_kw_cache(group_id: int):
+    _kw_cache.pop(group_id, None)
+
+
 def upsert_group(group_id: int, title: str = None, check_mode: str = "relaxed",
-                 log_channel_id: int = None) -> bool:
+                 log_channel_id: int = None, pfp_hash: str = None) -> bool:
     conn = get_connection()
     if not conn:
         return False
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO groups (group_id, title, check_mode, log_channel_id)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (group_id) DO UPDATE SET
-                    title          = COALESCE(EXCLUDED.title, groups.title),
-                    updated_at     = NOW();
-            """, (group_id, title, check_mode, log_channel_id))
+            if pfp_hash is not None:
+                cur.execute("""
+                    INSERT INTO groups (group_id, title, check_mode, log_channel_id, pfp_hash)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (group_id) DO UPDATE SET
+                        title          = COALESCE(EXCLUDED.title, groups.title),
+                        pfp_hash       = EXCLUDED.pfp_hash,
+                        updated_at     = NOW();
+                """, (group_id, title, check_mode, log_channel_id, pfp_hash))
+            else:
+                cur.execute("""
+                    INSERT INTO groups (group_id, title, check_mode, log_channel_id)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (group_id) DO UPDATE SET
+                        title          = COALESCE(EXCLUDED.title, groups.title),
+                        updated_at     = NOW();
+                """, (group_id, title, check_mode, log_channel_id))
         conn.commit()
+        _invalidate_group_cache(group_id)
         return True
     except Exception as e:
         logger.error(f"upsert_group error: {e}")
@@ -188,13 +241,19 @@ def upsert_group(group_id: int, title: str = None, check_mode: str = "relaxed",
 
 
 def get_group(group_id: int) -> dict | None:
+    cached = _group_cache.get(group_id)
+    if cached and time.time() - cached[0] < _GROUP_CACHE_TTL:
+        return cached[1]
+
     conn = get_connection()
     if not conn:
         return None
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM groups WHERE group_id = %s", (group_id,))
-            return cur.fetchone()
+            row = cur.fetchone()
+        _group_cache[group_id] = (time.time(), row)
+        return row
     except Exception as e:
         logger.error(f"get_group error: {e}")
         return None
@@ -228,6 +287,7 @@ def set_group_log_channel(group_id: int, log_channel_id: int | None) -> bool:
                 (log_channel_id, group_id)
             )
         conn.commit()
+        _invalidate_group_cache(group_id)
         return True
     except Exception as e:
         logger.error(f"set_group_log_channel error: {e}")
@@ -248,6 +308,7 @@ def set_group_check_mode(group_id: int, mode: str) -> bool:
                 (mode, group_id)
             )
         conn.commit()
+        _invalidate_group_cache(group_id)
         return True
     except Exception as e:
         logger.error(f"set_group_check_mode error: {e}")
@@ -268,6 +329,7 @@ def set_group_action_mode(group_id: int, mode: str) -> bool:
                 (mode, group_id)
             )
         conn.commit()
+        _invalidate_group_cache(group_id)
         return True
     except Exception as e:
         logger.error(f"set_group_action_mode error: {e}")
@@ -553,6 +615,7 @@ def add_reserved_keyword(group_id: int, pattern: str, is_regex: bool, created_by
                 ON CONFLICT (group_id, pattern) DO UPDATE SET is_regex = EXCLUDED.is_regex
             """, (group_id, pattern, is_regex, created_by))
         conn.commit()
+        _invalidate_kw_cache(group_id)
         return True
     except Exception as e:
         logger.error(f"add_reserved_keyword error: {e}")
@@ -574,6 +637,7 @@ def remove_reserved_keyword(group_id: int, pattern: str) -> bool:
             )
             deleted = cur.rowcount > 0
         conn.commit()
+        _invalidate_kw_cache(group_id)
         return deleted
     except Exception as e:
         logger.error(f"remove_reserved_keyword error: {e}")
@@ -584,6 +648,10 @@ def remove_reserved_keyword(group_id: int, pattern: str) -> bool:
 
 
 def get_reserved_keywords(group_id: int) -> list[dict]:
+    cached = _kw_cache.get(group_id)
+    if cached and time.time() - cached[0] < _KW_CACHE_TTL:
+        return cached[1]
+
     conn = get_connection()
     if not conn:
         return []
@@ -593,7 +661,9 @@ def get_reserved_keywords(group_id: int) -> list[dict]:
                 "SELECT pattern, is_regex FROM reserved_keywords WHERE group_id = %s ORDER BY created_at",
                 (group_id,)
             )
-            return cur.fetchall()
+            rows = cur.fetchall()
+        _kw_cache[group_id] = (time.time(), rows)
+        return rows
     except Exception as e:
         logger.error(f"get_reserved_keywords error: {e}")
         return []
@@ -614,6 +684,7 @@ def set_group_threshold(group_id: int, threshold: int) -> bool:
                 (threshold, group_id)
             )
         conn.commit()
+        _invalidate_group_cache(group_id)
         return True
     except Exception as e:
         logger.error(f"set_group_threshold error: {e}")
@@ -788,5 +859,65 @@ def get_all_group_stats() -> list[dict]:
     except Exception as e:
         logger.error(f"get_all_group_stats error: {e}")
         return []
+    finally:
+        conn.close()
+
+
+# ── False-positive grace period ────────────────────────────────────────────────
+
+def mark_false_positive(
+    group_id: int, user_id: int, cleared_by: int, days: int = 30
+) -> None:
+    """
+    Record a user as a confirmed false positive for this group.
+    The bot will not re-flag this user for ``days`` days (default: 30).
+    If the same user gets cleared again the window is reset.
+    """
+    from datetime import datetime, timedelta, timezone
+    expires = datetime.now(timezone.utc) + timedelta(days=days)
+    conn = get_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO false_positives (group_id, user_id, cleared_by, expires_at)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (group_id, user_id) DO UPDATE SET
+                    cleared_by = EXCLUDED.cleared_by,
+                    cleared_at = NOW(),
+                    expires_at = EXCLUDED.expires_at;
+            """, (group_id, user_id, cleared_by, expires))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"mark_false_positive error: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def is_false_positive(group_id: int, user_id: int) -> bool:
+    """Return True if the user has an active (non-expired) false-positive record."""
+    cache_key = (group_id, user_id)
+    now = time.time()
+    cached = _fp_cache.get(cache_key)
+    if cached and now - cached[0] < _FP_CACHE_TTL:
+        return cached[1]
+
+    conn = get_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 1 FROM false_positives
+                WHERE group_id = %s AND user_id = %s AND expires_at > NOW()
+            """, (group_id, user_id))
+            result = cur.fetchone() is not None
+        _fp_cache[cache_key] = (now, result)
+        return result
+    except Exception as e:
+        logger.error(f"is_false_positive error: {e}")
+        return False
     finally:
         conn.close()

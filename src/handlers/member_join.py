@@ -3,7 +3,7 @@ import html
 import logging
 from telegram import Update
 from telegram.ext import ContextTypes
-from telegram.constants import ChatMemberStatus
+from telegram.constants import ChatMemberStatus, ChatType
 
 from src.db import upsert_group, is_whitelisted, get_group, upsert_whitelisted_user, mark_seen
 from src.utils.checker import UserSnapshot, check_user, ban_and_log
@@ -29,8 +29,22 @@ async def on_bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TY
     new_status = my.new_chat_member.status
     chat = update.effective_chat
 
-    if new_status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR]:
-        upsert_group(chat.id, title=chat.title)
+    # Only register actual groups/supergroups — not channels (which also fire
+    # MY_CHAT_MEMBER when the bot is added as admin, causing duplicate /stats rows)
+    if new_status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR] and \
+            chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        # Fetch group PFP so the bot can detect impersonators of the group itself
+        group_pfp_hash = None
+        try:
+            full_chat = await context.bot.get_chat(chat.id)
+            if full_chat.photo:
+                f = await context.bot.get_file(full_chat.photo.big_file_id)
+                raw = bytes(await f.download_as_bytearray())
+                from src.utils.image import compute_pfp_hash_bytes
+                group_pfp_hash = compute_pfp_hash_bytes(raw)
+        except Exception:
+            pass
+        upsert_group(chat.id, title=chat.title, pfp_hash=group_pfp_hash)
         logger.info(f"Bot added to group {chat.title} ({chat.id}) — registered.")
 
         log_channel = context.bot_data.get("log_channel_id") or LOG_CHANNEL_ID

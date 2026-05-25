@@ -14,6 +14,7 @@ from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 
 from src.db import (
     get_whitelist, is_whitelisted, insert_log, get_group, get_reserved_keywords,
+    is_false_positive, mark_false_positive,
 )
 from src.utils.detector import (
     check_username_similarity, check_name_similarity,
@@ -67,6 +68,10 @@ async def check_user(
         return DetectionResult(flagged=False)
 
     if is_whitelisted(group_id, snapshot.user_id):
+        return DetectionResult(flagged=False)
+
+    # Skip users within their false-positive grace window
+    if is_false_positive(group_id, snapshot.user_id):
         return DetectionResult(flagged=False)
 
     # Per-group similarity threshold (falls back to global config)
@@ -161,6 +166,43 @@ async def check_user(
                     score=pfp_dist, **_target_fields(target)
                 )
 
+    # 6 — Group identity: catch users impersonating the group itself.
+    #     Checks user name similarity to the group title, and (for weak matches)
+    #     user PFP similarity to the group's stored logo hash.
+    if group_cfg:
+        group_title    = group_cfg.get("title") or ""
+        group_pfp_hash = group_cfg.get("pfp_hash")
+
+        if group_title:
+            g_match, g_matched, g_score = check_name_similarity(full_name, [group_title], threshold)
+            g_is_weak = g_match and (
+                len(full_name.split()) <= 1 or len(group_title.split()) <= 1
+            )
+
+            if g_match and not g_is_weak:
+                # Strong name match to the group itself (multi-word, above threshold)
+                return DetectionResult(
+                    flagged=True, match_type="group_name",
+                    matched_val=group_title, score=g_score,
+                    target_name=f"[Group] {group_title}",
+                )
+
+            # Weak group-name match: use the group logo as tiebreaker
+            if g_is_weak and group_pfp_hash:
+                if not snapshot.pfp_bytes:
+                    return DetectionResult(flagged=False, needs_pfp=True)
+                g_user_hash = compute_pfp_hash_bytes(snapshot.pfp_bytes)
+                if g_user_hash:
+                    g_pfp_match, _, g_pfp_dist = check_pfp_similarity(
+                        g_user_hash, [group_pfp_hash], PFP_HASH_THRESHOLD
+                    )
+                    if g_pfp_match:
+                        return DetectionResult(
+                            flagged=True, match_type="group_pfp",
+                            matched_val=group_title, score=g_pfp_dist,
+                            target_name=f"[Group] {group_title}",
+                        )
+
     return DetectionResult(flagged=False)
 
 
@@ -240,16 +282,24 @@ async def ban_and_log(
         # Attach action buttons only when the user was actually banned/kicked
         keyboard = None
         if action in ("banned", "kicked"):
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    "✅ Unban + Whitelist",
-                    callback_data=f"unban_wl|{group_id}|{snapshot.user_id}",
-                ),
-                InlineKeyboardButton(
-                    "🗑 Dismiss",
-                    callback_data=f"dismiss|{group_id}|{snapshot.user_id}",
-                ),
-            ]])
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "✅ Unban + Whitelist",
+                        callback_data=f"unban_wl|{group_id}|{snapshot.user_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "🔓 Unban only",
+                        callback_data=f"unban_fp|{group_id}|{snapshot.user_id}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🗑 Dismiss",
+                        callback_data=f"dismiss|{group_id}|{snapshot.user_id}",
+                    ),
+                ],
+            ])
         try:
             await log_channel_notify(log_msg, keyboard)
         except Exception as e:

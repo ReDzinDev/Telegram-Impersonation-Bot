@@ -3,9 +3,10 @@ import asyncio
 import logging
 
 from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, Update
+from telegram.error import TimedOut, NetworkError
 from telegram.ext import (
     ApplicationBuilder, CallbackQueryHandler, CommandHandler, ChatMemberHandler,
-    MessageHandler, PicklePersistence, filters,
+    ContextTypes, MessageHandler, PicklePersistence, filters,
 )
 
 from src.config import (
@@ -32,6 +33,21 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
+
+
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Global PTB error handler.
+
+    Network timeouts and transient connection errors are logged at WARNING level
+    (they're expected during heavy sweeps and resolve on the next poll cycle).
+    Everything else is logged at ERROR so real problems are still visible.
+    """
+    err = context.error
+    if isinstance(err, (TimedOut, NetworkError)):
+        logger.warning(f"Transient network error (ignored): {err}")
+        return
+    logger.error(f"Unhandled PTB exception", exc_info=err)
 
 
 def build_ptb_app(pyro_client=None):
@@ -76,8 +92,11 @@ def build_ptb_app(pyro_client=None):
 
     # Inline keyboard callbacks from log-channel detection alerts
     app.add_handler(CallbackQueryHandler(
-        handle_detection_callback, pattern=r"^(unban_wl|dismiss)\|"
+        handle_detection_callback, pattern=r"^(unban_wl|unban_fp|dismiss)\|"
     ))
+
+    # Global error handler: keeps TimedOut / NetworkError out of the ERROR log
+    app.add_error_handler(_error_handler)
 
     # Private group-picker flow
     app.add_handler(MessageHandler(filters.StatusUpdate.CHAT_SHARED, handle_chat_shared))

@@ -3,6 +3,7 @@ import csv
 import html
 import io
 import logging
+import time as _time
 
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, KeyboardButtonRequestChat, ReplyKeyboardRemove, InputFile
 from telegram.ext import ContextTypes
@@ -18,6 +19,7 @@ from src.db import (
     log_admin_action, get_recent_admin_actions,
     clear_whitelist as db_clear_whitelist,
     get_all_group_stats,
+    mark_false_positive,
 )
 from src.utils.image import compute_pfp_hash_bytes
 from src.config import LOG_CHANNEL_ID
@@ -25,6 +27,11 @@ from src.config import LOG_CHANNEL_ID
 logger = logging.getLogger(__name__)
 
 # ── Private-chat group context helpers ────────────────────────────────────────
+
+# 5-minute admin status cache: (user_id, group_id) → (expires_monotonic, is_admin)
+_admin_cache: dict[tuple[int, int], tuple[float, bool]] = {}
+_ADMIN_CACHE_TTL = 300  # seconds
+
 
 async def _get_active_group(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -62,20 +69,69 @@ async def _send_group_picker(update: Update):
     )
 
 
-async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check if the command sender is an admin of the relevant group."""
-    if update.effective_chat.type != ChatType.PRIVATE:
-        member = await update.effective_chat.get_member(update.effective_user.id)
-        return member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
+async def _is_admin(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    group_id: int | None = None,
+) -> bool:
+    """
+    Check if the command sender is an admin of the relevant group.
 
-    group_id = context.user_data.get("active_group_id")
-    if not group_id:
-        return False
+    Results are cached for 5 minutes to avoid repeated getChatMember API calls.
+    Pass group_id explicitly when you already know it (avoids a second context lookup).
+    """
+    user_id = update.effective_user.id
+
+    if update.effective_chat.type != ChatType.PRIVATE:
+        gid = update.effective_chat.id
+    else:
+        gid = group_id or context.user_data.get("active_group_id")
+        if not gid:
+            return False
+
+    # Cache hit
+    cache_key = (user_id, gid)
+    now = _time.monotonic()
+    if cache_key in _admin_cache:
+        expires_at, cached = _admin_cache[cache_key]
+        if now < expires_at:
+            return cached
+
+    # Live API call
     try:
-        member = await context.bot.get_chat_member(group_id, update.effective_user.id)
-        return member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
-    except Exception:
-        return False
+        if update.effective_chat.type != ChatType.PRIVATE:
+            member = await update.effective_chat.get_member(user_id)
+        else:
+            member = await context.bot.get_chat_member(gid, user_id)
+        result = member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
+    except Exception as e:
+        logger.warning(f"Admin check failed for user {user_id} in group {gid}: {e}")
+        result = False
+
+    _admin_cache[cache_key] = (now + _ADMIN_CACHE_TTL, result)
+    return result
+
+
+async def _get_admin_group(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> tuple[int, str] | None:
+    """
+    Combined helper: resolve the active group then verify the caller is an admin.
+
+    Returns (group_id, group_title) on success.
+    Returns None after sending the appropriate message to the user (group picker
+    or "Only admins" error) so callers can simply do ``if not ctx: return``.
+    """
+    ctx = await _get_active_group(update, context)
+    if not ctx:
+        return None  # _get_active_group already sent the group picker
+
+    group_id, group_title = ctx
+    if not await _is_admin(update, context, group_id=group_id):
+        await update.message.reply_text("Only admins can use this command.")
+        return None
+
+    return group_id, group_title
 
 
 async def _fetch_pfp(user) -> str | None:
@@ -86,6 +142,19 @@ async def _fetch_pfp(user) -> str | None:
             return compute_pfp_hash_bytes(bytes(await f.download_as_bytearray()))
     except Exception as e:
         logger.warning(f"Could not get PFP for {user.id}: {e}")
+    return None
+
+
+async def _fetch_group_pfp_hash(bot, chat) -> str | None:
+    """Download and hash the group's current profile photo. Returns None if unavailable."""
+    try:
+        if not chat.photo:
+            return None
+        f = await bot.get_file(chat.photo.big_file_id)
+        raw = bytes(await f.download_as_bytearray())
+        return compute_pfp_hash_bytes(raw)
+    except Exception as e:
+        logger.warning(f"Could not fetch group PFP for {chat.id}: {e}")
     return None
 
 
@@ -185,14 +254,10 @@ async def handle_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ── /import_admins ─────────────────────────────────────────────────────────────
 
 async def import_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ctx = await _get_active_group(update, context)
+    ctx = await _get_admin_group(update, context)
     if not ctx:
         return
     group_id, _ = ctx
-
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
-        return
 
     ok, msg = await _import_admins_logic(
         group_id, update.effective_user.id, update.effective_user.full_name, context
@@ -210,44 +275,52 @@ async def _import_admins_logic(
     except Exception as e:
         return False, f"❌ Could not access the group. Is the bot an admin there? (<code>{e}</code>)"
 
-    upsert_group(chat_id, title=chat.title)
+    # Store the group's own PFP so the bot can detect impersonators of the group itself
+    group_pfp_hash = await _fetch_group_pfp_hash(context.bot, chat)
+    upsert_group(chat_id, title=chat.title, pfp_hash=group_pfp_hash)
 
-    count = 0
+    count      = 0
+    bot_count  = 0
     for admin in admins:
         user = admin.user
-        if user.is_bot:
+        # Skip the Anti-Impersonator Bot itself, but keep other admin bots
+        # (Rose, Combot, etc.) so their names/usernames are also protected.
+        if user.id == context.bot.id:
             continue
-        pfp_hash = await _fetch_pfp(user)
+        pfp_hash = await _fetch_pfp(user) if not user.is_bot else None
         upsert_whitelisted_user(
             group_id=chat_id,
             user_id=user.id,
             username=user.username,
             first_name=user.first_name,
-            last_name=user.last_name,
+            last_name=user.last_name or "",
             pfp_hash=pfp_hash,
             whitelisted_by=requester_id,
+            user_type="admin",
         )
         mark_seen(chat_id, user.id)
         count += 1
+        if user.is_bot:
+            bot_count += 1
 
     log_admin_action(
         group_id=chat_id,
         admin_id=requester_id,
         admin_name=requester_name,
         action="import_admins",
-        details=f"Imported {count} admin(s)",
+        details=f"Imported {count} admin(s) ({bot_count} bot(s))",
     )
-    return True, f"✅ Imported/updated <b>{count}</b> admin(s) for <b>{html.escape(str(chat.title or chat_id))}</b>."
+    bot_note = f", including <b>{bot_count}</b> bot(s)" if bot_count else ""
+    return True, (
+        f"✅ Imported/updated <b>{count}</b> admin(s){bot_note} "
+        f"for <b>{html.escape(str(chat.title or chat_id))}</b>."
+    )
 
 
 # ── /whitelist ─────────────────────────────────────────────────────────────────
 
 async def whitelist_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
-        return
-
-    ctx = await _get_active_group(update, context)
+    ctx = await _get_admin_group(update, context)
     if not ctx:
         return
     group_id, _ = ctx
@@ -299,11 +372,7 @@ async def whitelist_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /unwhitelist ───────────────────────────────────────────────────────────────
 
 async def unwhitelist_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
-        return
-
-    ctx = await _get_active_group(update, context)
+    ctx = await _get_admin_group(update, context)
     if not ctx:
         return
     group_id, _ = ctx
@@ -339,11 +408,7 @@ async def unwhitelist_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /check ─────────────────────────────────────────────────────────────────────
 
 async def check_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
-        return
-
-    ctx = await _get_active_group(update, context)
+    ctx = await _get_admin_group(update, context)
     if not ctx:
         return
     group_id, _ = ctx
@@ -413,11 +478,7 @@ async def check_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /ban ───────────────────────────────────────────────────────────────────────
 
 async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
-        return
-
-    ctx = await _get_active_group(update, context)
+    ctx = await _get_admin_group(update, context)
     if not ctx:
         return
     group_id, _ = ctx
@@ -474,9 +535,10 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /unban ─────────────────────────────────────────────────────────────────────
 
 async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
+    ctx = await _get_admin_group(update, context)
+    if not ctx:
         return
+    group_id, _ = ctx
 
     if not context.args:
         await update.message.reply_text("Usage: /unban &lt;user_id&gt;", parse_mode="HTML")
@@ -488,11 +550,6 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Provide a numeric user ID.")
         return
 
-    ctx = await _get_active_group(update, context)
-    if not ctx:
-        return
-    group_id, _ = ctx
-
     try:
         await context.bot.unban_chat_member(chat_id=group_id, user_id=target_id, only_if_banned=True)
         await update.message.reply_text(f"✅ User <code>{target_id}</code> has been unbanned.", parse_mode="HTML")
@@ -503,9 +560,10 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /sweep ─────────────────────────────────────────────────────────────────────
 
 async def sweep(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
+    ctx = await _get_admin_group(update, context)
+    if not ctx:
         return
+    group_id, _ = ctx
 
     pyro = context.bot_data.get("pyro_client")
     if not pyro:
@@ -515,19 +573,21 @@ async def sweep(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    ctx = await _get_active_group(update, context)
-    if not ctx:
-        return
-    group_id, _ = ctx
-
     log_channel  = context.bot_data.get("log_channel_id") or LOG_CHANNEL_ID
-    status_msg   = await update.message.reply_text("🔍 Sweep started… this may take a while.")
+    status_msg   = await update.message.reply_text("🔍 Sweep started — fetching member list…")
 
     from src.watcher.sweep import sweep_group
 
-    async def progress(checked: int, flagged: int):
+    async def progress(iterated: int, checked: int, flagged: int):
         try:
-            await status_msg.edit_text(f"🔍 Sweeping… checked {checked} members, flagged {flagged}.")
+            if iterated == 0:
+                text = "🔍 Sweep running — scanning members…"
+            else:
+                text = (
+                    f"🔍 Sweeping… {iterated} seen · "
+                    f"{checked} checked · {flagged} flagged"
+                )
+            await status_msg.edit_text(text)
         except Exception:
             pass
 
@@ -544,15 +604,17 @@ async def sweep(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    checked = result.get("checked", 0)
-    flagged = result.get("flagged", 0)
-    errors  = result.get("errors", 0)
-    note    = "\n<i>(Admins and already-whitelisted users are skipped.)</i>" if checked == 0 else ""
+    iterated = result.get("iterated", 0)
+    checked  = result.get("checked", 0)
+    flagged  = result.get("flagged", 0)
+    errors   = result.get("errors", 0)
+    note     = "\n<i>(All members were admins or already whitelisted.)</i>" if checked == 0 else ""
 
     await status_msg.edit_text(
         f"✅ <b>Sweep complete</b>\n"
-        f"Checked: <code>{checked}</code>\n"
-        f"Flagged & banned: <code>{flagged}</code>\n"
+        f"Members seen: <code>{iterated}</code>\n"
+        f"Checked (non-whitelisted): <code>{checked}</code>\n"
+        f"Flagged & actioned: <code>{flagged}</code>\n"
         f"Errors: <code>{errors}</code>{note}",
         parse_mode="HTML",
     )
@@ -561,18 +623,14 @@ async def sweep(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /setmode ───────────────────────────────────────────────────────────────────
 
 async def setmode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
+    ctx = await _get_admin_group(update, context)
+    if not ctx:
         return
+    group_id, group_title = ctx
 
     if not context.args or context.args[0].lower() not in ("strict", "relaxed"):
         await update.message.reply_text("Usage: /setmode strict|relaxed")
         return
-
-    ctx = await _get_active_group(update, context)
-    if not ctx:
-        return
-    group_id, group_title = ctx
 
     mode = context.args[0].lower()
     upsert_group(group_id, title=group_title)
@@ -597,9 +655,10 @@ async def setmode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /setaction ────────────────────────────────────────────────────────────────
 
 async def setaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
+    ctx = await _get_admin_group(update, context)
+    if not ctx:
         return
+    group_id, group_title = ctx
 
     valid = ("ban", "kick", "alert")
     if not context.args or context.args[0].lower() not in valid:
@@ -610,11 +669,6 @@ async def setaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• alert — notify only, no action taken"
         )
         return
-
-    ctx = await _get_active_group(update, context)
-    if not ctx:
-        return
-    group_id, group_title = ctx
 
     mode = context.args[0].lower()
     upsert_group(group_id, title=group_title)
@@ -640,11 +694,7 @@ async def setaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /listwhitelist ────────────────────────────────────────────────────────────
 
 async def list_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
-        return
-
-    ctx = await _get_active_group(update, context)
+    ctx = await _get_admin_group(update, context)
     if not ctx:
         return
     group_id, _ = ctx
@@ -679,9 +729,10 @@ async def list_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /setlogchannel ────────────────────────────────────────────────────────────
 
 async def set_log_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
+    ctx = await _get_admin_group(update, context)
+    if not ctx:
         return
+    group_id, group_title = ctx
 
     if not context.args:
         await update.message.reply_text(
@@ -692,11 +743,6 @@ async def set_log_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
         )
         return
-
-    ctx = await _get_active_group(update, context)
-    if not ctx:
-        return
-    group_id, group_title = ctx
     upsert_group(group_id, title=group_title)
 
     if context.args[0].lower() == "clear":
@@ -735,8 +781,8 @@ async def set_log_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /stats ─────────────────────────────────────────────────────────────────────
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
+    ctx = await _get_admin_group(update, context)
+    if not ctx:
         return
 
     # Private chat: show a breakdown of every registered group
@@ -804,11 +850,7 @@ async def watch_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
       /watch          — reply to a message from the user to watch
       /watch <id>     — watch by user ID (requires Pyrogram to resolve profile)
     """
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
-        return
-
-    ctx = await _get_active_group(update, context)
+    ctx = await _get_admin_group(update, context)
     if not ctx:
         return
     group_id, group_title = ctx
@@ -973,15 +1015,29 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_reply_markup(reply_markup=None)
         await query.answer(f"Unbanned + whitelisted by {admin_name}.", show_alert=False)
 
+    if action == "unban_fp":
+        # Unban without whitelisting — 30-day grace period so detection doesn't
+        # immediately re-ban them on next sweep or re-join.
+        try:
+            await context.bot.unban_chat_member(
+                chat_id=group_id, user_id=user_id, only_if_banned=True
+            )
+        except Exception as e:
+            await query.answer(f"Unban failed: {e}", show_alert=True)
+            return
+
+        mark_false_positive(group_id, user_id, cleared_by=query.from_user.id, days=30)
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.answer(
+            f"Unbanned (false positive — 30-day grace) by {admin_name}.",
+            show_alert=False,
+        )
+
 
 # ── /exportwhitelist ──────────────────────────────────────────────────────────
 
 async def export_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
-        return
-
-    ctx = await _get_active_group(update, context)
+    ctx = await _get_admin_group(update, context)
     if not ctx:
         return
     group_id, _ = ctx
@@ -1014,11 +1070,7 @@ async def add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
       /addkeyword admin            — plain keyword (case-insensitive)
       /addkeyword r:official.*ceo  — regex (prefix with r:)
     """
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
-        return
-
-    ctx = await _get_active_group(update, context)
+    ctx = await _get_admin_group(update, context)
     if not ctx:
         return
     group_id, group_title = ctx
@@ -1060,11 +1112,7 @@ async def add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /removekeyword ────────────────────────────────────────────────────────────
 
 async def remove_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
-        return
-
-    ctx = await _get_active_group(update, context)
+    ctx = await _get_admin_group(update, context)
     if not ctx:
         return
     group_id, _ = ctx
@@ -1089,11 +1137,7 @@ async def remove_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /listkeywords ─────────────────────────────────────────────────────────────
 
 async def list_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
-        return
-
-    ctx = await _get_active_group(update, context)
+    ctx = await _get_admin_group(update, context)
     if not ctx:
         return
     group_id, _ = ctx
@@ -1127,9 +1171,10 @@ async def set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Higher = stricter (may miss subtle impersonation).
     Recommended range: 75–92.
     """
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
+    ctx = await _get_admin_group(update, context)
+    if not ctx:
         return
+    group_id, group_title = ctx
 
     if not context.args:
         await update.message.reply_text(
@@ -1148,11 +1193,6 @@ async def set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Provide an integer between 50 and 100.")
         return
-
-    ctx = await _get_active_group(update, context)
-    if not ctx:
-        return
-    group_id, group_title = ctx
     upsert_group(group_id, title=group_title)
     set_group_threshold(group_id, val)
     log_admin_action(
@@ -1172,11 +1212,7 @@ async def set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show recent detection log entries. Usage: /logs [limit=10]"""
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
-        return
-
-    ctx = await _get_active_group(update, context)
+    ctx = await _get_admin_group(update, context)
     if not ctx:
         return
     group_id, _ = ctx
@@ -1228,11 +1264,7 @@ async def import_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Expected columns: user_id, username, first_name, last_name
     (same format as /exportwhitelist output).
     """
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
-        return
-
-    ctx = await _get_active_group(update, context)
+    ctx = await _get_admin_group(update, context)
     if not ctx:
         return
     group_id, group_title = ctx
@@ -1318,11 +1350,7 @@ async def clear_whitelist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     Remove ALL protected users from this group's whitelist.
     Requires /clearwhitelist confirm to execute (safety gate).
     """
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
-        return
-
-    ctx = await _get_active_group(update, context)
+    ctx = await _get_admin_group(update, context)
     if not ctx:
         return
     group_id, group_title = ctx
@@ -1357,11 +1385,7 @@ async def clear_whitelist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def audit_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show recent admin actions for this group. Usage: /auditlog [limit=20]"""
-    if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can use this command.")
-        return
-
-    ctx = await _get_active_group(update, context)
+    ctx = await _get_admin_group(update, context)
     if not ctx:
         return
     group_id, _ = ctx

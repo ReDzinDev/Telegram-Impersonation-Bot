@@ -4,13 +4,13 @@
 
 ## What It Is
 
-A Telegram bot that automatically detects and removes users who impersonate admins, VIPs, or other protected members inside Telegram groups. It monitors joins, messages, profile changes, and runs scheduled full-group sweeps — then bans, kicks, or alerts based on how each group is configured.
+A Telegram bot that automatically detects and removes users who impersonate admins, VIPs, the group itself, or other protected identities inside Telegram groups. It monitors joins, messages, profile changes, and runs scheduled full-group sweeps — then bans, kicks, or alerts based on how each group is configured.
 
 ---
 
 ## The Problem It Solves
 
-Scammers routinely join crypto, trading, and community Telegram groups with a display name and profile photo nearly identical to a real admin's. They then DM members pretending to be that admin — offering "support", draining wallets, or phishing credentials.
+Scammers routinely join crypto, trading, and community Telegram groups with a display name and profile photo nearly identical to a real admin's — or even copying the group's own logo. They DM members pretending to be that admin or official support, then drain wallets or phish credentials.
 
 Telegram's built-in tools offer no automated protection against this. The bot fills that gap.
 
@@ -18,7 +18,7 @@ Telegram's built-in tools offer no automated protection against this. The bot fi
 
 ## How Detection Works
 
-Every user goes through a 5-stage pipeline. It stops at the first hit and takes action immediately.
+Every non-whitelisted user goes through a 7-stage pipeline. It stops at the first hit and takes action immediately.
 
 | Stage | What It Checks | Notes |
 | --- | --- | --- |
@@ -27,7 +27,10 @@ Every user goes through a 5-stage pipeline. It stops at the first hit and takes 
 | **2 — Homoglyph username** | Unicode lookalike characters (e.g. Cyrillic `а` for Latin `a`) | Only flags if it *also* fuzzy-matches a protected username |
 | **3 — Homoglyph name** | Same, for display names | Single-word names are excluded (too noisy) |
 | **4 — Display name similarity** | Fuzzy match vs. all whitelisted display names | Weak single-word matches escalate to stage 5 |
-| **5 — Profile photo hash** | Perceptual hash comparison (Hamming distance) | Tiebreaker only for weak name matches — never flags standalone |
+| **5 — Profile photo hash** | Perceptual hash comparison vs. whitelisted user photos | Tiebreaker only for weak name matches — never flags standalone |
+| **6 — Group identity** | Name + photo similarity vs. the group's own stored identity | Catches users impersonating the group itself (cloning logo/name) |
+
+**Match types logged:** `keyword`, `username`, `homoglyph_username`, `homoglyph_name`, `name`, `pfp`, `group_name`, `group_pfp`
 
 A separate **name-change velocity alert** fires if a user renames themselves 3+ times within 60 minutes — a common evasion tactic. It notifies the log channel but does not auto-ban (no specific impersonation target is known at that point).
 
@@ -91,22 +94,47 @@ Alert mode is useful for monitoring a new group before committing to auto-bans.
 
 ## The Whitelist (Protected Identities)
 
-The bot compares every suspicious user against the group's whitelist. A user with no whitelist to compare against will never be flagged.
+The bot compares every suspicious user against the group's whitelist. A group with an empty whitelist will never flag anyone.
 
 ### Who Gets Protected
 
 | Type | How Added | Notes |
 | --- | --- | --- |
-| **Admin** | `/import_admins` or automatic on promotion | Bot auto-whitelists newly promoted admins in real time |
+| **Admin (human)** | `/import_admins` or automatic on promotion | Includes name, username, and PFP hash |
+| **Admin (bot)** | `/import_admins` | Rose, Combot, and other admin bots are now included — protects their usernames from being copied. PFP not fetched for bots. |
 | **Watched VIP** | `/watch` (reply or user ID) | For non-admin staff, founders, influencers |
 | **Manual** | `/whitelist` (reply or user ID) | Any specific user |
 | **CSV import** | Send `.csv` in private chat | Bulk import; same format as `/exportwhitelist` output |
 
-Each entry stores: user ID, username, display name, profile photo hash, who added them, and when.
+Each entry stores: user ID, username, display name, profile photo hash, who added them, when, and type.
+
+### Admin Bot Protection
+
+`/import_admins` now whitelists **all admin bots** in the group (e.g. Rose, Combot, Guardian) except the Anti-Impersonator Bot itself. Their usernames and display names are added to the protected identity list, so copycats like `@R0seBot` or a user named "RoseBot Admin" can be caught.
 
 ### Profile Photo Hashes
 
-After every sweep, the bot re-downloads and re-hashes the current profile photo for every whitelisted user. This keeps the stored hash fresh even when protected users change their own photo legitimately.
+After every sweep, the bot re-downloads and re-hashes the current profile photo for every whitelisted user. This keeps stored hashes fresh even when protected users legitimately change their own photo.
+
+### Group Identity Storage
+
+When the bot joins a group or `/import_admins` runs, the group's own profile photo hash and name are stored. Stage 6 of detection uses these to catch users who clone the group's logo or name — e.g. a scammer joining "Crypto Group" with the group's own banner as their profile picture.
+
+---
+
+## Handling False Positives
+
+When the bot bans or kicks someone, the log channel alert includes three action buttons:
+
+| Button | What It Does |
+| --- | --- |
+| **✅ Unban + Whitelist** | Unbans the user and adds them to the whitelist. Use when the person is legitimately trusted and should never be flagged again. |
+| **🔓 Unban only** | Unbans the user and sets a **30-day grace period**. They can rejoin and won't be re-flagged during the window. After it expires, normal detection resumes. Use for confirmed false positives who don't need permanent protection. |
+| **🗑 Dismiss** | Removes the buttons from the log message without taking any action. The ban/kick stands. |
+
+The grace period resets to 30 days if the user is cleared again before it expires.
+
+Buttons only appear when the action was `ban` or `kick`. Alert-mode detections show no buttons.
 
 ---
 
@@ -136,12 +164,7 @@ Invite link: https://t.me/+abc123
 Action: banned
 ```
 
-Each alert includes two inline buttons:
-
-- **✅ Unban + Whitelist** — reverses the action and adds the user to the whitelist (false positive recovery)
-- **🗑 Dismiss** — removes the buttons without taking action
-
-Buttons only appear when the action was `ban` or `kick`. Alert-mode detections show no buttons.
+For group-identity matches, `Impersonating` shows `[Group] GroupName` instead of a user.
 
 ### Log Channel Priority
 
@@ -170,21 +193,21 @@ The bot resolves the log channel in this order:
 
 | Command | Description |
 | --- | --- |
-| `/import_admins` | Whitelist all current group admins (with PFP hashes) |
+| `/import_admins` | Whitelist all current group admins — human and bot alike — with name, username, and PFP hash. Also stores the group's own profile photo for group-identity detection. |
 | `/whitelist` | Whitelist a user — reply to their message or `/whitelist 123456` |
 | `/unwhitelist` | Remove from whitelist — reply or `/unwhitelist 123456` |
 | `/watch` | Protect a non-admin VIP — reply or `/watch 123456` (ID lookup needs Pyrogram) |
 | `/listwhitelist` | Show all protected users with type (admin / watch / manual) |
 | `/exportwhitelist` | Download the whitelist as a CSV file |
 | `/importwhitelist` | Send a CSV file in the bot's DM to bulk-add users |
-| `/clearwhitelist confirm` | ⚠️ Remove ALL protected users — shows warning first, requires `confirm` |
+| `/clearwhitelist confirm` | ⚠️ Remove ALL protected users — shows count warning first, requires `confirm` |
 
 ### Detection & Moderation
 
 | Command | Description |
 | --- | --- |
 | `/check` | Manually run a detection check — reply or `/check 123456`. Shows match type, score, and what action would be taken |
-| `/sweep` | Run a full member scan immediately (Pyrogram required) |
+| `/sweep` | Run a full member scan immediately (Pyrogram required). Shows live progress. |
 | `/ban` | Manually ban a user — reply or `/ban 123456` |
 | `/unban 123456` | Unban a user by ID |
 
@@ -204,9 +227,21 @@ The bot resolves the log channel in this order:
 
 | Command | Description |
 | --- | --- |
-| `/stats` | Group stats (in a group) or all-groups breakdown (in private DM) |
+| `/stats` | Group stats in a group chat; all-groups breakdown when used in private DM |
 | `/logs 20` | Last N detection log entries |
 | `/auditlog 20` | Last N admin actions (who ran what and when) |
+
+---
+
+## Private Chat (DM) Workflow
+
+All commands work from a direct message with the bot — no need to use them inside the group.
+
+1. DM the bot → tap **Select Group** (or **Switch Group** to change)
+2. Pick the group from the chat picker
+3. All subsequent commands apply to that group until you switch
+
+This lets group admins manage everything privately without posting commands in the group chat. `/stats` in DM shows a breakdown of **all registered groups** at once.
 
 ---
 
@@ -217,16 +252,18 @@ The bot resolves the log channel in this order:
    → Must have "Ban members" permission
 
 2. DM the bot → tap "Select Group" → pick your group
+   → The bot auto-runs /import_admins on first selection
 
-3. /import_admins
-   → Whitelists all current admins with name + username + profile photo hash
+3. /import_admins (re-run if needed)
+   → Whitelists all current admins (human + bots) with name + username + PFP hash
+   → Stores the group's profile photo for group-identity detection
 
 4. /watch <reply or ID>
    → Protect any VIPs who are not group admins
 
 5. /addkeyword admin
-   → Add any words that only real admins should have in their name
-   → Examples: Admin, Support, Official, CEO, Mod
+   → Add words only real admins should have in their name
+   → Examples: Admin, Support, Official, CEO, Mod, Staff
 
 6. /setaction ban
    → Default is already ban; confirm or switch to kick / alert
@@ -249,30 +286,48 @@ The bot runs two clients simultaneously:
 | **python-telegram-bot (PTB)** | Handles all commands, member-join events, and message scanning via the Telegram Bot API |
 | **Pyrogram (MTProto)** | User-session client; receives raw profile-change events and enumerates all group members for sweeps — both impossible via the Bot API |
 
-State is stored in **PostgreSQL**. The whitelist is cached in memory with a 60-second TTL to avoid hammering the DB on busy groups.
+State is stored in **PostgreSQL**. Frequently-read data is cached in memory:
+
+| Cache | TTL | What |
+| --- | --- | --- |
+| Whitelist | 60 s | Per-group list of protected users |
+| Group config | 5 min | Mode, action, threshold, log channel, group PFP hash |
+| Reserved keywords | 5 min | Per-group keyword/regex list |
+| Admin status | 5 min | Per-(user, group) admin check result — eliminates repeated `getChatMember` API calls |
+| False-positive grace | 5 min | Per-(user, group) clearance status |
+
+All caches are invalidated immediately on the relevant admin write (e.g. `/setmode` invalidates the group config cache).
 
 ### Background Tasks (Pyrogram only)
 
 | Task | Schedule |
 | --- | --- |
-| **Full sweep** | On startup + every 6 hours |
+| **Full sweep** | Every 6 hours (first sweep is delayed — no startup sweep) |
 | **PFP hash refresh** | After every sweep (keeps stored hashes current) |
 | **Health check** | Every 5 minutes; auto-reconnects if the Pyrogram session drops |
 | **Daily summary** | Midnight UTC; posts a per-group stats digest to the log channel |
 
+### Sweep Behaviour
+
+- Sweep is **non-blocking**: shows live progress in the status message (`🔍 Sweeping… 150 seen · 120 checked · 2 flagged`)
+- Uses **lazy PFP loading**: profile photos are only downloaded when there's a weak name match that needs confirmation, not for every member
+- The sweep lock prevents two concurrent sweeps on the same group
+- A 2-hour hard cap stops runaway sweeps on very large groups
+
 ---
 
-## Database Schema (key tables)
+## Database Schema
 
 | Table | Purpose |
 | --- | --- |
-| `groups` | Per-group config: mode, action, threshold, log channel |
-| `whitelisted_users` | Protected identities with name, username, PFP hash |
+| `groups` | Per-group config: mode, action, threshold, log channel, **group PFP hash** |
+| `whitelisted_users` | Protected identities with name, username, PFP hash, type (admin/watch/manual) |
 | `seen_members` | Tracks who has been checked (drives Relaxed mode) |
-| `logs` | Detection history: who, what, score, action, trigger |
+| `logs` | Detection history: who, what, score, action, trigger, invite link |
 | `reserved_keywords` | Per-group keyword/regex patterns |
-| `name_change_log` | Timestamps for velocity tracking |
+| `name_change_log` | Timestamps for rename velocity tracking |
 | `admin_actions` | Audit trail of every admin command |
+| **`false_positives`** | 30-day grace windows for manually-cleared users |
 
 ---
 
@@ -296,9 +351,10 @@ State is stored in **PostgreSQL**. The whitelist is cached in memory with a 60-s
 - **No message content scanning** — the bot only checks sender identity, never message text (privacy-safe)
 - **No global whitelist** — each group maintains its own independent whitelist
 - **Bio scanning only on profile changes** — not during sweeps (MTProto `GetFullUser` is too expensive per member at scale)
-- **PFP is a tiebreaker, not a primary signal** — a matching photo alone never triggers a ban
+- **PFP is a tiebreaker, not a primary signal** — a matching photo alone never triggers a ban (except for group-identity matches where a weak name match is also present)
 - **Relaxed mode cache is persistent** — a user who passed their initial check won't be re-scanned by messages until their profile changes or a sweep runs
-- **Sweep requires the bot's Pyrogram session to be a member of the group** — the session account must be in the group to enumerate members
+- **Sweep requires the Pyrogram session to be a member of the group** — the session account must be in the group to enumerate members
+- **False-positive grace expires** — after 30 days, detection resumes for cleared users. Re-clear them or whitelist them if needed.
 
 ---
 
@@ -308,7 +364,7 @@ State is stored in **PostgreSQL**. The whitelist is cached in memory with a 60-s
 | --- | --- | --- |
 | `python-telegram-bot` | v21+ | Bot API client, handlers, persistence |
 | `pyrogram` | v2+ | MTProto client |
-| `psycopg` | v3 | PostgreSQL (async-capable) |
+| `psycopg` | v3 | PostgreSQL (synchronous, connection-per-call) |
 | `rapidfuzz` | latest | Fuzzy string similarity |
 | `imagehash` + `Pillow` | latest | Perceptual profile photo hashing |
 | `confusable_homoglyphs` | latest | Unicode homoglyph detection |
