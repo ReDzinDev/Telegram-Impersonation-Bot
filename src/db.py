@@ -107,6 +107,36 @@ def init_db():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_group ON logs(group_id, created_at DESC);")
 
+            # Per-group similarity threshold
+            cur.execute("""
+                ALTER TABLE groups
+                    ADD COLUMN IF NOT EXISTS similarity_threshold INTEGER;
+            """)
+
+            # Reserved keywords / regex patterns per group
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS reserved_keywords (
+                    id          BIGSERIAL PRIMARY KEY,
+                    group_id    BIGINT NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE,
+                    pattern     TEXT NOT NULL,
+                    is_regex    BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_by  BIGINT,
+                    created_at  TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE(group_id, pattern)
+                );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_kw_group ON reserved_keywords(group_id);")
+
+            # Name-change velocity tracking
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS name_change_log (
+                    id         BIGSERIAL PRIMARY KEY,
+                    user_id    BIGINT NOT NULL,
+                    changed_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_ncl_user_time ON name_change_log(user_id, changed_at DESC);")
+
         conn.commit()
         logger.info("Database initialized.")
     except Exception as e:
@@ -490,5 +520,152 @@ def get_stats(group_id: int) -> dict:
     except Exception as e:
         logger.error(f"get_stats error: {e}")
         return {}
+    finally:
+        conn.close()
+
+
+# ── Reserved keyword helpers ───────────────────────────────────────────────────
+
+def add_reserved_keyword(group_id: int, pattern: str, is_regex: bool, created_by: int) -> bool:
+    conn = get_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO reserved_keywords (group_id, pattern, is_regex, created_by)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (group_id, pattern) DO UPDATE SET is_regex = EXCLUDED.is_regex
+            """, (group_id, pattern, is_regex, created_by))
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"add_reserved_keyword error: {e}")
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
+
+def remove_reserved_keyword(group_id: int, pattern: str) -> bool:
+    conn = get_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM reserved_keywords WHERE group_id = %s AND pattern = %s",
+                (group_id, pattern)
+            )
+            deleted = cur.rowcount > 0
+        conn.commit()
+        return deleted
+    except Exception as e:
+        logger.error(f"remove_reserved_keyword error: {e}")
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
+
+def get_reserved_keywords(group_id: int) -> list[dict]:
+    conn = get_connection()
+    if not conn:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT pattern, is_regex FROM reserved_keywords WHERE group_id = %s ORDER BY created_at",
+                (group_id,)
+            )
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_reserved_keywords error: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+# ── Per-group threshold ────────────────────────────────────────────────────────
+
+def set_group_threshold(group_id: int, threshold: int) -> bool:
+    conn = get_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE groups SET similarity_threshold = %s, updated_at = NOW() WHERE group_id = %s",
+                (threshold, group_id)
+            )
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"set_group_threshold error: {e}")
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
+
+# ── Name-change velocity ───────────────────────────────────────────────────────
+
+def log_name_change(user_id: int):
+    conn = get_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO name_change_log (user_id) VALUES (%s)",
+                (user_id,)
+            )
+        conn.commit()
+    except Exception as e:
+        logger.error(f"log_name_change error: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def count_recent_name_changes(user_id: int, window_minutes: int = 60) -> int:
+    conn = get_connection()
+    if not conn:
+        return 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*) AS cnt FROM name_change_log
+                WHERE user_id = %s AND changed_at > NOW() - INTERVAL '%s minutes'
+            """, (user_id, window_minutes))
+            row = cur.fetchone()
+            return row["cnt"] if row else 0
+    except Exception as e:
+        logger.error(f"count_recent_name_changes error: {e}")
+        return 0
+    finally:
+        conn.close()
+
+
+# ── Recent detections log ──────────────────────────────────────────────────────
+
+def get_recent_logs(group_id: int, limit: int = 10) -> list[dict]:
+    conn = get_connection()
+    if not conn:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT user_id, username, full_name, target_name, detection_type,
+                       similarity_score, action_taken, trigger, created_at
+                FROM logs
+                WHERE group_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, (group_id, limit))
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_recent_logs error: {e}")
+        return []
     finally:
         conn.close()

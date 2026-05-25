@@ -18,6 +18,7 @@ from src.handlers.commands import (
     unwhitelist_user, check_user_cmd, ban_user, unban_user,
     sweep, setmode, setaction, set_log_channel, list_whitelist, stats,
     watch_user, handle_detection_callback, export_whitelist,
+    add_keyword, remove_keyword, list_keywords, set_threshold, logs, import_whitelist,
 )
 from src.handlers.member_join import check_impersonation, on_bot_added_to_group
 from src.handlers.messages import scan_message_sender
@@ -60,6 +61,15 @@ def build_ptb_app(pyro_client=None):
     app.add_handler(CommandHandler("exportwhitelist", export_whitelist))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("watch", watch_user))
+    app.add_handler(CommandHandler("addkeyword",      add_keyword))
+    app.add_handler(CommandHandler("removekeyword",   remove_keyword))
+    app.add_handler(CommandHandler("listkeywords",    list_keywords))
+    app.add_handler(CommandHandler("setthreshold",    set_threshold))
+    app.add_handler(CommandHandler("logs",            logs))
+    app.add_handler(MessageHandler(
+        filters.Document.FileExtension("csv") & filters.ChatType.PRIVATE,
+        import_whitelist,
+    ))
 
     # Inline keyboard callbacks from log-channel detection alerts
     app.add_handler(CallbackQueryHandler(
@@ -130,6 +140,11 @@ async def main():
         BotCommand("setaction",       "Set detection action: ban, kick, or alert"),
         BotCommand("setlogchannel",   "Set per-group log channel"),
         BotCommand("stats",           "Show detection and ban stats"),
+        BotCommand("addkeyword",    "Add a reserved keyword or regex pattern"),
+        BotCommand("removekeyword", "Remove a reserved keyword"),
+        BotCommand("listkeywords",  "List all reserved keywords"),
+        BotCommand("setthreshold",  "Set fuzzy-match sensitivity (default 85)"),
+        BotCommand("logs",          "Show recent detection log"),
     ]
     # Register commands for both private chats and groups
     await ptb_app.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())

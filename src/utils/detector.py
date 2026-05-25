@@ -1,4 +1,5 @@
 
+import re
 from rapidfuzz import fuzz, process
 from typing import List, Tuple, Optional
 from confusable_homoglyphs import confusables
@@ -38,3 +39,31 @@ def check_homoglyph_danger(text: str) -> bool:
     if not text:
         return False
     return confusables.is_dangerous(text)
+
+
+def check_reserved_keywords(
+    full_name: str,
+    username: Optional[str],
+    bio: Optional[str],
+    keywords: list[dict],
+) -> Optional[str]:
+    """
+    Returns the first matched pattern if any reserved keyword/regex hits
+    the user's name, username, or bio. Returns None if no match.
+    """
+    if not keywords:
+        return None
+    texts = [t for t in [full_name, username, bio] if t]
+    for kw in keywords:
+        pattern = kw["pattern"]
+        for text in texts:
+            if kw["is_regex"]:
+                try:
+                    if re.search(pattern, text, re.IGNORECASE):
+                        return pattern
+                except re.error:
+                    pass  # bad regex — skip silently
+            else:
+                if pattern.lower() in text.lower():
+                    return pattern
+    return None

@@ -12,9 +12,12 @@ from typing import Optional, Callable, Awaitable
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 
 from src.db import (
-    get_whitelist, is_whitelisted, insert_log, get_group,
+    get_whitelist, is_whitelisted, insert_log, get_group, get_reserved_keywords,
 )
-from src.utils.detector import check_username_similarity, check_name_similarity, check_homoglyph_danger
+from src.utils.detector import (
+    check_username_similarity, check_name_similarity,
+    check_homoglyph_danger, check_reserved_keywords,
+)
 from src.utils.image import compute_pfp_hash_bytes, check_pfp_similarity
 from src.config import NAME_SIMILARITY_THRESHOLD, PFP_HASH_THRESHOLD
 
@@ -37,11 +40,13 @@ class UserSnapshot:
     first_name: str
     last_name: Optional[str]
     pfp_bytes: Optional[bytes] = None   # raw bytes of current profile photo
+    bio: Optional[str] = None           # Telegram bio / about text (Pyrogram only)
 
 
 @dataclass
 class DetectionResult:
     flagged: bool
+    needs_pfp: bool = False              # True = weak name match; caller should fetch PFP and re-run
     match_type: Optional[str] = None     # 'username' | 'name' | 'pfp' | 'homoglyph_username' | 'homoglyph_name'
     matched_val: Optional[str] = None
     score: float = 0.0
@@ -63,7 +68,23 @@ async def check_user(
     if is_whitelisted(group_id, snapshot.user_id):
         return DetectionResult(flagged=False)
 
+    # Per-group similarity threshold (falls back to global config)
+    group_cfg = get_group(group_id)
+    threshold = (group_cfg.get("similarity_threshold") if group_cfg else None) or NAME_SIMILARITY_THRESHOLD
+
     whitelist = get_whitelist(group_id)
+    full_name = f"{snapshot.first_name} {snapshot.last_name or ''}".strip()
+
+    # 0 — Reserved keyword / regex check (fastest — pure string ops, no fuzzy scoring)
+    keywords = get_reserved_keywords(group_id)
+    if keywords:
+        matched_kw = check_reserved_keywords(full_name, snapshot.username, snapshot.bio, keywords)
+        if matched_kw:
+            return DetectionResult(
+                flagged=True, match_type="keyword",
+                matched_val=matched_kw, score=100.0,
+            )
+
     if not whitelist:
         return DetectionResult(flagged=False)
 
@@ -76,12 +97,10 @@ async def check_user(
     names      = [f"{w['first_name']} {w['last_name'] or ''}".strip() for w in others]
     pfp_hashes = [w["pfp_hash"] for w in others if w["pfp_hash"]]
 
-    full_name = f"{snapshot.first_name} {snapshot.last_name or ''}".strip()
-
     # 1 — Username similarity (username vs whitelist usernames only)
     if snapshot.username and usernames:
         match, matched_val, score = check_username_similarity(
-            snapshot.username, usernames, NAME_SIMILARITY_THRESHOLD
+            snapshot.username, usernames, threshold
         )
         if match:
             target = _find_by_username(others, matched_val)
@@ -93,7 +112,7 @@ async def check_user(
     # 2 — Homoglyph username: only flag if it also fuzzy-matches a whitelisted username
     if snapshot.username and usernames and check_homoglyph_danger(snapshot.username):
         match, matched_val, score = check_username_similarity(
-            snapshot.username, usernames, NAME_SIMILARITY_THRESHOLD
+            snapshot.username, usernames, threshold
         )
         if match:
             target = _find_by_username(others, matched_val)
@@ -104,7 +123,7 @@ async def check_user(
 
     # 3 — Homoglyph name: only flag if it also fuzzy-matches a whitelisted display name
     if check_homoglyph_danger(full_name):
-        match, matched_val, score = check_name_similarity(full_name, names, NAME_SIMILARITY_THRESHOLD)
+        match, matched_val, score = check_name_similarity(full_name, names, threshold)
         if match and not (len(full_name.split()) <= 1 or len(matched_val.split()) <= 1):
             target = _find_by_name(others, matched_val)
             return DetectionResult(
@@ -113,7 +132,7 @@ async def check_user(
             )
 
     # 4 — Display name similarity (name vs whitelist names only)
-    match, matched_val, score = check_name_similarity(full_name, names, NAME_SIMILARITY_THRESHOLD)
+    match, matched_val, score = check_name_similarity(full_name, names, threshold)
     is_weak = match and (len(full_name.split()) <= 1 or len(matched_val.split()) <= 1)
 
     if match and not is_weak:
@@ -123,8 +142,12 @@ async def check_user(
             score=score, **_target_fields(target)
         )
 
-    # 5 — PFP hash
-    if snapshot.pfp_bytes and pfp_hashes:
+    # 5 — PFP hash (tiebreaker for weak name matches only)
+    # A standalone photo match without any name/username similarity is too noisy.
+    if is_weak and pfp_hashes:
+        if not snapshot.pfp_bytes:
+            # Signal the caller to fetch the PFP and re-run (lazy loading for sweep)
+            return DetectionResult(flagged=False, needs_pfp=True)
         target_hash = compute_pfp_hash_bytes(snapshot.pfp_bytes)
         if target_hash:
             pfp_match, pfp_matched_val, pfp_dist = check_pfp_similarity(
@@ -137,7 +160,6 @@ async def check_user(
                     score=pfp_dist, **_target_fields(target)
                 )
 
-    # Weak name match but no PFP match — let them through
     return DetectionResult(flagged=False)
 
 

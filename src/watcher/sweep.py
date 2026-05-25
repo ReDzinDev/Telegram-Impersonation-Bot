@@ -90,17 +90,30 @@ async def sweep_group(
                     mark_seen(group_id, user.id)
                     continue
 
-                pfp_bytes = await _fetch_pfp(pyro, user.id)
-
+                # Fast path: username + name checks only — no PFP download
                 snapshot = UserSnapshot(
                     user_id=user.id,
                     username=user.username,
                     first_name=user.first_name or "",
                     last_name=user.last_name,
-                    pfp_bytes=pfp_bytes,
+                    pfp_bytes=None,
                 )
 
                 result = await check_user(snapshot, group_id)
+
+                # Lazy PFP: only fetch when there's a weak name match that needs confirmation
+                if result.needs_pfp:
+                    pfp_bytes = await _fetch_pfp(pyro, user.id)
+                    if pfp_bytes:
+                        snapshot = UserSnapshot(
+                            user_id=user.id,
+                            username=user.username,
+                            first_name=user.first_name or "",
+                            last_name=user.last_name,
+                            pfp_bytes=pfp_bytes,
+                        )
+                        result = await check_user(snapshot, group_id)
+
                 checked += 1
 
                 if result.flagged:

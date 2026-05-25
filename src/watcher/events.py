@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 from pyrogram import Client, raw
 from telegram import Bot
 
-from src.db import get_all_group_ids, get_groups_for_user, unmark_seen
+from src.db import get_all_group_ids, get_groups_for_user, unmark_seen, log_name_change, count_recent_name_changes
 from src.utils.checker import UserSnapshot, check_user, ban_and_log
 
 if TYPE_CHECKING:
@@ -68,8 +68,33 @@ async def _handle_name_change(
     for gid in group_ids:
         unmark_seen(gid, user_id)
 
+    # Track name-change velocity — rapid renames are a common evasion tactic
+    log_name_change(user_id)
+    change_count = count_recent_name_changes(user_id, window_minutes=60)
+    NAME_CHANGE_VELOCITY_THRESHOLD = 3
+    if change_count >= NAME_CHANGE_VELOCITY_THRESHOLD:
+        logger.warning(
+            f"Name-change velocity alert for {user_id}: "
+            f"{change_count} changes in the last 60 min"
+        )
+        if log_channel_id:
+            try:
+                await bot.send_message(
+                    chat_id=log_channel_id,
+                    text=(
+                        f"⚠️ <b>Name-change velocity alert</b>\n\n"
+                        f"User ID: <code>{user_id}</code> changed their name "
+                        f"<b>{change_count} times</b> in the last 60 minutes.\n"
+                        f"Groups affected: {', '.join(f'<code>{g}</code>' for g in group_ids)}"
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.error(f"Failed to send velocity alert: {e}")
+
     # Fetch current PFP for a full check
     pfp_bytes = await _fetch_pfp(pyro, user_id)
+    bio = await _fetch_bio(pyro, user_id)
 
     snapshot = UserSnapshot(
         user_id=user_id,
@@ -77,6 +102,7 @@ async def _handle_name_change(
         first_name=first_name,
         last_name=last_name,
         pfp_bytes=pfp_bytes,
+        bio=bio,
     )
 
     await _check_and_act(pyro, bot, snapshot, group_ids, trigger="profile_change", log_channel_id=log_channel_id)
@@ -118,6 +144,7 @@ async def _handle_photo_change(
         username = getattr(user, "username", None)
 
     pfp_bytes = await _fetch_pfp(pyro, user_id)
+    bio = await _fetch_bio(pyro, user_id)
 
     snapshot = UserSnapshot(
         user_id=user_id,
@@ -125,6 +152,7 @@ async def _handle_photo_change(
         first_name=first_name,
         last_name=last_name,
         pfp_bytes=pfp_bytes,
+        bio=bio,
     )
 
     await _check_and_act(pyro, bot, snapshot, group_ids, trigger="profile_change", log_channel_id=log_channel_id)
@@ -176,4 +204,14 @@ async def _fetch_pfp(pyro: Client, user_id: int) -> bytes | None:
         return None
     except Exception as e:
         logger.debug(f"Could not fetch PFP for {user_id}: {e}")
+        return None
+
+
+async def _fetch_bio(pyro: Client, user_id: int) -> str | None:
+    """Fetch user bio via MTProto GetFullUser (Pyrogram user client only)."""
+    try:
+        peer = await pyro.resolve_peer(user_id)
+        full = await pyro.invoke(raw.functions.users.GetFullUser(id=peer))
+        return full.full_user.about or None
+    except Exception:
         return None

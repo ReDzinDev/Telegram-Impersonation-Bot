@@ -12,6 +12,8 @@ from src.db import (
     upsert_whitelisted_user, remove_whitelisted_user,
     set_group_check_mode, set_group_action_mode, set_group_log_channel,
     get_stats, get_latest_log_entry, get_whitelist, mark_seen,
+    add_reserved_keyword, remove_reserved_keyword, get_reserved_keywords,
+    set_group_threshold, get_recent_logs,
 )
 from src.utils.image import compute_pfp_hash_bytes
 from src.config import LOG_CHANNEL_ID
@@ -122,7 +124,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/watch — Protect a non-admin VIP's identity\n"
             "/listwhitelist — Show all protected users\n"
             "/exportwhitelist — Download whitelist as CSV\n"
-            "/stats — Show group protection stats",
+            "/stats — Show group protection stats\n"
+            "/addkeyword — Reserve words like 'admin', 'support' (flags any non-whitelisted user with them)\n"
+            "/removekeyword — Remove a reserved keyword\n"
+            "/listkeywords — Show all reserved keywords\n"
+            "/setthreshold — Tune fuzzy-match sensitivity (default 85)\n"
+            "/logs — Show recent detection log",
             parse_mode="HTML",
             reply_markup=ReplyKeyboardMarkup(
                 keyboard, resize_keyboard=True, one_time_keyboard=True
@@ -867,4 +874,280 @@ async def export_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(
         document=InputFile(file_bytes, filename="whitelist.csv"),
         caption=f"Whitelist export — {len(rows)} protected user(s).",
+    )
+
+
+# ── /addkeyword ───────────────────────────────────────────────────────────────
+
+async def add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Add a reserved keyword or regex pattern for this group.
+
+    Usage:
+      /addkeyword admin            — plain keyword (case-insensitive)
+      /addkeyword r:official.*ceo  — regex (prefix with r:)
+    """
+    if not await _is_admin(update, context):
+        await update.message.reply_text("Only admins can use this command.")
+        return
+
+    ctx = await _get_active_group(update, context)
+    if not ctx:
+        return
+    group_id, group_title = ctx
+    upsert_group(group_id, title=group_title)
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage:\n"
+            "  /addkeyword admin             — plain keyword\n"
+            "  /addkeyword r:official.*admin — regex (prefix with <code>r:</code>)\n\n"
+            "Matches against display name, username, and bio.",
+            parse_mode="HTML",
+        )
+        return
+
+    raw_pattern = " ".join(context.args)
+    is_regex = raw_pattern.startswith("r:")
+    pattern  = raw_pattern[2:].strip() if is_regex else raw_pattern.strip()
+
+    if is_regex:
+        import re
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            await update.message.reply_text(
+                f"❌ Invalid regex: <code>{e}</code>", parse_mode="HTML"
+            )
+            return
+
+    add_reserved_keyword(group_id, pattern, is_regex, update.effective_user.id)
+    kind = "regex" if is_regex else "keyword"
+    await update.message.reply_text(
+        f"✅ {kind.capitalize()} <code>{pattern}</code> added — "
+        "any non-whitelisted user whose name, username, or bio matches will be flagged.",
+        parse_mode="HTML",
+    )
+
+
+# ── /removekeyword ────────────────────────────────────────────────────────────
+
+async def remove_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_admin(update, context):
+        await update.message.reply_text("Only admins can use this command.")
+        return
+
+    ctx = await _get_active_group(update, context)
+    if not ctx:
+        return
+    group_id, _ = ctx
+
+    if not context.args:
+        await update.message.reply_text("Usage: /removekeyword &lt;pattern&gt;", parse_mode="HTML")
+        return
+
+    pattern = " ".join(context.args)
+    if pattern.startswith("r:"):
+        pattern = pattern[2:].strip()
+
+    removed = remove_reserved_keyword(group_id, pattern)
+    if removed:
+        await update.message.reply_text(f"✅ Keyword <code>{pattern}</code> removed.", parse_mode="HTML")
+    else:
+        await update.message.reply_text(
+            f"⚠️ <code>{pattern}</code> not found in keyword list.", parse_mode="HTML"
+        )
+
+
+# ── /listkeywords ─────────────────────────────────────────────────────────────
+
+async def list_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_admin(update, context):
+        await update.message.reply_text("Only admins can use this command.")
+        return
+
+    ctx = await _get_active_group(update, context)
+    if not ctx:
+        return
+    group_id, _ = ctx
+
+    rows = get_reserved_keywords(group_id)
+    if not rows:
+        await update.message.reply_text(
+            "No reserved keywords set.\n"
+            "Use /addkeyword to add terms like <code>admin</code>, <code>support</code>, etc.",
+            parse_mode="HTML",
+        )
+        return
+
+    lines = []
+    for r in rows:
+        tag = "regex" if r["is_regex"] else "keyword"
+        lines.append(f"• <code>{r['pattern']}</code> <i>({tag})</i>")
+
+    await update.message.reply_text(
+        f"🔑 <b>Reserved keywords ({len(rows)})</b>\n\n" + "\n".join(lines),
+        parse_mode="HTML",
+    )
+
+
+# ── /setthreshold ─────────────────────────────────────────────────────────────
+
+async def set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Set the fuzzy-match similarity threshold for this group (default: 85).
+    Lower = more detections (more false positives).
+    Higher = stricter (may miss subtle impersonation).
+    Recommended range: 75–92.
+    """
+    if not await _is_admin(update, context):
+        await update.message.reply_text("Only admins can use this command.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /setthreshold &lt;number&gt;\n\n"
+            "Sets the similarity threshold for name/username matching.\n"
+            "Default: <code>85</code> — recommended range: <code>75</code>–<code>92</code>.\n"
+            "Lower = more sensitive, higher = more strict.",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        val = int(context.args[0])
+        if not (50 <= val <= 100):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Provide an integer between 50 and 100.")
+        return
+
+    ctx = await _get_active_group(update, context)
+    if not ctx:
+        return
+    group_id, group_title = ctx
+    upsert_group(group_id, title=group_title)
+    set_group_threshold(group_id, val)
+
+    await update.message.reply_text(
+        f"✅ Similarity threshold set to <code>{val}</code>.", parse_mode="HTML"
+    )
+
+
+# ── /logs ─────────────────────────────────────────────────────────────────────
+
+async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show recent detection log entries. Usage: /logs [limit=10]"""
+    if not await _is_admin(update, context):
+        await update.message.reply_text("Only admins can use this command.")
+        return
+
+    ctx = await _get_active_group(update, context)
+    if not ctx:
+        return
+    group_id, _ = ctx
+
+    limit = 10
+    if context.args:
+        try:
+            limit = max(1, min(int(context.args[0]), 50))
+        except ValueError:
+            pass
+
+    rows = get_recent_logs(group_id, limit)
+    if not rows:
+        await update.message.reply_text("No detections logged for this group yet.")
+        return
+
+    lines = []
+    for r in rows:
+        dt = r["created_at"].strftime("%m-%d %H:%M") if r["created_at"] else "?"
+        name = r["full_name"] or r["username"] or f"ID {r['user_id']}"
+        target = r["target_name"] or "?"
+        dtype = r["detection_type"] or "?"
+        action = r["action_taken"] or "?"
+        lines.append(
+            f"<b>{dt}</b> — <a href='tg://user?id={r['user_id']}'>{name}</a> "
+            f"→ {target} | <i>{dtype}</i> | {action}"
+        )
+
+    msg = f"📋 <b>Last {len(rows)} detections</b>\n\n" + "\n".join(lines)
+    if len(msg) > 4096:
+        msg = msg[:4090] + "…"
+    await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
+
+
+# ── /importwhitelist ──────────────────────────────────────────────────────────
+
+async def import_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Upload a CSV file to bulk-add users to the whitelist.
+    Expected columns: user_id, username, first_name, last_name
+    (same format as /exportwhitelist output).
+    """
+    if not await _is_admin(update, context):
+        await update.message.reply_text("Only admins can use this command.")
+        return
+
+    ctx = await _get_active_group(update, context)
+    if not ctx:
+        return
+    group_id, group_title = ctx
+    upsert_group(group_id, title=group_title)
+
+    doc = update.message.document
+    if not doc:
+        await update.message.reply_text(
+            "Send a CSV file as a document with this command.\n"
+            "Expected columns: <code>user_id, username, first_name, last_name</code>\n\n"
+            "Use /exportwhitelist to download the current whitelist as a template.",
+            parse_mode="HTML",
+        )
+        return
+
+    if not doc.file_name or not doc.file_name.endswith(".csv"):
+        await update.message.reply_text("Please send a .csv file.")
+        return
+
+    try:
+        file = await context.bot.get_file(doc.file_id)
+        raw_bytes = await file.download_as_bytearray()
+        text = raw_bytes.decode("utf-8", errors="replace")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Could not download file: <code>{e}</code>", parse_mode="HTML")
+        return
+
+    reader = csv.DictReader(io.StringIO(text))
+    required = {"user_id", "first_name"}
+    if not required.issubset(set(reader.fieldnames or [])):
+        await update.message.reply_text(
+            f"❌ CSV must have at least: <code>user_id, first_name</code>", parse_mode="HTML"
+        )
+        return
+
+    added = 0
+    skipped = 0
+    for row in reader:
+        try:
+            uid = int(row["user_id"])
+        except (ValueError, KeyError):
+            skipped += 1
+            continue
+        upsert_whitelisted_user(
+            group_id=group_id,
+            user_id=uid,
+            username=row.get("username") or None,
+            first_name=row.get("first_name") or "Unknown",
+            last_name=row.get("last_name") or None,
+            pfp_hash=None,
+            whitelisted_by=update.effective_user.id,
+            user_type="manual",
+        )
+        mark_seen(group_id, uid)
+        added += 1
+
+    await update.message.reply_text(
+        f"✅ Imported <b>{added}</b> user(s) into whitelist for <b>{group_title}</b>."
+        + (f"\n⚠️ Skipped {skipped} invalid row(s)." if skipped else ""),
+        parse_mode="HTML",
     )
