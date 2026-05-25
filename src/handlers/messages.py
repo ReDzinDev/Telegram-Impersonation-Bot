@@ -108,7 +108,7 @@ async def scan_message_sender(update: Update, context: ContextTypes.DEFAULT_TYPE
                 first_name=user.first_name,
                 last_name=user.last_name,
                 pfp_hash=compute_pfp_hash_bytes(pfp_bytes) if pfp_bytes else None,
-                whitelisted_by=0,
+                whitelisted_by=context.bot.id,
                 user_type="admin",
             )
             logger.info(f"Auto-whitelisted admin {user.id} after false-positive detection in group {group_id}.")

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from io import BytesIO
 from typing import Optional
 
@@ -64,8 +65,17 @@ async def sweep_group(
             logger.error(f"Cannot resolve group {group_id} for sweep: {e}")
             return {"checked": 0, "flagged": 0, "errors": 1}
 
+        sweep_deadline = time.monotonic() + 7200  # 2-hour hard cap per group
+
         try:
             async for member in pyro.get_chat_members(group_id):
+                if time.monotonic() > sweep_deadline:
+                    logger.warning(
+                        f"Sweep hard-cap (2 h) reached for group {group_id}; "
+                        f"stopping early after {checked} members."
+                    )
+                    break
+
                 user = member.user
                 if not user or user.is_bot or user.is_deleted:
                     continue
@@ -84,7 +94,7 @@ async def sweep_group(
                         first_name=user.first_name or "",
                         last_name=user.last_name,
                         pfp_hash=compute_pfp_hash_bytes(pfp_bytes_admin) if pfp_bytes_admin else None,
-                        whitelisted_by=0,
+                        whitelisted_by=bot.id,
                         user_type="admin",
                     )
                     mark_seen(group_id, user.id)

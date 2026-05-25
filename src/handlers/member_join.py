@@ -78,7 +78,7 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
             first_name=user.first_name,
             last_name=user.last_name,
             pfp_hash=pfp_hash,
-            whitelisted_by=0,
+            whitelisted_by=context.bot.id,
             user_type="admin",
         )
         mark_seen(group_id, user.id)
@@ -141,7 +141,7 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
                 first_name=user.first_name,
                 last_name=user.last_name,
                 pfp_hash=compute_pfp_hash_bytes(pfp_bytes) if pfp_bytes else None,
-                whitelisted_by=0,
+                whitelisted_by=context.bot.id,
                 user_type="admin",
             )
             mark_seen(group_id, user.id)

@@ -137,6 +137,21 @@ def init_db():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_ncl_user_time ON name_change_log(user_id, changed_at DESC);")
 
+            # Admin action audit log
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS admin_actions (
+                    id         BIGSERIAL PRIMARY KEY,
+                    group_id   BIGINT,
+                    admin_id   BIGINT NOT NULL,
+                    admin_name TEXT,
+                    action     TEXT NOT NULL,
+                    target_id  BIGINT,
+                    details    TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_aa_group ON admin_actions(group_id, created_at DESC);")
+
         conn.commit()
         logger.info("Database initialized.")
     except Exception as e:
@@ -666,6 +681,112 @@ def get_recent_logs(group_id: int, limit: int = 10) -> list[dict]:
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_recent_logs error: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+# ── Admin action audit log ─────────────────────────────────────────────────────
+
+def log_admin_action(
+    group_id: int | None,
+    admin_id: int,
+    admin_name: str,
+    action: str,
+    target_id: int | None = None,
+    details: str | None = None,
+) -> None:
+    """Record a deliberate admin action (whitelist, ban, setmode, etc.)."""
+    conn = get_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO admin_actions (group_id, admin_id, admin_name, action, target_id, details)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (group_id, admin_id, admin_name, action, target_id, details))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"log_admin_action error: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def get_recent_admin_actions(group_id: int, limit: int = 20) -> list[dict]:
+    conn = get_connection()
+    if not conn:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT admin_id, admin_name, action, target_id, details, created_at
+                FROM admin_actions
+                WHERE group_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, (group_id, limit))
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_recent_admin_actions error: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+# ── Bulk whitelist clear ───────────────────────────────────────────────────────
+
+def clear_whitelist(group_id: int) -> int:
+    """Remove ALL whitelisted users for a group. Returns count of rows deleted."""
+    conn = get_connection()
+    if not conn:
+        return 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM whitelisted_users WHERE group_id = %s",
+                (group_id,)
+            )
+            count = cur.rowcount
+        conn.commit()
+        _invalidate_whitelist_cache(group_id)
+        return count
+    except Exception as e:
+        logger.error(f"clear_whitelist error: {e}")
+        conn.rollback()
+        return 0
+    finally:
+        conn.close()
+
+
+# ── All-groups stats ───────────────────────────────────────────────────────────
+
+def get_all_group_stats() -> list[dict]:
+    """Return protection and detection stats for every registered group."""
+    conn = get_connection()
+    if not conn:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    g.group_id,
+                    g.title,
+                    g.check_mode,
+                    g.action_mode,
+                    COUNT(DISTINCT w.user_id)                                          AS whitelisted,
+                    COUNT(DISTINCT CASE WHEN l.action_taken = 'banned' THEN l.log_id END) AS banned,
+                    COUNT(DISTINCT l.log_id)                                           AS detections
+                FROM groups g
+                LEFT JOIN whitelisted_users w ON w.group_id = g.group_id
+                LEFT JOIN logs l              ON l.group_id = g.group_id
+                GROUP BY g.group_id, g.title, g.check_mode, g.action_mode
+                ORDER BY g.group_id
+            """)
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_all_group_stats error: {e}")
         return []
     finally:
         conn.close()
