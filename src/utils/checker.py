@@ -5,6 +5,7 @@ Called from: join handler, message handler, sweep, and Pyrogram profile-change w
 """
 from __future__ import annotations
 
+import html
 import logging
 from dataclasses import dataclass
 from typing import Optional, Callable, Awaitable
@@ -225,12 +226,12 @@ async def ban_and_log(
         log_msg = (
             f"🚨 <b>Impersonation Detected</b>\n\n"
             f"<b>Group ID:</b> <code>{group_id}</code>\n"
-            f"<b>User:</b> <a href='tg://user?id={snapshot.user_id}'>{full_name}</a>"
-            f" (@{snapshot.username or 'N/A'}) | ID: <code>{snapshot.user_id}</code>\n"
-            f"<b>Impersonating:</b> {target_display}"
+            f"<b>User:</b> <a href='tg://user?id={snapshot.user_id}'>{html.escape(full_name)}</a>"
+            f" (@{html.escape(snapshot.username or 'N/A')}) | ID: <code>{snapshot.user_id}</code>\n"
+            f"<b>Impersonating:</b> {html.escape(target_display)}"
             f" (ID: <code>{result.target_user_id or 'N/A'}</code>)\n"
             f"<b>Method:</b> {result.match_type}\n"
-            f"<b>Match:</b> <code>{result.matched_val}</code>\n"
+            f"<b>Match:</b> <code>{html.escape(str(result.matched_val))}</code>\n"
             f"<b>Score:</b> <code>{result.score}</code>\n"
             f"<b>Trigger:</b> {trigger}\n"
             f"<b>Invite link:</b> {invite_link or 'N/A'}\n"

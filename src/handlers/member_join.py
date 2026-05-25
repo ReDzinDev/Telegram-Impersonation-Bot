@@ -1,4 +1,5 @@
 
+import html
 import logging
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -39,7 +40,7 @@ async def on_bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TY
                     chat_id=log_channel,
                     text=(
                         f"➕ <b>Bot added to new group</b>\n"
-                        f"<b>{chat.title}</b> (<code>{chat.id}</code>)\n\n"
+                        f"<b>{html.escape(chat.title or str(chat.id))}</b> (<code>{chat.id}</code>)\n\n"
                         f"Run /import_admins in that group to populate the whitelist."
                     ),
                     parse_mode="HTML",

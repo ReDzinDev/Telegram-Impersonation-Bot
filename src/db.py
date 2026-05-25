@@ -772,16 +772,16 @@ def get_all_group_stats() -> list[dict]:
             cur.execute("""
                 SELECT
                     g.group_id,
-                    g.title,
-                    g.check_mode,
-                    g.action_mode,
+                    MIN(g.title)       AS title,
+                    MIN(g.check_mode)  AS check_mode,
+                    MIN(g.action_mode) AS action_mode,
                     COUNT(DISTINCT w.user_id)                                          AS whitelisted,
                     COUNT(DISTINCT CASE WHEN l.action_taken = 'banned' THEN l.log_id END) AS banned,
                     COUNT(DISTINCT l.log_id)                                           AS detections
                 FROM groups g
                 LEFT JOIN whitelisted_users w ON w.group_id = g.group_id
                 LEFT JOIN logs l              ON l.group_id = g.group_id
-                GROUP BY g.group_id, g.title, g.check_mode, g.action_mode
+                GROUP BY g.group_id
                 ORDER BY g.group_id
             """)
             return cur.fetchall()

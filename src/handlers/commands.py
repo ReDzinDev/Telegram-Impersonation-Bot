@@ -1,5 +1,6 @@
 
 import csv
+import html
 import io
 import logging
 
@@ -96,7 +97,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         group_title = context.user_data.get("active_group_title")
 
         group_line = (
-            f"Active group: <b>{group_title}</b> (<code>{group_id}</code>)"
+            f"Active group: <b>{html.escape(str(group_title))}</b> (<code>{group_id}</code>)"
             if group_id else
             "No group selected yet."
         )
@@ -168,7 +169,7 @@ async def handle_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["active_group_title"] = group_title
 
     await update.message.reply_text(
-        f"✅ <b>Active group:</b> {group_title}\n\n"
+        f"✅ <b>Active group:</b> {html.escape(group_title)}\n\n"
         "You can now run all commands from here and they'll apply to that group.\n"
         "Use /start to switch groups.",
         parse_mode="HTML",
@@ -236,7 +237,7 @@ async def _import_admins_logic(
         action="import_admins",
         details=f"Imported {count} admin(s)",
     )
-    return True, f"✅ Imported/updated <b>{count}</b> admin(s) for <b>{chat.title or chat_id}</b>."
+    return True, f"✅ Imported/updated <b>{count}</b> admin(s) for <b>{html.escape(str(chat.title or chat_id))}</b>."
 
 
 # ── /whitelist ─────────────────────────────────────────────────────────────────
@@ -291,7 +292,7 @@ async def whitelist_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         details=target.full_name,
     )
     await update.message.reply_text(
-        f"✅ <b>{target.full_name}</b> has been whitelisted.", parse_mode="HTML"
+        f"✅ <b>{html.escape(target.full_name)}</b> has been whitelisted.", parse_mode="HTML"
     )
 
 
@@ -397,15 +398,15 @@ async def check_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"⚠️ <b>Suspicious user detected</b>\n"
             f"Match type: <code>{result.match_type}</code>\n"
-            f"Matched: <code>{result.matched_val}</code>\n"
+            f"Matched: <code>{html.escape(str(result.matched_val))}</code>\n"
             f"Score: <code>{result.score:.1f}</code>\n"
-            f"Impersonating: <b>{result.target_name or 'Unknown'}</b>\n"
+            f"Impersonating: <b>{html.escape(result.target_name or 'Unknown')}</b>\n"
             f"Action if triggered: <i>{action_labels.get(action_mode, action_mode)}</i>",
             parse_mode="HTML",
         )
     else:
         await update.message.reply_text(
-            f"✅ <b>{target.full_name}</b> looks clean — no whitelist matches.", parse_mode="HTML"
+            f"✅ <b>{html.escape(target.full_name)}</b> looks clean — no whitelist matches.", parse_mode="HTML"
         )
 
 
@@ -655,8 +656,8 @@ async def list_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = []
     for r in rows:
-        name  = f"{r['first_name']} {r['last_name'] or ''}".strip()
-        uname = f"@{r['username']}" if r['username'] else "no username"
+        name  = html.escape(f"{r['first_name']} {r['last_name'] or ''}".strip())
+        uname = f"@{html.escape(r['username'])}" if r['username'] else "no username"
         kind  = r.get("user_type", "manual")
         lines.append(f"• <a href='tg://user?id={r['user_id']}'>{name}</a> ({uname}) — <i>{kind}</i>")
 
@@ -714,7 +715,7 @@ async def set_log_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(
             chat_id=channel_id,
-            text=f"✅ Log channel set for group <b>{group_title}</b>.",
+            text=f"✅ Log channel set for group <b>{html.escape(group_title)}</b>.",
             parse_mode="HTML",
         )
     except Exception as e:
@@ -734,6 +735,10 @@ async def set_log_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /stats ─────────────────────────────────────────────────────────────────────
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_admin(update, context):
+        await update.message.reply_text("Only admins can use this command.")
+        return
+
     # Private chat: show a breakdown of every registered group
     if update.effective_chat.type == ChatType.PRIVATE:
         all_gs = get_all_group_stats()
@@ -747,7 +752,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         lines = [f"📊 <b>Stats across {len(all_gs)} group(s)</b>\n"]
         for gs in all_gs:
-            title = gs.get("title") or str(gs["group_id"])
+            title = html.escape(gs.get("title") or str(gs["group_id"]))
             lines.append(
                 f"<b>{title}</b>\n"
                 f"  🛡 {gs.get('whitelisted', 0)} protected · "
@@ -832,7 +837,7 @@ async def watch_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             details=target.full_name,
         )
         await update.message.reply_text(
-            f"👁 <b>{target.full_name}</b> is now watched — impersonators will be banned.",
+            f"👁 <b>{html.escape(target.full_name)}</b> is now watched — impersonators will be banned.",
             parse_mode="HTML",
         )
         return
@@ -907,7 +912,7 @@ async def watch_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         details=full_name,
     )
     await update.message.reply_text(
-        f"👁 <b>{full_name}</b> (ID: <code>{pyro_user.id}</code>) is now watched.",
+        f"👁 <b>{html.escape(full_name)}</b> (ID: <code>{pyro_user.id}</code>) is now watched.",
         parse_mode="HTML",
     )
 
@@ -1190,10 +1195,10 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = []
     for r in rows:
-        dt = r["created_at"].strftime("%m-%d %H:%M") if r["created_at"] else "?"
-        name = r["full_name"] or r["username"] or f"ID {r['user_id']}"
-        target = r["target_name"] or "?"
-        dtype = r["detection_type"] or "?"
+        dt     = r["created_at"].strftime("%m-%d %H:%M") if r["created_at"] else "?"
+        name   = html.escape(r["full_name"] or r["username"] or f"ID {r['user_id']}")
+        target = html.escape(r["target_name"] or "?")
+        dtype  = r["detection_type"] or "?"
         action = r["action_taken"] or "?"
         lines.append(
             f"<b>{dt}</b> — <a href='tg://user?id={r['user_id']}'>{name}</a> "
@@ -1379,10 +1384,10 @@ async def audit_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
     for r in rows:
         dt     = r["created_at"].strftime("%m-%d %H:%M") if r["created_at"] else "?"
-        who    = r["admin_name"] or f"ID {r['admin_id']}"
+        who    = html.escape(r["admin_name"] or f"ID {r['admin_id']}")
         action = r["action"]
         target = f" → <code>{r['target_id']}</code>" if r["target_id"] else ""
-        detail = f" ({r['details']})" if r["details"] else ""
+        detail = f" ({html.escape(r['details'])})" if r["details"] else ""
         lines.append(f"<b>{dt}</b> {who} — {action}{target}{detail}")
 
     header  = f"🔍 <b>Last {len(rows)} admin actions</b>\n\n"
