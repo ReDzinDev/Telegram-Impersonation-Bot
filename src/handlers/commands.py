@@ -225,30 +225,74 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /start private group-picker callback ──────────────────────────────────────
 
 async def handle_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    shared   = update.message.chat_shared
-    group_id = shared.chat_id
+    shared     = update.message.chat_shared
+    request_id = shared.request_id
+    chat_id    = shared.chat_id
 
-    try:
-        chat        = await context.bot.get_chat(group_id)
-        group_title = chat.title or str(group_id)
-    except Exception:
-        group_title = str(group_id)
+    # ── request_id=1: group picker (active group selection) ──────────────────
+    if request_id == 1:
+        try:
+            chat        = await context.bot.get_chat(chat_id)
+            group_title = chat.title or str(chat_id)
+        except Exception:
+            group_title = str(chat_id)
 
-    context.user_data["active_group_id"]    = group_id
-    context.user_data["active_group_title"] = group_title
+        context.user_data["active_group_id"]    = chat_id
+        context.user_data["active_group_title"] = group_title
 
-    await update.message.reply_text(
-        f"✅ <b>Active group:</b> {html.escape(group_title)}\n\n"
-        "You can now run all commands from here and they'll apply to that group.\n"
-        "Use /start to switch groups.",
-        parse_mode="HTML",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+        await update.message.reply_text(
+            f"✅ <b>Active group:</b> {html.escape(group_title)}\n\n"
+            "You can now run all commands from here and they'll apply to that group.\n"
+            "Use /start to switch groups.",
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
-    ok, msg = await _import_admins_logic(
-        group_id, update.effective_user.id, update.effective_user.full_name, context
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
+        ok, msg = await _import_admins_logic(
+            chat_id, update.effective_user.id, update.effective_user.full_name, context
+        )
+        await update.message.reply_text(msg, parse_mode="HTML")
+        return
+
+    # ── request_id=2: log channel picker ─────────────────────────────────────
+    if request_id == 2:
+        # Resolve the group we're configuring
+        g_id    = context.user_data.get("active_group_id")
+        g_title = context.user_data.get("active_group_title", str(g_id) if g_id else "?")
+
+        if not g_id:
+            await update.message.reply_text(
+                "No active group selected. Use /start to pick a group first.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+
+        # Verify the bot can post to the channel
+        try:
+            channel_chat  = await context.bot.get_chat(chat_id)
+            channel_title = channel_chat.title or str(chat_id)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"✅ Log channel set for group <b>{html.escape(g_title)}</b>.",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ Could not post to that channel: <code>{html.escape(str(e))}</code>\n\n"
+                "Make sure the bot is an admin in the channel and has permission to post messages.",
+                parse_mode="HTML",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+
+        upsert_group(g_id, title=g_title)
+        set_group_log_channel(g_id, chat_id)
+        await update.message.reply_text(
+            f"✅ Log channel set to <b>{html.escape(channel_title)}</b> "
+            f"(<code>{chat_id}</code>) for <b>{html.escape(g_title)}</b>.",
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
 
 # ── /import_admins ─────────────────────────────────────────────────────────────
@@ -735,13 +779,31 @@ async def set_log_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group_id, group_title = ctx
 
     if not context.args:
-        await update.message.reply_text(
-            "Usage:\n"
-            "  /setlogchannel &lt;channel_id&gt;\n"
-            "  /setlogchannel clear\n\n"
-            "Get the channel ID by forwarding a message from it to @userinfobot.",
-            parse_mode="HTML",
-        )
+        # In private chat: offer the channel picker button for easy selection
+        if update.effective_chat.type == ChatType.PRIVATE:
+            keyboard = [[KeyboardButton(
+                "Select log channel",
+                request_chat=KeyboardButtonRequestChat(
+                    request_id=2,
+                    chat_is_channel=True,
+                    bot_is_member=True,
+                ),
+            )]]
+            await update.message.reply_text(
+                "Pick the channel you want to use as the log channel for "
+                f"<b>{html.escape(group_title)}</b>.\n\n"
+                "The bot must already be an admin in that channel.",
+                parse_mode="HTML",
+                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
+            )
+        else:
+            await update.message.reply_text(
+                "Usage:\n"
+                "  /setlogchannel &lt;channel_id&gt;\n"
+                "  /setlogchannel clear\n\n"
+                "Tip: DM me and use /setlogchannel there to get a channel picker button.",
+                parse_mode="HTML",
+            )
         return
     upsert_group(group_id, title=group_title)
 
