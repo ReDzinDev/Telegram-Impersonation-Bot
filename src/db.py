@@ -8,13 +8,30 @@ from src.config import DATABASE_URL
 logger = logging.getLogger(__name__)
 
 
-def get_connection(retries: int = 5, delay: int = 2):
+def get_connection(retries: int = 8, base_delay: float = 2.0):
+    """
+    Open a new psycopg connection with exponential-backoff retries.
+
+    Railway Hobby databases go to sleep after inactivity and can take
+    15-30 s to wake up.  Exponential backoff (2 → 4 → 8 → 16 → 30 → 30…)
+    gives us up to ~2 minutes to wait for a cold-start without hammering
+    the server.  connect_timeout=30 ensures a sleeping DB fails fast
+    (rather than hanging) so the retry loop fires promptly.
+    """
     for attempt in range(retries):
         try:
-            return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+            return psycopg.connect(
+                DATABASE_URL,
+                row_factory=dict_row,
+                connect_timeout=30,
+            )
         except Exception as e:
             if attempt < retries - 1:
-                logger.warning(f"DB connection attempt {attempt + 1}/{retries} failed, retrying in {delay}s: {e}")
+                delay = min(base_delay * (2 ** attempt), 30)
+                logger.warning(
+                    f"DB connection attempt {attempt + 1}/{retries} failed, "
+                    f"retrying in {delay:.0f}s: {e}"
+                )
                 time.sleep(delay)
             else:
                 logger.error(f"DB connection failed after {retries} attempts: {e}")

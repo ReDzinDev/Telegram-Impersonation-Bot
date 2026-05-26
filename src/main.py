@@ -13,7 +13,7 @@ from src.config import (
     BOT_TOKEN, LOG_CHANNEL_ID,
     PYROGRAM_API_ID, PYROGRAM_API_HASH, PYROGRAM_SESSION, PYROGRAM_ENABLED,
 )
-from src.db import init_db
+from src.db import init_db, get_connection
 from src.handlers.commands import (
     start, handle_chat_shared, import_admins, whitelist_user,
     unwhitelist_user, check_user_cmd, ban_user, unban_user,
@@ -33,6 +33,32 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
+
+
+async def _db_keepalive(interval: int = 270) -> None:
+    """
+    Ping the database every *interval* seconds so Railway's Hobby Postgres
+    never enters sleep mode between sweeps / activity bursts.
+
+    Uses 270 s (just under 5 min) to stay inside psycopg's implicit
+    idle-connection timeout and Railway's own inactivity window.
+    On failure we log a warning and keep retrying — get_connection() will
+    do its own exponential-backoff retry before giving up.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        conn = get_connection()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                logger.debug("DB keep-alive ping OK")
+            except Exception as e:
+                logger.warning(f"DB keep-alive query failed: {e}")
+            finally:
+                conn.close()
+        else:
+            logger.warning("DB keep-alive: could not connect (database may be waking up)")
 
 
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -210,6 +236,9 @@ async def main():
             run_health_check(pyro_client, ptb_app.bot, LOG_CHANNEL_ID)
         )
 
+    # DB keep-alive — prevents Railway Hobby Postgres from sleeping
+    keepalive_task = asyncio.create_task(_db_keepalive())
+
     summary_task = None
     if LOG_CHANNEL_ID:
         from src.watcher.summary import run_daily_summary
@@ -223,6 +252,7 @@ async def main():
         pass
     finally:
         logger.info("Shutting down…")
+        keepalive_task.cancel()
         if summary_task:
             summary_task.cancel()
         if pyro_client:
