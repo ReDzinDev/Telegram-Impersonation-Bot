@@ -279,8 +279,7 @@ async def ban_and_log(
             f"<b>Invite link:</b> {invite_link or 'N/A'}\n"
             f"<b>Action:</b> {action}"
         )
-        # Attach action buttons only when the user was actually banned/kicked
-        keyboard = None
+        # Attach action buttons for every detection (labels differ by action type)
         if action in ("banned", "kicked"):
             keyboard = InlineKeyboardMarkup([
                 [
@@ -300,6 +299,29 @@ async def ban_and_log(
                     ),
                 ],
             ])
+        elif action == "alerted":
+            # User is still in the group — no unban needed, but admins
+            # should still be able to clear the alert as a false positive.
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "✅ Whitelist",
+                        callback_data=f"unban_wl|{group_id}|{snapshot.user_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "🔕 Ignore (30d)",
+                        callback_data=f"unban_fp|{group_id}|{snapshot.user_id}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🗑 Dismiss",
+                        callback_data=f"dismiss|{group_id}|{snapshot.user_id}",
+                    ),
+                ],
+            ])
+        else:
+            keyboard = None
         try:
             await log_channel_notify(log_msg, keyboard)
         except Exception as e:

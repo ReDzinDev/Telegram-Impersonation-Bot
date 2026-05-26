@@ -984,15 +984,17 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
         return
 
     if action == "unban_wl":
+        # only_if_banned=True is safe for alert-mode detections (no-op if not banned)
         try:
             await context.bot.unban_chat_member(
                 chat_id=group_id, user_id=user_id, only_if_banned=True
             )
         except Exception as e:
-            await query.answer(f"Unban failed: {e}", show_alert=True)
+            await query.answer(f"Action failed: {e}", show_alert=True)
             return
 
         entry = get_latest_log_entry(group_id, user_id)
+        was_banned = entry and entry.get("action_taken") in ("banned", "kicked")
         if entry:
             name_parts = (entry.get("full_name") or "").split(maxsplit=1)
             first_name = name_parts[0] if name_parts else "Unknown"
@@ -1013,25 +1015,31 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
         )
 
         await query.edit_message_reply_markup(reply_markup=None)
-        await query.answer(f"Unbanned + whitelisted by {admin_name}.", show_alert=False)
+        msg = (
+            f"Unbanned + whitelisted by {admin_name}." if was_banned
+            else f"Whitelisted by {admin_name} (alert cleared)."
+        )
+        await query.answer(msg, show_alert=False)
 
     if action == "unban_fp":
-        # Unban without whitelisting — 30-day grace period so detection doesn't
-        # immediately re-ban them on next sweep or re-join.
+        # only_if_banned=True makes this safe for alert-mode (no-op if not banned)
         try:
             await context.bot.unban_chat_member(
                 chat_id=group_id, user_id=user_id, only_if_banned=True
             )
         except Exception as e:
-            await query.answer(f"Unban failed: {e}", show_alert=True)
+            await query.answer(f"Action failed: {e}", show_alert=True)
             return
 
+        entry = get_latest_log_entry(group_id, user_id)
+        was_banned = entry and entry.get("action_taken") in ("banned", "kicked")
         mark_false_positive(group_id, user_id, cleared_by=query.from_user.id, days=30)
         await query.edit_message_reply_markup(reply_markup=None)
-        await query.answer(
-            f"Unbanned (false positive — 30-day grace) by {admin_name}.",
-            show_alert=False,
+        msg = (
+            f"Unbanned (30-day grace) by {admin_name}." if was_banned
+            else f"Alert ignored — 30-day grace set by {admin_name}."
         )
+        await query.answer(msg, show_alert=False)
 
 
 # ── /exportwhitelist ──────────────────────────────────────────────────────────
