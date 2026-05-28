@@ -32,13 +32,11 @@ Detection is a pipeline — stops at first hit. Configurable fuzzy threshold per
 
 ## Actions & Modes
 
-**Action** (per group): `ban` · `kick` · `alert`  
-**Scan mode** (per group): `relaxed` (check once on first message) · `strict` (re-check every 5 min)
+**Action** (per group): `ban` · `kick` · `alert`
 
-When a ban or kick fires, the log channel alert shows three inline buttons:
-- **✅ Unban + Whitelist** — reverse and protect permanently
-- **🔓 Unban only** — reverse with a 30-day grace period (no whitelist entry)
-- **🗑 Dismiss** — keep the ban, remove buttons
+Each user is scanned **once** — on their first message in the group — and re-checked thereafter via the Pyrogram profile-change watcher and the 6-hour auto-sweep.
+
+When a detection fires, the log channel alert shows inline buttons. After a ban/kick: **Unban + Whitelist** · **Unban only (30-day grace)** · **Dismiss**. In alert-only mode: **Ban** · **Kick** · **Whitelist** · **Ignore (30d)** · **Dismiss**.
 
 ---
 
@@ -47,17 +45,15 @@ When a ban or kick fires, the log channel alert shows three inline buttons:
 | Command | What it does |
 |---|---|
 | `/import_admins` | Whitelist all current admins (human + bots like Rose/Combot) and store the group's own logo for brand protection |
-| `/watch` | Protect a non-admin VIP (reply or ID) |
-| `/whitelist` / `/unwhitelist` | Add or remove any user (reply or ID) |
+| `/whitelist` / `/unwhitelist` | Add or remove any user (reply or ID). Falls back to the Pyrogram userbot for users not yet in the chat. |
+| `/listwhitelist` | Show whitelist (Admins / Bots / Manual sections) + CSV export attached |
 | `/sweep` | Run a full member scan immediately |
-| `/check` | Manually check a user and preview the action that would be taken |
-| `/setmode strict\|relaxed` | Set scan mode |
 | `/setaction ban\|kick\|alert` | Set detection action |
 | `/setthreshold 85` | Fuzzy sensitivity 50–100 (default 85) |
-| `/addkeyword admin` | Reserve a word; prefix `r:` for regex |
-| `/setlogchannel -100…` | Per-group log channel |
-| `/stats` | Stats for this group (or all groups in private DM) |
-| `/logs` / `/auditlog` | Recent detections / admin actions |
+| `/addkeyword admin, *mod*, r:official.*ceo` | Add keywords — commas, `*` wildcards, and `r:` regex all supported |
+| `/setlogchannel` | Pick a per-group log channel via the channel picker |
+| `/stats` | Stats with All-time / 30d / 7d breakdown |
+| `/logs` | Recent detections + admin actions in one reply |
 | `/clearwhitelist confirm` | ⚠️ Wipe the entire whitelist |
 
 All commands work from a **private DM** with the bot — select a group via the picker, then manage it without posting in the group chat.

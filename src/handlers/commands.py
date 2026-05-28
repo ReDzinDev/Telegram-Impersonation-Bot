@@ -12,13 +12,13 @@ from telegram.constants import ChatMemberStatus, ChatType
 from src.db import (
     get_group, upsert_group,
     upsert_whitelisted_user, remove_whitelisted_user,
-    set_group_check_mode, set_group_action_mode, set_group_log_channel,
-    get_stats, get_latest_log_entry, get_whitelist, mark_seen,
+    set_group_action_mode, set_group_log_channel,
+    get_stats_windowed, get_latest_log_entry, get_whitelist, mark_seen,
     add_reserved_keyword, remove_reserved_keyword, get_reserved_keywords,
     set_group_threshold, get_recent_logs,
-    log_admin_action, get_recent_admin_actions,
+    log_admin_action, get_recent_admin_actions, insert_log,
     clear_whitelist as db_clear_whitelist,
-    get_all_group_stats,
+    get_all_group_stats_windowed,
     mark_false_positive,
 )
 from src.utils.image import compute_pfp_hash_bytes
@@ -183,28 +183,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"👋 <b>Anti-Impersonator Bot</b>\n\n"
             f"{group_line}\n\n"
-            "<b>Available commands:</b>\n"
+            "<b>Whitelist</b>\n"
             "/import_admins — Whitelist all current admins\n"
             "/whitelist — Reply, or /whitelist 123456\n"
             "/unwhitelist — Reply, or /unwhitelist 123456\n"
-            "/watch — Protect a VIP (reply or /watch 123456)\n"
-            "/listwhitelist — Show all protected users\n"
-            "/exportwhitelist — Download whitelist as CSV\n"
+            "/listwhitelist — Show whitelist + download CSV\n"
             "/clearwhitelist confirm — ⚠️ Remove all protected users\n"
-            "/check — Reply, or /check 123456\n"
+            "\n<b>Moderation</b>\n"
             "/ban — Reply, or /ban 123456\n"
             "/unban 123456 — Unban a user by ID\n"
             "/sweep — Full member scan (Pyrogram required)\n"
-            "/setmode strict|relaxed — Default: relaxed\n"
+            "\n<b>Configuration</b>\n"
             "/setaction ban|kick|alert — Default: ban\n"
-            "/setlogchannel -100… — or /setlogchannel clear\n"
-            "/addkeyword admin — or /addkeyword r:official.*admin for regex\n"
-            "/removekeyword admin — Remove a reserved keyword\n"
-            "/listkeywords — List all reserved keywords\n"
+            "/setlogchannel — Pick the log channel (or /setlogchannel clear)\n"
             "/setthreshold 85 — Fuzzy sensitivity (50–100, default 85)\n"
-            "/stats — Stats (all groups shown in private chat)\n"
-            "/logs 20 — Last N detections\n"
-            "/auditlog 20 — Last N admin actions",
+            "/addkeyword admin, *mod*, support* — keywords, wildcards, regex (r:...)\n"
+            "/removekeyword admin — Remove a keyword\n"
+            "/listkeywords — List reserved keywords\n"
+            "\n<b>Insights</b>\n"
+            "/stats — All-time, 30d, 7d breakdown\n"
+            "/logs 20 — Recent detections + admin actions",
             parse_mode="HTML",
             reply_markup=ReplyKeyboardMarkup(
                 keyboard, resize_keyboard=True, one_time_keyboard=True
@@ -213,10 +211,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         group_id = update.effective_chat.id
         group = get_group(group_id)
-        mode = group["check_mode"] if group else "not registered"
+        action = (group.get("action_mode", "ban") if group else "not registered")
         await update.message.reply_text(
             f"🛡 <b>Anti-Impersonator Bot active</b>\n"
-            f"Mode: <code>{mode}</code>\n\n"
+            f"Action mode: <code>{action}</code>\n\n"
             "Use /import_admins to populate the whitelist.",
             parse_mode="HTML",
         )
@@ -341,6 +339,7 @@ async def _import_admins_logic(
             pfp_hash=pfp_hash,
             whitelisted_by=requester_id,
             user_type="admin",
+            is_bot=bool(user.is_bot),
         )
         mark_seen(chat_id, user.id)
         count += 1
@@ -364,53 +363,126 @@ async def _import_admins_logic(
 # ── /whitelist ─────────────────────────────────────────────────────────────────
 
 async def whitelist_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Add a user to the protected list.
+
+    Resolution order:
+      1. Reply to a message  → use that user.
+      2. /whitelist <id>     → Bot API getChatMember; if that fails (user
+                                not in the chat yet, etc.), fall back to
+                                the Pyrogram userbot when available.
+
+    This replaces the old /watch command — there was no behavioural
+    difference, just a cosmetic user_type tag, which is now always
+    'manual' for hand-added entries.
+    """
     ctx = await _get_admin_group(update, context)
     if not ctx:
         return
     group_id, _ = ctx
 
-    # In-group: reply to the target message
+    target = None              # PTB User (when resolved via Bot API)
+    pyro_user = None           # Pyrogram user (when resolved via MTProto)
+
     if update.message.reply_to_message:
         target = update.message.reply_to_message.from_user
     elif context.args:
-        # Private or in-group with ID: look up via the bot
         try:
             target_id = int(context.args[0])
-            member    = await context.bot.get_chat_member(group_id, target_id)
-            target    = member.user
-        except (ValueError, Exception) as e:
+        except ValueError:
             await update.message.reply_text(
-                f"❌ Could not find user: <code>{e}</code>\n"
-                "Usage: reply to a message or /whitelist &lt;user_id&gt;",
+                "Usage: reply to a message, or /whitelist &lt;user_id&gt;",
                 parse_mode="HTML",
             )
             return
+
+        # Try Bot API first — fastest and works for users in the chat
+        try:
+            member = await context.bot.get_chat_member(group_id, target_id)
+            target = member.user
+        except Exception:
+            # Fall back to the Pyrogram userbot — required for users
+            # who haven't joined the group yet (proactive whitelisting)
+            pyro = context.bot_data.get("pyro_client")
+            if not pyro:
+                await update.message.reply_text(
+                    f"❌ Could not find user <code>{target_id}</code> in this group.\n"
+                    "Enable the Pyrogram watcher to whitelist users by ID without "
+                    "them being in the chat.",
+                    parse_mode="HTML",
+                )
+                return
+            try:
+                pyro_user = await pyro.get_users(target_id)
+            except Exception as e:
+                await update.message.reply_text(
+                    f"❌ Could not resolve user <code>{target_id}</code>: <code>{e}</code>",
+                    parse_mode="HTML",
+                )
+                return
     else:
         await update.message.reply_text("Reply to a user's message or provide a user ID.")
         return
 
-    pfp_hash = await _fetch_pfp(target)
+    # Normalize fields + fetch PFP hash from whichever client resolved the user
+    if target is not None:
+        user_id    = target.id
+        username   = target.username
+        first_name = target.first_name
+        last_name  = target.last_name
+        full_name  = target.full_name
+        is_bot     = bool(target.is_bot)
+        pfp_hash   = await _fetch_pfp(target)
+    else:
+        # Pyrogram path
+        user_id    = pyro_user.id
+        # Pyrogram surfaces usernames as a list on multi-username accounts
+        if getattr(pyro_user, "usernames", None):
+            username = pyro_user.usernames[0].username
+        else:
+            username = getattr(pyro_user, "username", None)
+        first_name = pyro_user.first_name or ""
+        last_name  = pyro_user.last_name
+        full_name  = f"{first_name} {last_name or ''}".strip()
+        is_bot     = bool(getattr(pyro_user, "is_bot", False))
+        pfp_hash   = await _fetch_pfp_pyro(context.bot_data["pyro_client"], user_id)
+
     upsert_whitelisted_user(
         group_id=group_id,
-        user_id=target.id,
-        username=target.username,
-        first_name=target.first_name,
-        last_name=target.last_name,
+        user_id=user_id,
+        username=username,
+        first_name=first_name,
+        last_name=last_name,
         pfp_hash=pfp_hash,
         whitelisted_by=update.effective_user.id,
+        user_type="manual",
+        is_bot=is_bot,
     )
-    mark_seen(group_id, target.id)
+    mark_seen(group_id, user_id)
     log_admin_action(
         group_id=group_id,
         admin_id=update.effective_user.id,
         admin_name=update.effective_user.full_name,
         action="whitelist",
-        target_id=target.id,
-        details=target.full_name,
+        target_id=user_id,
+        details=full_name,
     )
     await update.message.reply_text(
-        f"✅ <b>{html.escape(target.full_name)}</b> has been whitelisted.", parse_mode="HTML"
+        f"✅ <b>{html.escape(full_name)}</b> has been whitelisted.", parse_mode="HTML"
     )
+
+
+async def _fetch_pfp_pyro(pyro, user_id: int) -> str | None:
+    """Download and hash a user's PFP via the Pyrogram userbot."""
+    from io import BytesIO
+    try:
+        photo = await pyro.get_chat_photos(user_id, limit=1).__anext__()
+        buf = BytesIO()
+        async for chunk in pyro.stream_media(photo):
+            buf.write(chunk)
+        return compute_pfp_hash_bytes(buf.getvalue())
+    except Exception:
+        return None
 
 
 # ── /unwhitelist ───────────────────────────────────────────────────────────────
@@ -449,76 +521,6 @@ async def unwhitelist_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"User <code>{target_id}</code> was not in the whitelist.", parse_mode="HTML")
 
 
-# ── /check ─────────────────────────────────────────────────────────────────────
-
-async def check_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ctx = await _get_admin_group(update, context)
-    if not ctx:
-        return
-    group_id, _ = ctx
-
-    from src.utils.checker import UserSnapshot, check_user
-
-    # Resolve target from reply or user ID argument
-    if update.message.reply_to_message:
-        target = update.message.reply_to_message.from_user
-    elif context.args:
-        try:
-            target_id = int(context.args[0])
-            member    = await context.bot.get_chat_member(group_id, target_id)
-            target    = member.user
-        except (ValueError, Exception) as e:
-            await update.message.reply_text(
-                f"❌ Could not find user: <code>{e}</code>\n"
-                "Usage: reply to a message or /check &lt;user_id&gt;",
-                parse_mode="HTML",
-            )
-            return
-    else:
-        await update.message.reply_text("Reply to a user's message or provide a user ID.")
-        return
-
-    pfp_bytes = None
-    try:
-        photos = await target.get_profile_photos(limit=1)
-        if photos.total_count > 0:
-            f         = await photos.photos[0][-1].get_file()
-            pfp_bytes = bytes(await f.download_as_bytearray())
-    except Exception:
-        pass
-
-    snapshot = UserSnapshot(
-        user_id=target.id,
-        username=target.username,
-        first_name=target.first_name,
-        last_name=target.last_name,
-        pfp_bytes=pfp_bytes,
-    )
-    result = await check_user(snapshot, group_id)
-
-    if result.flagged:
-        group_cfg   = get_group(group_id)
-        action_mode = (group_cfg.get("action_mode", "ban") if group_cfg else None) or "ban"
-        action_labels = {
-            "ban":   "permanently banned",
-            "kick":  "kicked (not permanently banned)",
-            "alert": "alert only — no action taken",
-        }
-        await update.message.reply_text(
-            f"⚠️ <b>Suspicious user detected</b>\n"
-            f"Match type: <code>{result.match_type}</code>\n"
-            f"Matched: <code>{html.escape(str(result.matched_val))}</code>\n"
-            f"Score: <code>{result.score:.1f}</code>\n"
-            f"Impersonating: <b>{html.escape(result.target_name or 'Unknown')}</b>\n"
-            f"Action if triggered: <i>{action_labels.get(action_mode, action_mode)}</i>",
-            parse_mode="HTML",
-        )
-    else:
-        await update.message.reply_text(
-            f"✅ <b>{html.escape(target.full_name)}</b> looks clean — no whitelist matches.", parse_mode="HTML"
-        )
-
-
 # ── /ban ───────────────────────────────────────────────────────────────────────
 
 async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -551,7 +553,6 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await context.bot.ban_chat_member(chat_id=group_id, user_id=target_id)
-        from src.db import insert_log
         insert_log(
             group_id=group_id,
             user_id=target_id,
@@ -664,38 +665,6 @@ async def sweep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ── /setmode ───────────────────────────────────────────────────────────────────
-
-async def setmode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ctx = await _get_admin_group(update, context)
-    if not ctx:
-        return
-    group_id, group_title = ctx
-
-    if not context.args or context.args[0].lower() not in ("strict", "relaxed"):
-        await update.message.reply_text("Usage: /setmode strict|relaxed")
-        return
-
-    mode = context.args[0].lower()
-    upsert_group(group_id, title=group_title)
-    set_group_check_mode(group_id, mode)
-    log_admin_action(
-        group_id=group_id,
-        admin_id=update.effective_user.id,
-        admin_name=update.effective_user.full_name,
-        action="setmode",
-        details=mode,
-    )
-
-    desc = (
-        "every message sender is re-checked" if mode == "strict"
-        else "each user is checked only on their first message"
-    )
-    await update.message.reply_text(
-        f"✅ Scan mode set to <b>{mode}</b> — {desc}.", parse_mode="HTML"
-    )
-
-
 # ── /setaction ────────────────────────────────────────────────────────────────
 
 async def setaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -738,6 +707,11 @@ async def setaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /listwhitelist ────────────────────────────────────────────────────────────
 
 async def list_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Show the protected users, split into Admins / Bots / Manual sections,
+    and attach a CSV export so admins don't need a separate command.
+    (This used to be two commands: /listwhitelist and /exportwhitelist.)
+    """
     ctx = await _get_admin_group(update, context)
     if not ctx:
         return
@@ -748,26 +722,63 @@ async def list_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No protected users yet. Run /import_admins first.")
         return
 
-    lines = []
+    # Partition rows into the three buckets we report on. is_bot is
+    # authoritative (set from User.is_bot at write time); we no longer
+    # need the username-ends-in-'bot' heuristic.
+    admins:  list[dict] = []
+    bots:    list[dict] = []
+    manual:  list[dict] = []
     for r in rows:
+        if r.get("is_bot"):
+            bots.append(r)
+        elif r.get("user_type") == "admin":
+            admins.append(r)
+        else:
+            manual.append(r)
+
+    def _fmt(r: dict) -> str:
         name  = html.escape(f"{r['first_name']} {r['last_name'] or ''}".strip())
         uname = f"@{html.escape(r['username'])}" if r['username'] else "no username"
-        kind  = r.get("user_type", "manual")
-        lines.append(f"• <a href='tg://user?id={r['user_id']}'>{name}</a> ({uname}) — <i>{kind}</i>")
+        return f"• <a href='tg://user?id={r['user_id']}'>{name}</a> ({uname})"
 
-    header = f"🛡 <b>Protected users ({len(rows)})</b>\n\n"
-    msg    = header + "\n".join(lines)
-    if len(msg) <= 4096:
-        await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
+    header = (
+        f"🛡 <b>Protected users — {len(rows)} total</b>\n"
+        f"<i>{len(admins)} admins · {len(bots)} bots · {len(manual)} manual</i>\n"
+    )
+
+    sections = []
+    if admins:
+        sections.append("\n👑 <b>Admins</b>\n" + "\n".join(_fmt(r) for r in admins))
+    if bots:
+        sections.append("\n🤖 <b>Bots</b>\n" + "\n".join(_fmt(r) for r in bots))
+    if manual:
+        sections.append("\n✋ <b>Manual</b>\n" + "\n".join(_fmt(r) for r in manual))
+
+    # Telegram caps messages at 4096 chars — chunk by section line
+    body = header + "".join(sections)
+    if len(body) <= 4096:
+        await update.message.reply_text(body, parse_mode="HTML", disable_web_page_preview=True)
     else:
-        chunks, current = [], header
-        for line in lines:
-            if len(current) + len(line) + 1 > 4096:
+        current = header
+        for section in sections:
+            if len(current) + len(section) + 1 > 4096:
                 await update.message.reply_text(current, parse_mode="HTML", disable_web_page_preview=True)
                 current = ""
-            current += line + "\n"
-        if current:
+            current += section
+        if current.strip():
             await update.message.reply_text(current, parse_mode="HTML", disable_web_page_preview=True)
+
+    # Attach the CSV export — same payload the old /exportwhitelist produced.
+    buf = io.StringIO()
+    fieldnames = ["user_id", "username", "first_name", "last_name", "user_type", "is_bot", "created_at"]
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+    file_bytes = io.BytesIO(buf.getvalue().encode("utf-8"))
+    await update.message.reply_document(
+        document=InputFile(file_bytes, filename="whitelist.csv"),
+        caption=f"CSV export — {len(rows)} protected user(s).",
+    )
 
 
 # ── /setlogchannel ────────────────────────────────────────────────────────────
@@ -843,180 +854,90 @@ async def set_log_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /stats ─────────────────────────────────────────────────────────────────────
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Show stats with All-time / Last 30d / Last 7d breakdowns.
+
+    In a group chat: stats for that group.
+    In a private chat: per-group rollup across every registered group.
+    """
     ctx = await _get_admin_group(update, context)
     if not ctx:
         return
 
-    # Private chat: show a breakdown of every registered group
+    # Private chat: per-group rollup with All / 30d / 7d windows
     if update.effective_chat.type == ChatType.PRIVATE:
-        all_gs = get_all_group_stats()
+        all_gs = get_all_group_stats_windowed()
         if not all_gs:
             await update.message.reply_text("No groups registered yet.")
             return
 
-        total_protected  = sum(g.get("whitelisted", 0)  for g in all_gs)
-        total_detections = sum(g.get("detections", 0)   for g in all_gs)
-        total_bans       = sum(g.get("banned", 0)       for g in all_gs)
+        # Aggregate totals across every group, per window
+        tot = {
+            "protected":      sum(g.get("whitelisted", 0)      for g in all_gs),
+            "detections_all": sum(g.get("detections_all", 0)   for g in all_gs),
+            "detections_30d": sum(g.get("detections_30d", 0)   for g in all_gs),
+            "detections_7d":  sum(g.get("detections_7d", 0)    for g in all_gs),
+            "banned_all":     sum(g.get("banned_all", 0)       for g in all_gs),
+            "banned_30d":     sum(g.get("banned_30d", 0)       for g in all_gs),
+            "banned_7d":      sum(g.get("banned_7d", 0)        for g in all_gs),
+        }
 
         lines = [f"📊 <b>Stats across {len(all_gs)} group(s)</b>\n"]
         for gs in all_gs:
             title = html.escape(gs.get("title") or str(gs["group_id"]))
             lines.append(
-                f"<b>{title}</b>\n"
-                f"  🛡 {gs.get('whitelisted', 0)} protected · "
-                f"🚨 {gs.get('detections', 0)} detections · "
-                f"🚫 {gs.get('banned', 0)} bans · "
-                f"mode: {gs.get('check_mode', '?')}/{gs.get('action_mode', '?')}"
+                f"<b>{title}</b> · action: {gs.get('action_mode', '?')}\n"
+                f"  🛡 protected: {gs.get('whitelisted', 0)}\n"
+                f"  🚨 detections — all: {gs.get('detections_all', 0)} · "
+                f"30d: {gs.get('detections_30d', 0)} · "
+                f"7d: {gs.get('detections_7d', 0)}\n"
+                f"  🚫 bans — all: {gs.get('banned_all', 0)} · "
+                f"30d: {gs.get('banned_30d', 0)} · "
+                f"7d: {gs.get('banned_7d', 0)}"
             )
 
         lines.append(
-            f"\n<b>Total:</b> {total_protected} protected · "
-            f"{total_detections} detections · {total_bans} bans"
+            f"\n<b>Totals</b> · 🛡 {tot['protected']} protected\n"
+            f"  🚨 detections — all: {tot['detections_all']} · "
+            f"30d: {tot['detections_30d']} · 7d: {tot['detections_7d']}\n"
+            f"  🚫 bans — all: {tot['banned_all']} · "
+            f"30d: {tot['banned_30d']} · 7d: {tot['banned_7d']}"
         )
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        # Chunk for the 4096-char cap
+        msg = "\n".join(lines)
+        for i in range(0, len(msg), 4000):
+            await update.message.reply_text(msg[i:i+4000], parse_mode="HTML")
         return
 
-    # Group chat: show this group's stats
+    # Group chat: windowed breakdown
     group_id = update.effective_chat.id
     group    = get_group(group_id)
-    s        = get_stats(group_id)
+    s        = get_stats_windowed(group_id)
 
     if not s:
         await update.message.reply_text("No stats available yet.")
         return
 
-    mode      = group["check_mode"]  if group else "unknown"
-    action    = group.get("action_mode", "ban") if group else "ban"
+    action    = (group.get("action_mode", "ban") if group else "ban") or "ban"
     threshold = group.get("similarity_threshold") if group else None
     thr_label = f"<code>{threshold}</code>" if threshold else "<code>85</code> (default)"
 
+    def _row(label: str, det: int, banned: int, sweeps: int) -> str:
+        return (
+            f"<b>{label}</b>\n"
+            f"  🚨 detections: <code>{det}</code> · "
+            f"🚫 bans: <code>{banned}</code> · "
+            f"🧹 sweeps: <code>{sweeps}</code>"
+        )
+
     await update.message.reply_text(
         f"📊 <b>Stats for this group</b>\n\n"
-        f"Scan mode: <code>{mode}</code>\n"
         f"Action mode: <code>{action}</code>\n"
         f"Similarity threshold: {thr_label}\n"
-        f"Whitelisted users: <code>{s.get('whitelisted', 0)}</code>\n"
-        f"Total detections: <code>{s.get('detections', 0)}</code>\n"
-        f"Total bans: <code>{s.get('banned', 0)}</code>",
-        parse_mode="HTML",
-    )
-
-
-# ── /watch ─────────────────────────────────────────────────────────────────────
-
-async def watch_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Protect a non-admin VIP's identity without granting them any trust.
-
-    Usage:
-      /watch          — reply to a message from the user to watch
-      /watch <id>     — watch by user ID (requires Pyrogram to resolve profile)
-    """
-    ctx = await _get_admin_group(update, context)
-    if not ctx:
-        return
-    group_id, group_title = ctx
-    upsert_group(group_id, title=group_title)
-
-    # ── Case 1: reply to a message ─────────────────────────────────────────────
-    if update.message.reply_to_message:
-        target   = update.message.reply_to_message.from_user
-        pfp_hash = await _fetch_pfp(target)
-        upsert_whitelisted_user(
-            group_id=group_id,
-            user_id=target.id,
-            username=target.username,
-            first_name=target.first_name,
-            last_name=target.last_name,
-            pfp_hash=pfp_hash,
-            whitelisted_by=update.effective_user.id,
-            user_type="watch",
-        )
-        log_admin_action(
-            group_id=group_id,
-            admin_id=update.effective_user.id,
-            admin_name=update.effective_user.full_name,
-            action="watch",
-            target_id=target.id,
-            details=target.full_name,
-        )
-        await update.message.reply_text(
-            f"👁 <b>{html.escape(target.full_name)}</b> is now watched — impersonators will be banned.",
-            parse_mode="HTML",
-        )
-        return
-
-    # ── Case 2: /watch <user_id> via Pyrogram ──────────────────────────────────
-    if not context.args:
-        await update.message.reply_text(
-            "Usage: reply to a message with /watch, or /watch &lt;user_id&gt;",
-            parse_mode="HTML",
-        )
-        return
-
-    try:
-        target_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Provide a numeric user ID.")
-        return
-
-    pyro = context.bot_data.get("pyro_client")
-    if not pyro:
-        await update.message.reply_text(
-            "⚠️ Looking up users by ID requires the Pyrogram watcher.\n"
-            "Set PYROGRAM_API_ID, PYROGRAM_API_HASH, and PYROGRAM_SESSION, "
-            "or use /watch as a reply to a message instead."
-        )
-        return
-
-    try:
-        pyro_user = await pyro.get_users(target_id)
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ Could not resolve user <code>{target_id}</code>: <code>{e}</code>", parse_mode="HTML"
-        )
-        return
-
-    from io import BytesIO
-    from src.utils.image import compute_pfp_hash_bytes as _hash_bytes
-    pfp_hash = None
-    try:
-        buf = BytesIO()
-        async for chunk in pyro.stream_media(
-            await pyro.get_chat_photos(target_id, limit=1).__anext__()
-        ):
-            buf.write(chunk)
-        pfp_hash = _hash_bytes(buf.getvalue())
-    except Exception:
-        pass
-
-    username = None
-    if getattr(pyro_user, "usernames", None):
-        username = pyro_user.usernames[0].username
-    else:
-        username = getattr(pyro_user, "username", None)
-
-    upsert_whitelisted_user(
-        group_id=group_id,
-        user_id=pyro_user.id,
-        username=username,
-        first_name=pyro_user.first_name or "",
-        last_name=pyro_user.last_name,
-        pfp_hash=pfp_hash,
-        whitelisted_by=update.effective_user.id,
-        user_type="watch",
-    )
-    full_name = f"{pyro_user.first_name or ''} {pyro_user.last_name or ''}".strip()
-    log_admin_action(
-        group_id=group_id,
-        admin_id=update.effective_user.id,
-        admin_name=update.effective_user.full_name,
-        action="watch",
-        target_id=pyro_user.id,
-        details=full_name,
-    )
-    await update.message.reply_text(
-        f"👁 <b>{html.escape(full_name)}</b> (ID: <code>{pyro_user.id}</code>) is now watched.",
+        f"🛡 Protected users: <code>{s.get('whitelisted', 0)}</code>\n\n"
+        + _row("All time",   s.get("detections_all", 0), s.get("banned_all", 0), s.get("sweeps_all", 0)) + "\n"
+        + _row("Last 30 days", s.get("detections_30d", 0), s.get("banned_30d", 0), s.get("sweeps_30d", 0)) + "\n"
+        + _row("Last 7 days",  s.get("detections_7d", 0),  s.get("banned_7d", 0),  s.get("sweeps_7d", 0)),
         parse_mode="HTML",
     )
 
@@ -1029,7 +950,10 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
 
     Callback data format: "<action>|<group_id>|<user_id>"
       unban_wl  — unban the user and add them to the whitelist
+      unban_fp  — unban with a 30-day false-positive grace
       dismiss   — remove the buttons without taking action
+      ban_now   — escalate an alert-mode detection to a permanent ban
+      kick_now  — escalate an alert-mode detection to a kick (no ban)
     """
     query = update.callback_query
     await query.answer()
@@ -1043,6 +967,45 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
 
     if action == "dismiss":
         await query.edit_message_reply_markup(reply_markup=None)
+        return
+
+    # Escalation actions from alert-mode detections
+    if action in ("ban_now", "kick_now"):
+        try:
+            await context.bot.ban_chat_member(chat_id=group_id, user_id=user_id)
+            if action == "kick_now":
+                # Telegram kick = ban + immediate unban so the user can rejoin
+                await context.bot.unban_chat_member(
+                    chat_id=group_id, user_id=user_id, only_if_banned=True
+                )
+        except Exception as e:
+            await query.answer(f"Action failed: {e}", show_alert=True)
+            return
+
+        verb = "banned" if action == "ban_now" else "kicked"
+        # Mirror the manual /ban path so the detection log reflects the outcome
+        entry = get_latest_log_entry(group_id, user_id)
+        insert_log(
+            group_id=group_id,
+            user_id=user_id,
+            username=(entry or {}).get("username"),
+            full_name=(entry or {}).get("full_name"),
+            target_user_id=None, target_name=None,
+            detection_type="manual_escalation", similarity_score=None,
+            action_taken=verb,
+            details=f"Escalated from alert by {admin_name} ({query.from_user.id})",
+            trigger="alert_escalation",
+        )
+        log_admin_action(
+            group_id=group_id,
+            admin_id=query.from_user.id,
+            admin_name=admin_name,
+            action=verb,
+            target_id=user_id,
+            details="from alert button",
+        )
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.answer(f"{verb.capitalize()} by {admin_name}.", show_alert=False)
         return
 
     if action == "unban_wl":
@@ -1076,6 +1039,16 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
             user_type="manual",
         )
 
+        # Audit-log the action so /logs reflects who reversed what
+        log_admin_action(
+            group_id=group_id,
+            admin_id=query.from_user.id,
+            admin_name=admin_name,
+            action="unban_whitelist" if was_banned else "whitelist",
+            target_id=user_id,
+            details="from alert button",
+        )
+
         await query.edit_message_reply_markup(reply_markup=None)
         msg = (
             f"Unbanned + whitelisted by {admin_name}." if was_banned
@@ -1096,6 +1069,14 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
         entry = get_latest_log_entry(group_id, user_id)
         was_banned = entry and entry.get("action_taken") in ("banned", "kicked")
         mark_false_positive(group_id, user_id, cleared_by=query.from_user.id, days=30)
+        log_admin_action(
+            group_id=group_id,
+            admin_id=query.from_user.id,
+            admin_name=admin_name,
+            action="unban_grace" if was_banned else "false_positive_grace",
+            target_id=user_id,
+            details="30-day grace, from alert button",
+        )
         await query.edit_message_reply_markup(reply_markup=None)
         msg = (
             f"Unbanned (30-day grace) by {admin_name}." if was_banned
@@ -1104,41 +1085,23 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
         await query.answer(msg, show_alert=False)
 
 
-# ── /exportwhitelist ──────────────────────────────────────────────────────────
-
-async def export_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ctx = await _get_admin_group(update, context)
-    if not ctx:
-        return
-    group_id, _ = ctx
-
-    rows = get_whitelist(group_id)
-    if not rows:
-        await update.message.reply_text("No protected users yet. Run /import_admins first.")
-        return
-
-    buf = io.StringIO()
-    fieldnames = ["user_id", "username", "first_name", "last_name", "user_type", "created_at"]
-    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
-    writer.writeheader()
-    writer.writerows(rows)
-
-    file_bytes = io.BytesIO(buf.getvalue().encode("utf-8"))
-    await update.message.reply_document(
-        document=InputFile(file_bytes, filename="whitelist.csv"),
-        caption=f"Whitelist export — {len(rows)} protected user(s).",
-    )
-
-
 # ── /addkeyword ───────────────────────────────────────────────────────────────
 
 async def add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Add a reserved keyword or regex pattern for this group.
+    Add one or more reserved keywords / regex patterns for this group.
 
-    Usage:
-      /addkeyword admin            — plain keyword (case-insensitive)
-      /addkeyword r:official.*ceo  — regex (prefix with r:)
+    Multiple entries can be supplied in a single command separated by commas.
+    Each entry is one of:
+      admin           — substring match (default, case-insensitive)
+      admin*          — starts-with `admin`
+      *admin          — ends-with `admin`
+      *admin*         — explicit "contains" (same as bare `admin`)
+      r:official.*ceo — Python regex (prefix with `r:`)
+
+    Examples:
+      /addkeyword admin, support, *ceo*
+      /addkeyword admin*, r:official.*team
     """
     ctx = await _get_admin_group(update, context)
     if not ctx:
@@ -1149,34 +1112,55 @@ async def add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "Usage:\n"
-            "  /addkeyword admin             — plain keyword\n"
-            "  /addkeyword r:official.*admin — regex (prefix with <code>r:</code>)\n\n"
-            "Matches against display name, username, and bio.",
+            "  /addkeyword admin                       — substring match\n"
+            "  /addkeyword admin*                      — starts-with\n"
+            "  /addkeyword *admin                      — ends-with\n"
+            "  /addkeyword r:official.*admin           — regex (prefix <code>r:</code>)\n"
+            "  /addkeyword admin, support, *mod*       — multiple at once\n\n"
+            "Matches are case-insensitive and checked against display name, "
+            "username, and bio.",
             parse_mode="HTML",
         )
         return
 
-    raw_pattern = " ".join(context.args)
-    is_regex = raw_pattern.startswith("r:")
-    pattern  = raw_pattern[2:].strip() if is_regex else raw_pattern.strip()
+    # Split on commas so a single command can register many keywords.
+    raw = " ".join(context.args)
+    entries = [e.strip() for e in raw.split(",") if e.strip()]
 
-    if is_regex:
-        import re
-        try:
-            re.compile(pattern)
-        except re.error as e:
-            await update.message.reply_text(
-                f"❌ Invalid regex: <code>{e}</code>", parse_mode="HTML"
-            )
-            return
+    if not entries:
+        await update.message.reply_text("No keywords provided.")
+        return
 
-    add_reserved_keyword(group_id, pattern, is_regex, update.effective_user.id)
-    kind = "regex" if is_regex else "keyword"
-    await update.message.reply_text(
-        f"✅ {kind.capitalize()} <code>{pattern}</code> added — "
-        "any non-whitelisted user whose name, username, or bio matches will be flagged.",
-        parse_mode="HTML",
-    )
+    import re as _re
+    added:    list[str] = []
+    failed:   list[tuple[str, str]] = []
+
+    for entry in entries:
+        is_regex = entry.startswith("r:")
+        pattern  = entry[2:].strip() if is_regex else entry
+
+        if is_regex:
+            try:
+                _re.compile(pattern)
+            except _re.error as e:
+                failed.append((entry, f"invalid regex: {e}"))
+                continue
+
+        ok = add_reserved_keyword(group_id, pattern, is_regex, update.effective_user.id)
+        if ok:
+            added.append(f"{'regex' if is_regex else 'keyword'} <code>{html.escape(pattern)}</code>")
+        else:
+            failed.append((entry, "DB error"))
+
+    parts = []
+    if added:
+        parts.append(f"✅ Added {len(added)}: " + ", ".join(added))
+    if failed:
+        parts.append("⚠️ Skipped:")
+        for e, why in failed:
+            parts.append(f"  • <code>{html.escape(e)}</code> — {html.escape(why)}")
+
+    await update.message.reply_text("\n".join(parts), parse_mode="HTML")
 
 
 # ── /removekeyword ────────────────────────────────────────────────────────────
@@ -1278,10 +1262,15 @@ async def set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ── /logs ─────────────────────────────────────────────────────────────────────
+# ── /logs (detections + admin actions, merged) ───────────────────────────────
 
 async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show recent detection log entries. Usage: /logs [limit=10]"""
+    """
+    Show recent activity for the group: both detections AND admin actions
+    in a single reply. Usage: /logs [limit=10]
+
+    (This used to be two commands: /logs and /auditlog.)
+    """
     ctx = await _get_admin_group(update, context)
     if not ctx:
         return
@@ -1294,32 +1283,54 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             pass
 
-    rows = get_recent_logs(group_id, limit)
-    if not rows:
-        await update.message.reply_text("No detections logged for this group yet.")
+    # Note: limit is applied PER section. /logs 5 → up to 5 detections + 5 admin actions.
+    detections = get_recent_logs(group_id, limit)
+    actions    = get_recent_admin_actions(group_id, limit)
+
+    if not detections and not actions:
+        await update.message.reply_text(
+            "No activity logged for this group yet.\n"
+            "Detections appear here when an impersonator is caught; admin actions "
+            "(whitelist / ban / setaction etc.) are recorded too."
+        )
         return
 
-    lines = []
-    for r in rows:
-        dt     = r["created_at"].strftime("%m-%d %H:%M") if r["created_at"] else "?"
-        name   = html.escape(r["full_name"] or r["username"] or f"ID {r['user_id']}")
-        target = html.escape(r["target_name"] or "?")
-        dtype  = r["detection_type"] or "?"
-        action = r["action_taken"] or "?"
-        lines.append(
-            f"<b>{dt}</b> — <a href='tg://user?id={r['user_id']}'>{name}</a> "
-            f"→ {target} | <i>{dtype}</i> | {action}"
-        )
+    parts = []
 
-    header  = f"📋 <b>Last {len(rows)} detections</b>\n\n"
+    if detections:
+        parts.append(f"📋 <b>Last {len(detections)} detections</b>")
+        for r in detections:
+            dt     = r["created_at"].strftime("%m-%d %H:%M") if r["created_at"] else "?"
+            name   = html.escape(r["full_name"] or r["username"] or f"ID {r['user_id']}")
+            target = html.escape(r["target_name"] or "?")
+            dtype  = r["detection_type"] or "?"
+            action = r["action_taken"] or "?"
+            parts.append(
+                f"<b>{dt}</b> — <a href='tg://user?id={r['user_id']}'>{name}</a> "
+                f"→ {target} | <i>{dtype}</i> | {action}"
+            )
+
+    if actions:
+        if parts:
+            parts.append("")  # blank line between sections
+        parts.append(f"🔍 <b>Last {len(actions)} admin actions</b>")
+        for r in actions:
+            dt     = r["created_at"].strftime("%m-%d %H:%M") if r["created_at"] else "?"
+            who    = html.escape(r["admin_name"] or f"ID {r['admin_id']}")
+            tgt    = f" → <code>{r['target_id']}</code>" if r["target_id"] else ""
+            detail = f" ({html.escape(r['details'])})" if r["details"] else ""
+            parts.append(f"<b>{dt}</b> {who} — {r['action']}{tgt}{detail}")
+
+    # Chunk per Telegram's 4096-char message cap
     chunks  = []
-    current = header
-    for line in lines:
-        if len(current) + len(line) + 1 > 4096:
+    current = ""
+    for line in parts:
+        addition = line + "\n"
+        if len(current) + len(addition) > 4096:
             chunks.append(current.rstrip())
-            current = line + "\n"
+            current = addition
         else:
-            current += line + "\n"
+            current += addition
     if current.strip():
         chunks.append(current.rstrip())
     for chunk in chunks:
@@ -1332,7 +1343,7 @@ async def import_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Upload a CSV file to bulk-add users to the whitelist.
     Expected columns: user_id, username, first_name, last_name
-    (same format as /exportwhitelist output).
+    (same format as the CSV emitted by /listwhitelist).
     """
     ctx = await _get_admin_group(update, context)
     if not ctx:
@@ -1345,7 +1356,7 @@ async def import_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Send a CSV file as a document with this command.\n"
             "Expected columns: <code>user_id, username, first_name, last_name</code>\n\n"
-            "Use /exportwhitelist to download the current whitelist as a template.",
+            "Use /listwhitelist to download the current whitelist as a template.",
             parse_mode="HTML",
         )
         return
@@ -1389,7 +1400,8 @@ async def import_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
             last_name=row.get("last_name") or None,
             pfp_hash=None,
             whitelisted_by=update.effective_user.id,
-            user_type="manual",
+            user_type=row.get("user_type") or "manual",
+            is_bot=str(row.get("is_bot", "")).strip().lower() in ("true", "1", "yes"),
         )
         mark_seen(group_id, uid)
         added += 1
@@ -1451,50 +1463,3 @@ async def clear_whitelist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
-# ── /auditlog ─────────────────────────────────────────────────────────────────
-
-async def audit_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show recent admin actions for this group. Usage: /auditlog [limit=20]"""
-    ctx = await _get_admin_group(update, context)
-    if not ctx:
-        return
-    group_id, _ = ctx
-
-    limit = 20
-    if context.args:
-        try:
-            limit = max(1, min(int(context.args[0]), 50))
-        except ValueError:
-            pass
-
-    rows = get_recent_admin_actions(group_id, limit)
-    if not rows:
-        await update.message.reply_text(
-            "No admin actions logged for this group yet.\n"
-            "Actions like /whitelist, /ban, /setmode, /watch are recorded here."
-        )
-        return
-
-    lines = []
-    for r in rows:
-        dt     = r["created_at"].strftime("%m-%d %H:%M") if r["created_at"] else "?"
-        who    = html.escape(r["admin_name"] or f"ID {r['admin_id']}")
-        action = r["action"]
-        target = f" → <code>{r['target_id']}</code>" if r["target_id"] else ""
-        detail = f" ({html.escape(r['details'])})" if r["details"] else ""
-        lines.append(f"<b>{dt}</b> {who} — {action}{target}{detail}")
-
-    header  = f"🔍 <b>Last {len(rows)} admin actions</b>\n\n"
-    chunks  = []
-    current = header
-    for line in lines:
-        if len(current) + len(line) + 1 > 4096:
-            chunks.append(current.rstrip())
-            current = line + "\n"
-        else:
-            current += line + "\n"
-    if current.strip():
-        chunks.append(current.rstrip())
-
-    for chunk in chunks:
-        await update.message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)

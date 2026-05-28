@@ -300,9 +300,19 @@ async def ban_and_log(
                 ],
             ])
         elif action == "alerted":
-            # User is still in the group — no unban needed, but admins
-            # should still be able to clear the alert as a false positive.
+            # User is still in the group. Admin can escalate (Ban / Kick),
+            # accept the user (Whitelist / Ignore-30d) or just dismiss.
             keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🚫 Ban",
+                        callback_data=f"ban_now|{group_id}|{snapshot.user_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "👢 Kick",
+                        callback_data=f"kick_now|{group_id}|{snapshot.user_id}",
+                    ),
+                ],
                 [
                     InlineKeyboardButton(
                         "✅ Whitelist",

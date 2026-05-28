@@ -22,7 +22,10 @@ from pyrogram.enums import ChatMemberStatus as PyroChatMemberStatus
 from pyrogram.errors import FloodWait, ChatAdminRequired, UserNotParticipant
 from telegram import Bot
 
-from src.db import get_all_group_ids, get_whitelist, is_whitelisted, mark_seen, upsert_whitelisted_user
+from src.db import (
+    get_all_group_ids, get_group, get_whitelist, is_whitelisted, mark_seen,
+    record_sweep_run, upsert_whitelisted_user,
+)
 from src.utils.checker import UserSnapshot, check_user, ban_and_log
 from src.utils.image import compute_pfp_hash_bytes
 
@@ -40,11 +43,17 @@ async def sweep_group(
     group_id: int,
     log_channel_id: Optional[str] = None,
     progress_cb=None,
+    trigger: str = "manual",
 ) -> dict:
     """
     Sweep all members of group_id.
-    progress_cb(checked, flagged, total) — optional callback for live updates.
-    Returns a summary dict.
+
+    progress_cb(iterated, checked, flagged) — optional live-update callback.
+    trigger                                 — "manual" or "auto"; recorded in
+                                              sweep_runs so we can show
+                                              "sweeps in the last 24h / 30d".
+
+    Returns a summary dict with keys: iterated, checked, flagged, errors.
     """
     if group_id not in _sweep_locks:
         _sweep_locks[group_id] = asyncio.Lock()
@@ -110,6 +119,7 @@ async def sweep_group(
                         pfp_hash=compute_pfp_hash_bytes(pfp_bytes_admin) if pfp_bytes_admin else None,
                         whitelisted_by=bot.id,
                         user_type="admin",
+                        is_bot=bool(user.is_bot),
                     )
                     mark_seen(group_id, user.id)
                     continue
@@ -199,7 +209,10 @@ async def sweep_group(
         # Refresh stored PFP hashes for all whitelisted users after each sweep
         await refresh_whitelist_pfps(pyro, group_id)
 
-        return {"iterated": iterated, "checked": checked, "flagged": flagged, "errors": errors}
+        result = {"iterated": iterated, "checked": checked, "flagged": flagged, "errors": errors}
+        # Persist this run so /stats and the daily summary can count it
+        record_sweep_run(group_id, iterated, checked, flagged, errors, trigger)
+        return result
 
 
 async def refresh_whitelist_pfps(pyro: Client, group_id: int):
@@ -224,6 +237,7 @@ async def refresh_whitelist_pfps(pyro: Client, group_id: int):
                 pfp_hash=new_hash,
                 whitelisted_by=row["whitelisted_by"],
                 user_type=row.get("user_type", "manual"),
+                is_bot=bool(row.get("is_bot", False)),
             )
             refreshed += 1
         await asyncio.sleep(0.05)
@@ -236,16 +250,52 @@ async def run_periodic_sweeps(pyro: Client, bot: Bot, log_channel_id: Optional[s
     Background task: sweeps all configured groups every SWEEP_INTERVAL_HOURS hours.
     The first sweep is delayed by a full interval — the bot does NOT sweep on startup.
     Admins should run /sweep manually after initial setup.
+
+    After each sweep we post a short per-group summary to that group's
+    configured log channel (falling back to the global LOG_CHANNEL_ID).
     """
     while True:
         await asyncio.sleep(SWEEP_INTERVAL_HOURS * 3600)
         all_ids = get_all_group_ids()
-        # Only sweep groups that have at least one whitelisted user — others have nothing to check against
+        # Only sweep groups that have at least one whitelisted user — others
+        # have nothing to check against
         group_ids = [gid for gid in all_ids if get_whitelist(gid)]
-        logger.info(f"Starting scheduled sweep of {len(group_ids)}/{len(all_ids)} group(s) (skipping unconfigured).")
+        logger.info(
+            f"Starting scheduled sweep of {len(group_ids)}/{len(all_ids)} "
+            "group(s) (skipping unconfigured)."
+        )
         for gid in group_ids:
-            result = await sweep_group(pyro, bot, gid, log_channel_id)
+            result = await sweep_group(pyro, bot, gid, log_channel_id, trigger="auto")
             logger.info(f"Scheduled sweep complete for {gid}: {result}")
+            await _post_sweep_summary(bot, gid, result, log_channel_id)
+
+
+async def _post_sweep_summary(
+    bot: Bot, group_id: int, result: dict, fallback_channel_id: Optional[str]
+) -> None:
+    """
+    Send a per-run summary of an auto-sweep to the group's log channel
+    (or the global fallback channel). Silently no-ops if no channel is
+    configured anywhere.
+    """
+    group = get_group(group_id)
+    channel = (group and group.get("log_channel_id")) or fallback_channel_id
+    if not channel:
+        return
+
+    title = (group and group.get("title")) or str(group_id)
+    text = (
+        f"🧹 <b>Auto-sweep complete</b>\n"
+        f"<b>Group:</b> {title} (<code>{group_id}</code>)\n"
+        f"Members seen: <code>{result.get('iterated', 0)}</code>\n"
+        f"Checked: <code>{result.get('checked', 0)}</code>\n"
+        f"Flagged: <code>{result.get('flagged', 0)}</code>\n"
+        f"Errors: <code>{result.get('errors', 0)}</code>"
+    )
+    try:
+        await bot.send_message(chat_id=channel, text=text, parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"Failed to post auto-sweep summary for {group_id}: {e}")
 
 
 async def _fetch_pfp(pyro: Client, user_id: int) -> Optional[bytes]:

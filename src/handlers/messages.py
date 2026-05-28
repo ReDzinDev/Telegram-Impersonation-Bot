@@ -1,29 +1,22 @@
 
 """
-Message-based impersonation scanning.
+Message-based impersonation scanning (RELAXED — the only mode).
 
-RELAXED (default) — checks a user only the first time they send a message
-  in a group. After that they are marked as "seen" and skipped.
-
-STRICT — re-checks every message sender, but no more than once per
-  STRICT_RECHECK_INTERVAL seconds (in-memory TTL cache). This prevents
-  hammering the DB and Telegram API for active chatters while still
-  catching post-join profile changes.
+Each user is checked once per group, the first time they send a message,
+then their `seen_members` row prevents re-checking. Profile changes after
+that point are caught in real time by the Pyrogram watcher
+(`src/watcher/events.py`) and by the periodic 6-hour sweep
+(`src/watcher/sweep.py`) — no need to re-scan every message.
 """
 import logging
-import time
+
 from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ChatMemberStatus, ChatType
 
 from src.db import get_group, is_whitelisted, is_seen, mark_seen, upsert_whitelisted_user
-from src.utils.image import compute_pfp_hash_bytes
-
-# In-memory cache: (group_id, user_id) -> last_checked unix timestamp
-# Only consulted in STRICT mode; RELAXED uses the persistent seen_members table.
-_strict_cache: dict[tuple[int, int], float] = {}
-STRICT_RECHECK_INTERVAL = 300  # seconds (5 minutes)
 from src.utils.checker import UserSnapshot, check_user, ban_and_log
+from src.utils.image import compute_pfp_hash_bytes
 from src.config import LOG_CHANNEL_ID
 
 logger = logging.getLogger(__name__)
@@ -40,36 +33,19 @@ async def scan_message_sender(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     group_id = update.effective_chat.id
-
-    group = get_group(group_id)
+    group    = get_group(group_id)
     if not group:
         # Bot not yet registered for this group — skip until /import_admins is run
         return
 
     if is_whitelisted(group_id, user.id):
         return
-    mode = group["check_mode"] if group else "relaxed"
 
-    key = (group_id, user.id)
+    # Skip permanently once the user has been checked
+    if is_seen(group_id, user.id):
+        return
 
-    if mode == "relaxed":
-        # Skip permanently once the user has been checked
-        if is_seen(group_id, user.id):
-            return
-    else:
-        # STRICT: skip if checked within the TTL window
-        now = time.time()
-        last = _strict_cache.get(key, 0)
-        if now - last < STRICT_RECHECK_INTERVAL:
-            return
-        # Prune stale entries to prevent unbounded memory growth
-        if len(_strict_cache) > 10_000:
-            cutoff = now - STRICT_RECHECK_INTERVAL
-            stale = [k for k, v in _strict_cache.items() if v < cutoff]
-            for k in stale:
-                del _strict_cache[k]
-
-    # Fetch PFP
+    # Fetch PFP for the detection pipeline
     pfp_bytes = None
     try:
         photos = await user.get_profile_photos(limit=1)
@@ -88,16 +64,13 @@ async def scan_message_sender(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
     detection = await check_user(snapshot, group_id)
-
-    # Update both the persistent seen table (RELAXED) and the in-memory TTL (STRICT)
     mark_seen(group_id, user.id)
-    _strict_cache[key] = time.time()
 
     if not detection.flagged:
         return
 
-    # Guard against false positives on first setup: if the flagged user is actually
-    # a current group admin, whitelist them silently instead of banning.
+    # Guard against false positives on first setup: if the flagged user is
+    # actually a current group admin, whitelist them silently instead of banning.
     try:
         member_info = await context.bot.get_chat_member(group_id, user.id)
         if member_info.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
@@ -110,24 +83,33 @@ async def scan_message_sender(update: Update, context: ContextTypes.DEFAULT_TYPE
                 pfp_hash=compute_pfp_hash_bytes(pfp_bytes) if pfp_bytes else None,
                 whitelisted_by=context.bot.id,
                 user_type="admin",
+                is_bot=bool(user.is_bot),
             )
-            logger.info(f"Auto-whitelisted admin {user.id} after false-positive detection in group {group_id}.")
+            logger.info(
+                f"Auto-whitelisted admin {user.id} after false-positive detection in group {group_id}."
+            )
             return
     except Exception:
         pass
 
-    log_channel = (group["log_channel_id"] if group else None) or context.bot_data.get("log_channel_id") or LOG_CHANNEL_ID
+    log_channel = (
+        (group["log_channel_id"] if group else None)
+        or context.bot_data.get("log_channel_id")
+        or LOG_CHANNEL_ID
+    )
 
     async def _ban(gid: int, uid: int):
         await context.bot.ban_chat_member(chat_id=gid, user_id=uid)
 
+    async def _unban(gid: int, uid: int):
+        await context.bot.unban_chat_member(chat_id=gid, user_id=uid)
+
     log_notify = None
     if log_channel:
         async def log_notify(text: str, markup=None, _lc=log_channel):
-            await context.bot.send_message(chat_id=_lc, text=text, parse_mode="HTML", reply_markup=markup)
-
-    async def _unban(gid: int, uid: int):
-        await context.bot.unban_chat_member(chat_id=gid, user_id=uid)
+            await context.bot.send_message(
+                chat_id=_lc, text=text, parse_mode="HTML", reply_markup=markup
+            )
 
     await ban_and_log(
         result=detection,

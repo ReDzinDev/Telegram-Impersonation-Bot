@@ -50,7 +50,6 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS groups (
                     group_id    BIGINT PRIMARY KEY,
                     title       TEXT,
-                    check_mode  TEXT NOT NULL DEFAULT 'relaxed',
                     log_channel_id BIGINT,
                     added_at    TIMESTAMPTZ DEFAULT NOW(),
                     updated_at  TIMESTAMPTZ DEFAULT NOW()
@@ -62,6 +61,11 @@ def init_db():
                 ALTER TABLE groups
                     ADD COLUMN IF NOT EXISTS action_mode TEXT NOT NULL DEFAULT 'ban';
             """)
+
+            # Migration: drop the legacy check_mode column. We only support
+            # the equivalent of RELAXED now (real-time Pyrogram watcher +
+            # 6h auto-sweep cover what STRICT used to add).
+            cur.execute("ALTER TABLE groups DROP COLUMN IF EXISTS check_mode;")
 
             # Per-group whitelist of protected users (admins + manual + watched VIPs)
             cur.execute("""
@@ -83,6 +87,25 @@ def init_db():
             cur.execute("""
                 ALTER TABLE whitelisted_users
                     ADD COLUMN IF NOT EXISTS user_type TEXT NOT NULL DEFAULT 'manual';
+            """)
+            # Migration: legacy 'watch' rows (from the removed /watch command)
+            # collapse to plain 'manual'. They were functionally identical.
+            cur.execute(
+                "UPDATE whitelisted_users SET user_type = 'manual' WHERE user_type = 'watch';"
+            )
+            # is_bot: authoritative flag for listwhitelist's Bots section.
+            # We backfill via the username-ends-in-'bot' heuristic for rows
+            # that pre-date the column — /import_admins will overwrite with
+            # the real value on its next run.
+            cur.execute("""
+                ALTER TABLE whitelisted_users
+                    ADD COLUMN IF NOT EXISTS is_bot BOOLEAN NOT NULL DEFAULT FALSE;
+            """)
+            cur.execute("""
+                UPDATE whitelisted_users
+                   SET is_bot = TRUE
+                 WHERE is_bot = FALSE
+                   AND lower(username) LIKE '%bot';
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_wl_username ON whitelisted_users(group_id, username);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_wl_pfp     ON whitelisted_users(group_id, pfp_hash);")
@@ -192,6 +215,24 @@ def init_db():
                 "CREATE INDEX IF NOT EXISTS idx_fp_group ON false_positives(group_id, expires_at);"
             )
 
+            # Per-group sweep run history — powers the per-run summary message
+            # and the windowed "sweeps in the last 24h" counter in the daily digest.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS sweep_runs (
+                    id         BIGSERIAL PRIMARY KEY,
+                    group_id   BIGINT NOT NULL,
+                    iterated   INTEGER NOT NULL DEFAULT 0,
+                    checked    INTEGER NOT NULL DEFAULT 0,
+                    flagged    INTEGER NOT NULL DEFAULT 0,
+                    errors     INTEGER NOT NULL DEFAULT 0,
+                    trigger    TEXT    NOT NULL DEFAULT 'auto',
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sweep_group ON sweep_runs(group_id, created_at DESC);"
+            )
+
         conn.commit()
         logger.info("Database initialized.")
     except Exception as e:
@@ -222,7 +263,7 @@ def _invalidate_kw_cache(group_id: int):
     _kw_cache.pop(group_id, None)
 
 
-def upsert_group(group_id: int, title: str = None, check_mode: str = "relaxed",
+def upsert_group(group_id: int, title: str = None,
                  log_channel_id: int = None, pfp_hash: str = None) -> bool:
     conn = get_connection()
     if not conn:
@@ -231,21 +272,21 @@ def upsert_group(group_id: int, title: str = None, check_mode: str = "relaxed",
         with conn.cursor() as cur:
             if pfp_hash is not None:
                 cur.execute("""
-                    INSERT INTO groups (group_id, title, check_mode, log_channel_id, pfp_hash)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO groups (group_id, title, log_channel_id, pfp_hash)
+                    VALUES (%s, %s, %s, %s)
                     ON CONFLICT (group_id) DO UPDATE SET
                         title          = COALESCE(EXCLUDED.title, groups.title),
                         pfp_hash       = EXCLUDED.pfp_hash,
                         updated_at     = NOW();
-                """, (group_id, title, check_mode, log_channel_id, pfp_hash))
+                """, (group_id, title, log_channel_id, pfp_hash))
             else:
                 cur.execute("""
-                    INSERT INTO groups (group_id, title, check_mode, log_channel_id)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO groups (group_id, title, log_channel_id)
+                    VALUES (%s, %s, %s)
                     ON CONFLICT (group_id) DO UPDATE SET
                         title          = COALESCE(EXCLUDED.title, groups.title),
                         updated_at     = NOW();
-                """, (group_id, title, check_mode, log_channel_id))
+                """, (group_id, title, log_channel_id))
         conn.commit()
         _invalidate_group_cache(group_id)
         return True
@@ -308,27 +349,6 @@ def set_group_log_channel(group_id: int, log_channel_id: int | None) -> bool:
         return True
     except Exception as e:
         logger.error(f"set_group_log_channel error: {e}")
-        conn.rollback()
-        return False
-    finally:
-        conn.close()
-
-
-def set_group_check_mode(group_id: int, mode: str) -> bool:
-    conn = get_connection()
-    if not conn:
-        return False
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE groups SET check_mode = %s, updated_at = NOW() WHERE group_id = %s",
-                (mode, group_id)
-            )
-        conn.commit()
-        _invalidate_group_cache(group_id)
-        return True
-    except Exception as e:
-        logger.error(f"set_group_check_mode error: {e}")
         conn.rollback()
         return False
     finally:
@@ -433,7 +453,8 @@ def get_groups_for_user(user_id: int) -> list[int]:
 def upsert_whitelisted_user(group_id: int, user_id: int, username: str,
                             first_name: str, last_name: str,
                             pfp_hash: str, whitelisted_by: int,
-                            user_type: str = "manual") -> bool:
+                            user_type: str = "manual",
+                            is_bot: bool = False) -> bool:
     conn = get_connection()
     if not conn:
         return False
@@ -441,16 +462,17 @@ def upsert_whitelisted_user(group_id: int, user_id: int, username: str,
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO whitelisted_users
-                    (group_id, user_id, username, first_name, last_name, pfp_hash, whitelisted_by, user_type)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    (group_id, user_id, username, first_name, last_name, pfp_hash, whitelisted_by, user_type, is_bot)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (group_id, user_id) DO UPDATE SET
                     username   = EXCLUDED.username,
                     first_name = EXCLUDED.first_name,
                     last_name  = EXCLUDED.last_name,
                     pfp_hash   = COALESCE(EXCLUDED.pfp_hash, whitelisted_users.pfp_hash),
                     user_type  = EXCLUDED.user_type,
+                    is_bot     = EXCLUDED.is_bot,
                     updated_at = NOW();
-            """, (group_id, user_id, username, first_name, last_name, pfp_hash, whitelisted_by, user_type))
+            """, (group_id, user_id, username, first_name, last_name, pfp_hash, whitelisted_by, user_type, is_bot))
         conn.commit()
         _invalidate_whitelist_cache(group_id)
         return True
@@ -586,34 +608,127 @@ def get_latest_log_entry(group_id: int, user_id: int) -> dict | None:
         conn.close()
 
 
-def get_stats(group_id: int) -> dict:
+def get_stats_windowed(group_id: int) -> dict:
+    """
+    Stats split into three windows: all-time / last 30d / last 7d.
+
+    Returns a dict with `whitelisted` (current count) plus, for each of
+    {detections, banned, sweeps}, the keys `<metric>_all`, `<metric>_30d`,
+    and `<metric>_7d`. A single round-trip to the DB.
+    """
     conn = get_connection()
     if not conn:
         return {}
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT COUNT(*) AS total FROM whitelisted_users WHERE group_id = %s",
-                (group_id,)
-            )
-            wl_count = cur.fetchone()["total"]
+            cur.execute("""
+                SELECT
+                  (SELECT COUNT(*) FROM whitelisted_users WHERE group_id = %(gid)s) AS whitelisted,
 
-            cur.execute(
-                "SELECT COUNT(*) AS total FROM logs WHERE group_id = %s AND action_taken = 'banned'",
-                (group_id,)
-            )
-            ban_count = cur.fetchone()["total"]
+                  (SELECT COUNT(*) FROM logs WHERE group_id = %(gid)s)                                                                   AS detections_all,
+                  (SELECT COUNT(*) FROM logs WHERE group_id = %(gid)s AND created_at > NOW() - INTERVAL '30 days')                       AS detections_30d,
+                  (SELECT COUNT(*) FROM logs WHERE group_id = %(gid)s AND created_at > NOW() - INTERVAL '7 days')                        AS detections_7d,
 
-            cur.execute(
-                "SELECT COUNT(*) AS total FROM logs WHERE group_id = %s",
-                (group_id,)
-            )
-            detection_count = cur.fetchone()["total"]
+                  (SELECT COUNT(*) FROM logs WHERE group_id = %(gid)s AND action_taken = 'banned')                                       AS banned_all,
+                  (SELECT COUNT(*) FROM logs WHERE group_id = %(gid)s AND action_taken = 'banned' AND created_at > NOW() - INTERVAL '30 days') AS banned_30d,
+                  (SELECT COUNT(*) FROM logs WHERE group_id = %(gid)s AND action_taken = 'banned' AND created_at > NOW() - INTERVAL '7 days')  AS banned_7d,
 
-        return {"whitelisted": wl_count, "banned": ban_count, "detections": detection_count}
+                  (SELECT COUNT(*) FROM sweep_runs WHERE group_id = %(gid)s)                                                             AS sweeps_all,
+                  (SELECT COUNT(*) FROM sweep_runs WHERE group_id = %(gid)s AND created_at > NOW() - INTERVAL '30 days')                 AS sweeps_30d,
+                  (SELECT COUNT(*) FROM sweep_runs WHERE group_id = %(gid)s AND created_at > NOW() - INTERVAL '7 days')                  AS sweeps_7d
+            """, {"gid": group_id})
+            return cur.fetchone() or {}
     except Exception as e:
-        logger.error(f"get_stats error: {e}")
+        logger.error(f"get_stats_windowed error: {e}")
         return {}
+    finally:
+        conn.close()
+
+
+def get_all_group_stats_windowed() -> list[dict]:
+    """
+    Per-group rollup with All / 30d / 7d windows for detections + bans,
+    in a single round-trip. Used by /stats in private chat.
+    """
+    conn = get_connection()
+    if not conn:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    g.group_id,
+                    g.title,
+                    g.action_mode,
+                    COUNT(DISTINCT w.user_id)                                                                          AS whitelisted,
+                    COUNT(DISTINCT l.log_id)                                                                           AS detections_all,
+                    COUNT(DISTINCT CASE WHEN l.created_at > NOW() - INTERVAL '30 days' THEN l.log_id END)              AS detections_30d,
+                    COUNT(DISTINCT CASE WHEN l.created_at > NOW() - INTERVAL '7 days'  THEN l.log_id END)              AS detections_7d,
+                    COUNT(DISTINCT CASE WHEN l.action_taken = 'banned' THEN l.log_id END)                              AS banned_all,
+                    COUNT(DISTINCT CASE WHEN l.action_taken = 'banned' AND l.created_at > NOW() - INTERVAL '30 days' THEN l.log_id END) AS banned_30d,
+                    COUNT(DISTINCT CASE WHEN l.action_taken = 'banned' AND l.created_at > NOW() - INTERVAL '7 days'  THEN l.log_id END) AS banned_7d
+                FROM groups g
+                LEFT JOIN whitelisted_users w ON w.group_id = g.group_id
+                LEFT JOIN logs l              ON l.group_id = g.group_id
+                GROUP BY g.group_id, g.title, g.action_mode
+                ORDER BY g.group_id
+            """)
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_all_group_stats_windowed error: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def get_recent_activity(group_id: int, hours: int = 24) -> dict:
+    """
+    Activity counts within the last `hours` hours for one group.
+    Used by the daily summary so it reports "what happened in the last day"
+    instead of cumulative numbers.
+    """
+    conn = get_connection()
+    if not conn:
+        return {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                  (SELECT COUNT(*) FROM logs        WHERE group_id = %(gid)s AND created_at > NOW() - make_interval(hours => %(h)s))                                AS detections,
+                  (SELECT COUNT(*) FROM logs        WHERE group_id = %(gid)s AND action_taken = 'banned' AND created_at > NOW() - make_interval(hours => %(h)s))    AS banned,
+                  (SELECT COUNT(*) FROM logs        WHERE group_id = %(gid)s AND action_taken = 'kicked' AND created_at > NOW() - make_interval(hours => %(h)s))    AS kicked,
+                  (SELECT COUNT(*) FROM logs        WHERE group_id = %(gid)s AND action_taken = 'alerted' AND created_at > NOW() - make_interval(hours => %(h)s))   AS alerted,
+                  (SELECT COUNT(*) FROM sweep_runs  WHERE group_id = %(gid)s AND created_at > NOW() - make_interval(hours => %(h)s))                                AS sweeps
+            """, {"gid": group_id, "h": hours})
+            return cur.fetchone() or {}
+    except Exception as e:
+        logger.error(f"get_recent_activity error: {e}")
+        return {}
+    finally:
+        conn.close()
+
+
+# ── Sweep run history ─────────────────────────────────────────────────────────
+
+def record_sweep_run(
+    group_id: int, iterated: int, checked: int, flagged: int, errors: int,
+    trigger: str = "auto",
+) -> None:
+    """Persist the result of one sweep_group() call so we can show
+    'sweeps in the last 24h / 30d' and a per-run summary."""
+    conn = get_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO sweep_runs (group_id, iterated, checked, flagged, errors, trigger)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (group_id, iterated, checked, flagged, errors, trigger))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"record_sweep_run error: {e}")
+        conn.rollback()
     finally:
         conn.close()
 
@@ -844,38 +959,6 @@ def clear_whitelist(group_id: int) -> int:
         logger.error(f"clear_whitelist error: {e}")
         conn.rollback()
         return 0
-    finally:
-        conn.close()
-
-
-# ── All-groups stats ───────────────────────────────────────────────────────────
-
-def get_all_group_stats() -> list[dict]:
-    """Return protection and detection stats for every registered group."""
-    conn = get_connection()
-    if not conn:
-        return []
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    g.group_id,
-                    MIN(g.title)       AS title,
-                    MIN(g.check_mode)  AS check_mode,
-                    MIN(g.action_mode) AS action_mode,
-                    COUNT(DISTINCT w.user_id)                                          AS whitelisted,
-                    COUNT(DISTINCT CASE WHEN l.action_taken = 'banned' THEN l.log_id END) AS banned,
-                    COUNT(DISTINCT l.log_id)                                           AS detections
-                FROM groups g
-                LEFT JOIN whitelisted_users w ON w.group_id = g.group_id
-                LEFT JOIN logs l              ON l.group_id = g.group_id
-                GROUP BY g.group_id
-                ORDER BY g.group_id
-            """)
-            return cur.fetchall()
-    except Exception as e:
-        logger.error(f"get_all_group_stats error: {e}")
-        return []
     finally:
         conn.close()
 

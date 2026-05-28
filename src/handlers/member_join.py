@@ -95,6 +95,7 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
             pfp_hash=pfp_hash,
             whitelisted_by=context.bot.id,
             user_type="admin",
+            is_bot=bool(user.is_bot),
         )
         mark_seen(group_id, user.id)
         logger.info(f"Auto-whitelisted promoted admin {user.full_name} ({user.id}) in group {group_id}.")
@@ -158,6 +159,7 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
                 pfp_hash=compute_pfp_hash_bytes(pfp_bytes) if pfp_bytes else None,
                 whitelisted_by=context.bot.id,
                 user_type="admin",
+                is_bot=bool(user.is_bot),
             )
             mark_seen(group_id, user.id)
             logger.info(f"Auto-whitelisted admin {user.id} after false-positive on join in group {group_id}.")

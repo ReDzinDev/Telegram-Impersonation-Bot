@@ -43,7 +43,7 @@ The bot catches impersonators through four independent paths:
 | Trigger | When | Requires Pyrogram |
 | --- | --- | --- |
 | **Join** | Every time a non-bot user joins | No |
-| **Message** | On first message (Relaxed) or every 5 min (Strict) | No |
+| **Message** | On a user's **first message** in the group | No |
 | **Profile change** | Instantly when a group member renames or changes photo | **Yes** |
 | **Sweep** | Full member scan every 6 hours, plus on-demand `/sweep` | **Yes** |
 
@@ -51,30 +51,14 @@ The bot catches impersonators through four independent paths:
 
 ---
 
-## Scan Modes
+## Scanning Model
 
-Controlled per group with `/setmode`.
+There is no "strict / relaxed" toggle anymore. Each user is checked **once per group**, on their first message, then never re-scanned via the message handler. Coverage of profile changes after that point comes from two background paths:
 
-### Relaxed (default)
+- The **Pyrogram watcher** catches rename / photo-change events instantly.
+- The **6-hour auto-sweep** catches anything the watcher missed (and refreshes whitelist PFP hashes).
 
-- Each user is checked once — on their **first message** in the group.
-- After passing, they are permanently marked as "seen" and skipped for message scanning.
-- If Pyrogram detects a profile change, the seen flag is reset and the user is re-checked on their next message.
-- **Best for:** Most groups. Low API usage, minimal overhead.
-
-### Strict
-
-- Each user is re-checked on every message, rate-limited to **once per 5 minutes** per user (in-memory TTL cache).
-- Catches post-join renames even without Pyrogram enabled.
-- **Best for:** High-risk groups where Pyrogram is not available or extra vigilance is needed.
-
-| | Relaxed | Strict |
-| --- | --- | --- |
-| First message | ✅ Checked | ✅ Checked |
-| Subsequent messages | ❌ Skipped | ✅ Re-checked every 5 min |
-| Rename caught without Pyrogram | ❌ Only at next sweep | ✅ Within 5 min of next message |
-| Rename caught with Pyrogram | ✅ Instantly | ✅ Instantly |
-| API load | Very low | Moderate |
+The legacy STRICT mode (re-check every 5 min) was redundant once Pyrogram + sweeps were in place and has been removed.
 
 ---
 
@@ -101,10 +85,9 @@ The bot compares every suspicious user against the group's whitelist. A group wi
 | Type | How Added | Notes |
 | --- | --- | --- |
 | **Admin (human)** | `/import_admins` or automatic on promotion | Includes name, username, and PFP hash |
-| **Admin (bot)** | `/import_admins` | Rose, Combot, and other admin bots are now included — protects their usernames from being copied. PFP not fetched for bots. |
-| **Watched VIP** | `/watch` (reply or user ID) | For non-admin staff, founders, influencers |
-| **Manual** | `/whitelist` (reply or user ID) | Any specific user |
-| **CSV import** | Send `.csv` in private chat | Bulk import; same format as `/exportwhitelist` output |
+| **Admin (bot)** | `/import_admins` | Rose, Combot, and other admin bots are included — protects their usernames from being copied. PFP not fetched for bots. |
+| **Manual** | `/whitelist` (reply or user ID) | Any specific user. If the user isn't in the chat yet, the Bot API lookup falls back to the Pyrogram userbot — this absorbs what the old `/watch` command did. |
+| **CSV import** | Send `.csv` in private chat | Bulk import; same column format as the CSV emitted by `/listwhitelist` |
 
 Each entry stores: user ID, username, display name, profile photo hash, who added them, when, and type.
 
@@ -122,27 +105,37 @@ When the bot joins a group or `/import_admins` runs, the group's own profile pho
 
 ---
 
-## Handling False Positives
+## Handling False Positives (and Alert-Mode Escalation)
 
-When the bot bans or kicks someone, the log channel alert includes three action buttons:
+Every detection alert in the log channel comes with action buttons. The set differs by what the bot already did:
+
+**Ban / Kick mode** — bot already removed the user:
 
 | Button | What It Does |
 | --- | --- |
-| **✅ Unban + Whitelist** | Unbans the user and adds them to the whitelist. Use when the person is legitimately trusted and should never be flagged again. |
-| **🔓 Unban only** | Unbans the user and sets a **30-day grace period**. They can rejoin and won't be re-flagged during the window. After it expires, normal detection resumes. Use for confirmed false positives who don't need permanent protection. |
-| **🗑 Dismiss** | Removes the buttons from the log message without taking any action. The ban/kick stands. |
+| **✅ Unban + Whitelist** | Unbans and adds the user to the whitelist. Use when the person is legitimately trusted. |
+| **🔓 Unban only** | Unbans with a **30-day grace period** (no whitelist add). Won't be re-flagged during the window. |
+| **🗑 Dismiss** | Just removes the buttons. The ban/kick stands. |
 
-The grace period resets to 30 days if the user is cleared again before it expires.
+**Alert mode** — bot only notified, took no action:
 
-Buttons only appear when the action was `ban` or `kick`. Alert-mode detections show no buttons.
+| Button | What It Does |
+| --- | --- |
+| **🚫 Ban** | Escalate to a permanent ban now. |
+| **👢 Kick** | Escalate to a kick (user can rejoin). |
+| **✅ Whitelist** | Mark the user as trusted. |
+| **🔕 Ignore (30d)** | 30-day grace window — won't re-fire. |
+| **🗑 Dismiss** | Acknowledge without doing anything. |
+
+The 30-day grace resets if the same user is cleared again before it expires.
 
 ---
 
 ## Admin Action Audit Trail
 
-Every mutating command is recorded in the `admin_actions` table with who ran it, when, and on which target. Use `/auditlog` to query recent entries.
+Every mutating command is recorded in the `admin_actions` table with who ran it, when, and on which target. Recent entries are shown alongside detection history in `/logs`.
 
-Tracked actions: `whitelist`, `unwhitelist`, `ban`, `watch`, `import_admins`, `setmode`, `setaction`, `setthreshold`, `importwhitelist`, `clearwhitelist`.
+Tracked actions: `whitelist`, `unwhitelist`, `ban`, `kicked`, `banned`, `import_admins`, `setaction`, `setthreshold`, `importwhitelist`, `clearwhitelist`.
 
 ---
 
@@ -179,11 +172,28 @@ The bot resolves the log channel in this order:
 
 | Setting | Command | Default | Options / Notes |
 | --- | --- | --- | --- |
-| Scan mode | `/setmode` | `relaxed` | `relaxed` · `strict` |
 | Detection action | `/setaction` | `ban` | `ban` · `kick` · `alert` |
 | Fuzzy threshold | `/setthreshold 85` | `85` | 50–100. Lower = more sensitive |
-| Log channel | `/setlogchannel -100…` | Global env | `/setlogchannel clear` removes override |
-| Reserved keywords | `/addkeyword admin` | None | Prefix `r:` for regex, e.g. `/addkeyword r:official.*support` |
+| Log channel | `/setlogchannel` | Global env | DM the bot to get a channel picker; `/setlogchannel clear` removes override |
+| Reserved keywords | `/addkeyword admin` | None | Supports comma lists, `*` wildcards, and `r:regex` (see below) |
+
+### Keyword syntax
+
+`/addkeyword` accepts multiple entries in one command, separated by commas. Each entry is one of:
+
+| Form | Matches |
+| --- | --- |
+| `admin` | Substring — `admin` appears anywhere in name/username/bio |
+| `admin*` | Starts-with `admin` |
+| `*admin` | Ends-with `admin` |
+| `*admin*` | Explicit "contains" — same as bare `admin` |
+| `r:official.*ceo` | Python regex (`re.IGNORECASE`) |
+
+Examples:
+```
+/addkeyword admin, support, *mod*
+/addkeyword admin*, r:official.*team
+```
 
 ---
 
@@ -194,11 +204,9 @@ The bot resolves the log channel in this order:
 | Command | Description |
 | --- | --- |
 | `/import_admins` | Whitelist all current group admins — human and bot alike — with name, username, and PFP hash. Also stores the group's own profile photo for group-identity detection. |
-| `/whitelist` | Whitelist a user — reply to their message or `/whitelist 123456` |
+| `/whitelist` | Whitelist a user — reply to their message, or `/whitelist 123456`. Falls back to the Pyrogram userbot when the user isn't in the chat yet (covers what the old `/watch` did). |
 | `/unwhitelist` | Remove from whitelist — reply or `/unwhitelist 123456` |
-| `/watch` | Protect a non-admin VIP — reply or `/watch 123456` (ID lookup needs Pyrogram) |
-| `/listwhitelist` | Show all protected users with type (admin / watch / manual) |
-| `/exportwhitelist` | Download the whitelist as a CSV file |
+| `/listwhitelist` | Show all protected users sectioned by **Admins / Bots / Manual**, and attach a CSV export of the whitelist in the same reply |
 | `/importwhitelist` | Send a CSV file in the bot's DM to bulk-add users |
 | `/clearwhitelist confirm` | ⚠️ Remove ALL protected users — shows count warning first, requires `confirm` |
 
@@ -206,8 +214,7 @@ The bot resolves the log channel in this order:
 
 | Command | Description |
 | --- | --- |
-| `/check` | Manually run a detection check — reply or `/check 123456`. Shows match type, score, and what action would be taken |
-| `/sweep` | Run a full member scan immediately (Pyrogram required). Shows live progress. |
+| `/sweep` | Run a full member scan immediately (Pyrogram required). Shows live progress; auto-sweeps also post a summary to the log channel every 6 h. |
 | `/ban` | Manually ban a user — reply or `/ban 123456` |
 | `/unban 123456` | Unban a user by ID |
 
@@ -215,11 +222,10 @@ The bot resolves the log channel in this order:
 
 | Command | Description |
 | --- | --- |
-| `/setmode strict\|relaxed` | Set message scan mode |
 | `/setaction ban\|kick\|alert` | Set what happens when an impersonator is detected |
 | `/setthreshold 85` | Set fuzzy-match sensitivity (50–100, default 85) |
-| `/setlogchannel -100…` | Set a per-group log channel (or `clear`) |
-| `/addkeyword admin` | Add a reserved word or `r:regex` pattern |
+| `/setlogchannel` | Pick the per-group log channel (or `/setlogchannel clear` / `/setlogchannel -100…`) |
+| `/addkeyword admin, *mod*, r:official.*ceo` | Add one or more keywords (wildcards + regex supported — see Keyword syntax) |
 | `/removekeyword admin` | Remove a reserved keyword |
 | `/listkeywords` | List all reserved keywords for this group |
 
@@ -227,9 +233,8 @@ The bot resolves the log channel in this order:
 
 | Command | Description |
 | --- | --- |
-| `/stats` | Group stats in a group chat; all-groups breakdown when used in private DM |
-| `/logs 20` | Last N detection log entries |
-| `/auditlog 20` | Last N admin actions (who ran what and when) |
+| `/stats` | In a group: all-time / 30d / 7d breakdown of detections, bans, sweeps. In private DM: per-group rollup across every registered group. |
+| `/logs 20` | Recent detections AND admin actions in one reply (replaces the old `/logs` + `/auditlog` pair) |
 
 ---
 
@@ -258,12 +263,14 @@ This lets group admins manage everything privately without posting commands in t
    → Whitelists all current admins (human + bots) with name + username + PFP hash
    → Stores the group's profile photo for group-identity detection
 
-4. /watch <reply or ID>
-   → Protect any VIPs who are not group admins
+4. /whitelist <reply or ID>
+   → Protect any non-admin VIPs (founders, staff, influencers).
+     Works even for users who haven't joined the group yet
+     when the Pyrogram userbot is configured.
 
-5. /addkeyword admin
-   → Add words only real admins should have in their name
-   → Examples: Admin, Support, Official, CEO, Mod, Staff
+5. /addkeyword admin, support, *mod*, r:official.*team
+   → Add words only real admins should have in their name.
+     Supports comma lists, * wildcards, and r:regex.
 
 6. /setaction ban
    → Default is already ban; confirm or switch to kick / alert
@@ -291,21 +298,21 @@ State is stored in **PostgreSQL**. Frequently-read data is cached in memory:
 | Cache | TTL | What |
 | --- | --- | --- |
 | Whitelist | 60 s | Per-group list of protected users |
-| Group config | 5 min | Mode, action, threshold, log channel, group PFP hash |
+| Group config | 5 min | Action, threshold, log channel, group PFP hash |
 | Reserved keywords | 5 min | Per-group keyword/regex list |
 | Admin status | 5 min | Per-(user, group) admin check result — eliminates repeated `getChatMember` API calls |
 | False-positive grace | 5 min | Per-(user, group) clearance status |
 
-All caches are invalidated immediately on the relevant admin write (e.g. `/setmode` invalidates the group config cache).
+All caches are invalidated immediately on the relevant admin write (e.g. `/setaction` invalidates the group config cache).
 
 ### Background Tasks (Pyrogram only)
 
 | Task | Schedule |
 | --- | --- |
-| **Full sweep** | Every 6 hours (first sweep is delayed — no startup sweep) |
+| **Full sweep** | Every 6 hours (first sweep is delayed — no startup sweep). Each run is recorded in `sweep_runs` and posts a short summary to the group's log channel. |
 | **PFP hash refresh** | After every sweep (keeps stored hashes current) |
 | **Health check** | Every 5 minutes; auto-reconnects if the Pyrogram session drops |
-| **Daily summary** | Midnight UTC; posts a per-group stats digest to the log channel |
+| **Daily summary** | Midnight UTC; posts a **last-24h** activity digest (detections / bans / kicks / alerts / sweeps) to the log channel. Use `/stats` for cumulative + windowed numbers. |
 
 ### Sweep Behaviour
 
@@ -320,14 +327,17 @@ All caches are invalidated immediately on the relevant admin write (e.g. `/setmo
 
 | Table | Purpose |
 | --- | --- |
-| `groups` | Per-group config: mode, action, threshold, log channel, **group PFP hash** |
-| `whitelisted_users` | Protected identities with name, username, PFP hash, type (admin/watch/manual) |
-| `seen_members` | Tracks who has been checked (drives Relaxed mode) |
+| `groups` | Per-group config: action, threshold, log channel, **group PFP hash** |
+| `whitelisted_users` | Protected identities with name, username, PFP hash, type (`admin` / `manual`) |
+| `seen_members` | Tracks who has been checked (one entry per user per group) |
 | `logs` | Detection history: who, what, score, action, trigger, invite link |
 | `reserved_keywords` | Per-group keyword/regex patterns |
 | `name_change_log` | Timestamps for rename velocity tracking |
 | `admin_actions` | Audit trail of every admin command |
-| **`false_positives`** | 30-day grace windows for manually-cleared users |
+| `false_positives` | 30-day grace windows for manually-cleared users |
+| **`sweep_runs`** | One row per sweep_group() call — feeds /stats sweep counts and the daily digest |
+
+A startup migration drops the legacy `check_mode` column on `groups` and rewrites any `user_type='watch'` rows to `'manual'` (the two were behaviourally identical).
 
 ---
 
@@ -352,7 +362,7 @@ All caches are invalidated immediately on the relevant admin write (e.g. `/setmo
 - **No global whitelist** — each group maintains its own independent whitelist
 - **Bio scanning only on profile changes** — not during sweeps (MTProto `GetFullUser` is too expensive per member at scale)
 - **PFP is a tiebreaker, not a primary signal** — a matching photo alone never triggers a ban (except for group-identity matches where a weak name match is also present)
-- **Relaxed mode cache is persistent** — a user who passed their initial check won't be re-scanned by messages until their profile changes or a sweep runs
+- **Seen-cache is persistent** — a user who passed their initial check won't be re-scanned by messages until the Pyrogram watcher resets the seen flag (profile change) or the 6 h sweep runs
 - **Sweep requires the Pyrogram session to be a member of the group** — the session account must be in the group to enumerate members
 - **False-positive grace expires** — after 30 days, detection resumes for cleared users. Re-clear them or whitelist them if needed.
 

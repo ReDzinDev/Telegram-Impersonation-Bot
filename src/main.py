@@ -16,11 +16,11 @@ from src.config import (
 from src.db import init_db, get_connection
 from src.handlers.commands import (
     start, handle_chat_shared, import_admins, whitelist_user,
-    unwhitelist_user, check_user_cmd, ban_user, unban_user,
-    sweep, setmode, setaction, set_log_channel, list_whitelist, stats,
-    watch_user, handle_detection_callback, export_whitelist,
+    unwhitelist_user, ban_user, unban_user,
+    sweep, setaction, set_log_channel, list_whitelist, stats,
+    handle_detection_callback,
     add_keyword, remove_keyword, list_keywords, set_threshold, logs, import_whitelist,
-    clear_whitelist_cmd, audit_log,
+    clear_whitelist_cmd,
 )
 from src.handlers.member_join import check_impersonation, on_bot_added_to_group
 from src.handlers.messages import scan_message_sender
@@ -89,28 +89,23 @@ def build_ptb_app(pyro_client=None):
     app.bot_data["log_channel_id"] = LOG_CHANNEL_ID
 
     # Commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("import_admins", import_admins))
-    app.add_handler(CommandHandler("whitelist", whitelist_user))
-    app.add_handler(CommandHandler("unwhitelist", unwhitelist_user))
-    app.add_handler(CommandHandler("check", check_user_cmd))
-    app.add_handler(CommandHandler("ban", ban_user))
-    app.add_handler(CommandHandler("unban", unban_user))
-    app.add_handler(CommandHandler("sweep", sweep))
-    app.add_handler(CommandHandler("setmode", setmode))
-    app.add_handler(CommandHandler("setaction", setaction))
-    app.add_handler(CommandHandler("setlogchannel", set_log_channel))
-    app.add_handler(CommandHandler("listwhitelist", list_whitelist))
-    app.add_handler(CommandHandler("exportwhitelist", export_whitelist))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("watch", watch_user))
+    app.add_handler(CommandHandler("start",           start))
+    app.add_handler(CommandHandler("import_admins",   import_admins))
+    app.add_handler(CommandHandler("whitelist",       whitelist_user))
+    app.add_handler(CommandHandler("unwhitelist",     unwhitelist_user))
+    app.add_handler(CommandHandler("ban",             ban_user))
+    app.add_handler(CommandHandler("unban",           unban_user))
+    app.add_handler(CommandHandler("sweep",           sweep))
+    app.add_handler(CommandHandler("setaction",       setaction))
+    app.add_handler(CommandHandler("setlogchannel",   set_log_channel))
+    app.add_handler(CommandHandler("listwhitelist",   list_whitelist))
+    app.add_handler(CommandHandler("stats",           stats))
     app.add_handler(CommandHandler("addkeyword",      add_keyword))
     app.add_handler(CommandHandler("removekeyword",   remove_keyword))
     app.add_handler(CommandHandler("listkeywords",    list_keywords))
     app.add_handler(CommandHandler("setthreshold",    set_threshold))
     app.add_handler(CommandHandler("logs",            logs))
     app.add_handler(CommandHandler("clearwhitelist",  clear_whitelist_cmd))
-    app.add_handler(CommandHandler("auditlog",        audit_log))
     app.add_handler(MessageHandler(
         filters.Document.FileExtension("csv") & filters.ChatType.PRIVATE,
         import_whitelist,
@@ -118,7 +113,8 @@ def build_ptb_app(pyro_client=None):
 
     # Inline keyboard callbacks from log-channel detection alerts
     app.add_handler(CallbackQueryHandler(
-        handle_detection_callback, pattern=r"^(unban_wl|unban_fp|dismiss)\|"
+        handle_detection_callback,
+        pattern=r"^(unban_wl|unban_fp|dismiss|ban_now|kick_now)\|",
     ))
 
     # Global error handler: keeps TimedOut / NetworkError out of the ERROR log
@@ -133,7 +129,7 @@ def build_ptb_app(pyro_client=None):
     # New member joins
     app.add_handler(ChatMemberHandler(check_impersonation, ChatMemberHandler.CHAT_MEMBER))
 
-    # Message scanning (STRICT / RELAXED)
+    # First-message impersonation scan (relaxed — one check per user per group)
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
         scan_message_sender,
@@ -177,24 +173,19 @@ async def main():
         BotCommand("import_admins",   "Whitelist all current group admins"),
         BotCommand("whitelist",       "Whitelist a user (reply or ID)"),
         BotCommand("unwhitelist",     "Remove from whitelist (reply or ID)"),
-        BotCommand("watch",           "Protect a non-admin VIP (reply or ID)"),
-        BotCommand("listwhitelist",   "Show all protected users"),
-        BotCommand("exportwhitelist", "Download whitelist as CSV"),
-        BotCommand("check",           "Manually check a user (reply or ID)"),
+        BotCommand("listwhitelist",   "Show whitelist + download CSV"),
         BotCommand("ban",             "Manually ban a user (reply or ID)"),
         BotCommand("unban",           "Unban a user by ID"),
         BotCommand("sweep",           "Run a full member scan"),
-        BotCommand("setmode",         "Set scan mode: strict or relaxed"),
         BotCommand("setaction",       "Set detection action: ban, kick, or alert"),
         BotCommand("setlogchannel",   "Set per-group log channel"),
-        BotCommand("stats",           "Show detection and ban stats"),
-        BotCommand("addkeyword",    "Add a reserved keyword or regex pattern"),
-        BotCommand("removekeyword", "Remove a reserved keyword"),
-        BotCommand("listkeywords",  "List all reserved keywords"),
-        BotCommand("setthreshold",  "Set fuzzy-match sensitivity (default 85)"),
-        BotCommand("logs",          "Show recent detection log"),
-        BotCommand("clearwhitelist","⚠️ Remove all protected users (requires confirm)"),
-        BotCommand("auditlog",      "Show recent admin actions"),
+        BotCommand("stats",           "Show stats: all-time / 30d / 7d"),
+        BotCommand("addkeyword",      "Add keyword(s) — supports *wildcards*, commas, r:regex"),
+        BotCommand("removekeyword",   "Remove a reserved keyword"),
+        BotCommand("listkeywords",    "List all reserved keywords"),
+        BotCommand("setthreshold",    "Set fuzzy-match sensitivity (default 85)"),
+        BotCommand("logs",            "Recent detections + admin actions"),
+        BotCommand("clearwhitelist",  "⚠️ Remove all protected users (requires confirm)"),
     ]
     # Register commands for both private chats and groups
     await ptb_app.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
