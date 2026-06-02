@@ -54,6 +54,7 @@ class DetectionResult:
     score: float = 0.0
     target_user_id: Optional[int] = None
     target_name: Optional[str] = None
+    target_username: Optional[str] = None  # @handle of the impersonated user, when known
 
 
 async def check_user(
@@ -265,13 +266,32 @@ async def ban_and_log(
     )
 
     if log_channel_notify:
+        # Impersonator line — always clickable, always shows @username
+        u_handle = f"@{html.escape(snapshot.username)}" if snapshot.username else "no username"
+        user_line = (
+            f"<a href='tg://user?id={snapshot.user_id}'>{html.escape(full_name)}</a> "
+            f"({u_handle}) | ID: <code>{snapshot.user_id}</code>"
+        )
+
+        # Target line — clickable only when we have a target_user_id
+        # (group-identity matches don't have one).
+        if result.target_user_id:
+            t_handle = (
+                f"@{html.escape(result.target_username)}"
+                if result.target_username else "no username"
+            )
+            target_line = (
+                f"<a href='tg://user?id={result.target_user_id}'>{html.escape(target_display)}</a> "
+                f"({t_handle}) | ID: <code>{result.target_user_id}</code>"
+            )
+        else:
+            target_line = html.escape(target_display)
+
         log_msg = (
             f"🚨 <b>Impersonation Detected</b>\n\n"
             f"<b>Group ID:</b> <code>{group_id}</code>\n"
-            f"<b>User:</b> <a href='tg://user?id={snapshot.user_id}'>{html.escape(full_name)}</a>"
-            f" (@{html.escape(snapshot.username or 'N/A')}) | ID: <code>{snapshot.user_id}</code>\n"
-            f"<b>Impersonating:</b> {html.escape(target_display)}"
-            f" (ID: <code>{result.target_user_id or 'N/A'}</code>)\n"
+            f"<b>User:</b> {user_line}\n"
+            f"<b>Impersonating:</b> {target_line}\n"
             f"<b>Method:</b> {result.match_type}\n"
             f"<b>Match:</b> <code>{html.escape(str(result.matched_val))}</code>\n"
             f"<b>Score:</b> <code>{result.score}</code>\n"
@@ -301,7 +321,9 @@ async def ban_and_log(
             ])
         elif action == "alerted":
             # User is still in the group. Admin can escalate (Ban / Kick),
-            # accept the user (Whitelist / Ignore-30d) or just dismiss.
+            # accept (Whitelist) or shelf for 30 days (Ignore). Dismiss is
+            # intentionally omitted — Ignore (30d) already covers
+            # "acknowledge without action" and prevents re-firing.
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
@@ -323,12 +345,6 @@ async def ban_and_log(
                         callback_data=f"unban_fp|{group_id}|{snapshot.user_id}",
                     ),
                 ],
-                [
-                    InlineKeyboardButton(
-                        "🗑 Dismiss",
-                        callback_data=f"dismiss|{group_id}|{snapshot.user_id}",
-                    ),
-                ],
             ])
         else:
             keyboard = None
@@ -342,9 +358,13 @@ async def ban_and_log(
 
 def _target_fields(row: Optional[dict]) -> dict:
     if not row:
-        return {"target_user_id": None, "target_name": None}
+        return {"target_user_id": None, "target_name": None, "target_username": None}
     name = f"{row['first_name']} {row['last_name'] or ''}".strip()
-    return {"target_user_id": row["user_id"], "target_name": name}
+    return {
+        "target_user_id":   row["user_id"],
+        "target_name":      name,
+        "target_username":  row.get("username"),
+    }
 
 
 def _find_by_username(whitelist: list[dict], username: str) -> Optional[dict]:

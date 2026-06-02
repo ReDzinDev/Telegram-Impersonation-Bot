@@ -1297,17 +1297,25 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     parts = []
 
+    def _user_link(uid: int | None, name: str | None, username: str | None) -> str:
+        """Render a clickable user with @handle inline. Falls back gracefully
+        when we don't have a uid (group-identity matches) or a username."""
+        display = html.escape(name or (f"@{username}" if username else f"ID {uid}" if uid else "?"))
+        handle  = f" (@{html.escape(username)})" if username else ""
+        if uid:
+            return f"<a href='tg://user?id={uid}'>{display}</a>{handle}"
+        return f"{display}{handle}"
+
     if detections:
         parts.append(f"📋 <b>Last {len(detections)} detections</b>")
         for r in detections:
-            dt     = r["created_at"].strftime("%m-%d %H:%M") if r["created_at"] else "?"
-            name   = html.escape(r["full_name"] or r["username"] or f"ID {r['user_id']}")
-            target = html.escape(r["target_name"] or "?")
-            dtype  = r["detection_type"] or "?"
-            action = r["action_taken"] or "?"
+            dt        = r["created_at"].strftime("%m-%d %H:%M") if r["created_at"] else "?"
+            imp_link  = _user_link(r["user_id"],        r["full_name"],   r["username"])
+            tgt_link  = _user_link(r["target_user_id"], r["target_name"], r.get("target_username"))
+            dtype     = r["detection_type"] or "?"
+            action    = r["action_taken"] or "?"
             parts.append(
-                f"<b>{dt}</b> — <a href='tg://user?id={r['user_id']}'>{name}</a> "
-                f"→ {target} | <i>{dtype}</i> | {action}"
+                f"<b>{dt}</b> — {imp_link} → {tgt_link} | <i>{dtype}</i> | {action}"
             )
 
     if actions:
@@ -1316,8 +1324,14 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts.append(f"🔍 <b>Last {len(actions)} admin actions</b>")
         for r in actions:
             dt     = r["created_at"].strftime("%m-%d %H:%M") if r["created_at"] else "?"
-            who    = html.escape(r["admin_name"] or f"ID {r['admin_id']}")
-            tgt    = f" → <code>{r['target_id']}</code>" if r["target_id"] else ""
+            # Link the admin themselves to their profile
+            admin_display = html.escape(r["admin_name"] or f"ID {r['admin_id']}")
+            who = f"<a href='tg://user?id={r['admin_id']}'>{admin_display}</a>"
+            # Link the action target too when we have an ID
+            tgt = (
+                f" → <a href='tg://user?id={r['target_id']}'><code>{r['target_id']}</code></a>"
+                if r["target_id"] else ""
+            )
             detail = f" ({html.escape(r['details'])})" if r["details"] else ""
             parts.append(f"<b>{dt}</b> {who} — {r['action']}{tgt}{detail}")
 

@@ -45,7 +45,9 @@ async def run_daily_summary(bot: Bot, log_channel_id: int):
         if not group_ids:
             continue
 
-        # Build per-group rows AND aggregate totals so the digest is useful at a glance
+        # Build per-group rows AND aggregate totals so the digest is useful at a glance.
+        # Every number on the digest comes from get_recent_activity(hours=24),
+        # so it's strictly last-24h — never cumulative.
         per_group_lines = []
         totals = {"detections": 0, "banned": 0, "kicked": 0, "alerted": 0, "sweeps": 0}
 
@@ -70,10 +72,30 @@ async def run_daily_summary(bot: Bot, log_channel_id: int):
                 f"🧹 {act.get('sweeps', 0)}"
             )
 
+        # If the whole window is empty, post a one-line "quiet day" message
+        # instead of a zero-filled table — avoids confusion with cumulative figures.
+        any_activity = any(totals[k] for k in totals)
+        if not any_activity:
+            try:
+                await bot.send_message(
+                    chat_id=log_channel_id,
+                    text=(
+                        f"📋 <b>Daily Summary — last 24h</b> "
+                        f"({now.strftime('%Y-%m-%d UTC')})\n\n"
+                        "<i>No activity across any group in the last 24h.</i>"
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.error(f"Failed to send daily summary: {e}")
+            continue
+
         header = (
             f"📋 <b>Daily Summary — last 24h</b> "
-            f"({now.strftime('%Y-%m-%d UTC')})\n\n"
-            f"<b>Across all groups:</b> "
+            f"({now.strftime('%Y-%m-%d UTC')})\n"
+            f"<i>All numbers below are for the last 24 hours only — "
+            f"use /stats for cumulative + windowed totals.</i>\n\n"
+            f"<b>Across all groups (24h):</b> "
             f"🚨 {totals['detections']} detections · "
             f"🚫 {totals['banned']} bans · "
             f"👢 {totals['kicked']} kicks · "
@@ -81,11 +103,7 @@ async def run_daily_summary(bot: Bot, log_channel_id: int):
             f"🧹 {totals['sweeps']} sweeps\n"
         )
 
-        body = (
-            "\n<b>By group:</b>\n" + "\n".join(per_group_lines)
-            if per_group_lines
-            else "\n<i>No activity in any group in the last 24h.</i>"
-        )
+        body = "\n<b>By group (24h):</b>\n" + "\n".join(per_group_lines)
 
         try:
             await bot.send_message(

@@ -686,6 +686,10 @@ def get_recent_activity(group_id: int, hours: int = 24) -> dict:
     Activity counts within the last `hours` hours for one group.
     Used by the daily summary so it reports "what happened in the last day"
     instead of cumulative numbers.
+
+    The interval is built server-side via `now() - (hours * interval '1 hour')`
+    rather than `make_interval()` — make_interval refuses parameter binding
+    in older psycopg builds, which silently broke the window.
     """
     conn = get_connection()
     if not conn:
@@ -694,11 +698,11 @@ def get_recent_activity(group_id: int, hours: int = 24) -> dict:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT
-                  (SELECT COUNT(*) FROM logs        WHERE group_id = %(gid)s AND created_at > NOW() - make_interval(hours => %(h)s))                                AS detections,
-                  (SELECT COUNT(*) FROM logs        WHERE group_id = %(gid)s AND action_taken = 'banned' AND created_at > NOW() - make_interval(hours => %(h)s))    AS banned,
-                  (SELECT COUNT(*) FROM logs        WHERE group_id = %(gid)s AND action_taken = 'kicked' AND created_at > NOW() - make_interval(hours => %(h)s))    AS kicked,
-                  (SELECT COUNT(*) FROM logs        WHERE group_id = %(gid)s AND action_taken = 'alerted' AND created_at > NOW() - make_interval(hours => %(h)s))   AS alerted,
-                  (SELECT COUNT(*) FROM sweep_runs  WHERE group_id = %(gid)s AND created_at > NOW() - make_interval(hours => %(h)s))                                AS sweeps
+                  (SELECT COUNT(*) FROM logs       WHERE group_id = %(gid)s AND created_at > NOW() - (%(h)s * INTERVAL '1 hour'))                                AS detections,
+                  (SELECT COUNT(*) FROM logs       WHERE group_id = %(gid)s AND action_taken = 'banned'  AND created_at > NOW() - (%(h)s * INTERVAL '1 hour'))   AS banned,
+                  (SELECT COUNT(*) FROM logs       WHERE group_id = %(gid)s AND action_taken = 'kicked'  AND created_at > NOW() - (%(h)s * INTERVAL '1 hour'))   AS kicked,
+                  (SELECT COUNT(*) FROM logs       WHERE group_id = %(gid)s AND action_taken = 'alerted' AND created_at > NOW() - (%(h)s * INTERVAL '1 hour'))   AS alerted,
+                  (SELECT COUNT(*) FROM sweep_runs WHERE group_id = %(gid)s AND created_at > NOW() - (%(h)s * INTERVAL '1 hour'))                                AS sweeps
             """, {"gid": group_id, "h": hours})
             return cur.fetchone() or {}
     except Exception as e:
@@ -868,17 +872,32 @@ def count_recent_name_changes(user_id: int, window_minutes: int = 60) -> int:
 # ── Recent detections log ──────────────────────────────────────────────────────
 
 def get_recent_logs(group_id: int, limit: int = 10) -> list[dict]:
+    """
+    Recent detections for a group.
+
+    LEFT JOINs whitelisted_users to pick up the target's current username
+    (the logs table itself doesn't store it). If the target was later
+    removed from the whitelist, `target_username` will be NULL — the
+    formatter falls back to just showing the stored target_name.
+    """
     conn = get_connection()
     if not conn:
         return []
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT user_id, username, full_name, target_name, detection_type,
-                       similarity_score, action_taken, trigger, created_at
-                FROM logs
-                WHERE group_id = %s
-                ORDER BY created_at DESC
+                SELECT
+                    l.user_id, l.username, l.full_name,
+                    l.target_user_id, l.target_name,
+                    wl.username AS target_username,
+                    l.detection_type, l.similarity_score,
+                    l.action_taken, l.trigger, l.created_at
+                FROM logs l
+                LEFT JOIN whitelisted_users wl
+                       ON wl.group_id = l.group_id
+                      AND wl.user_id  = l.target_user_id
+                WHERE l.group_id = %s
+                ORDER BY l.created_at DESC
                 LIMIT %s
             """, (group_id, limit))
             return cur.fetchall()
