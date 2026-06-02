@@ -320,19 +320,19 @@ async def ban_and_log(
                 ],
             ])
         elif action == "alerted":
-            # User is still in the group. Admin can escalate (Ban / Kick),
-            # accept (Whitelist) or shelf for 30 days (Ignore). Dismiss is
-            # intentionally omitted — Ignore (30d) already covers
-            # "acknowledge without action" and prevents re-firing.
+            # User is still in the group. Admin can escalate (Ban), accept
+            # (Whitelist), or shelf for 30 days (Ignore).
+            #
+            # Kick is intentionally omitted — anyone you'd want to kick from
+            # an alert you'd probably want to ban outright; offering both
+            # invites decision fatigue. Dismiss is also omitted: Ignore (30d)
+            # already covers "acknowledge without action" and additionally
+            # prevents the same alert re-firing during the grace window.
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
                         "🚫 Ban",
                         callback_data=f"ban_now|{group_id}|{snapshot.user_id}",
-                    ),
-                    InlineKeyboardButton(
-                        "👢 Kick",
-                        callback_data=f"kick_now|{group_id}|{snapshot.user_id}",
                     ),
                 ],
                 [
