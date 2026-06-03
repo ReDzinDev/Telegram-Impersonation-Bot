@@ -1309,13 +1309,30 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if detections:
         parts.append(f"📋 <b>Last {len(detections)} detections</b>")
         for r in detections:
-            dt        = r["created_at"].strftime("%m-%d %H:%M") if r["created_at"] else "?"
-            imp_link  = _user_link(r["user_id"],        r["full_name"],   r["username"])
-            tgt_link  = _user_link(r["target_user_id"], r["target_name"], r.get("target_username"))
-            dtype     = r["detection_type"] or "?"
-            action    = r["action_taken"] or "?"
+            dt       = r["created_at"].strftime("%m-%d %H:%M") if r["created_at"] else "?"
+            imp_link = _user_link(r["user_id"], r["full_name"], r["username"])
+            dtype    = r["detection_type"] or "?"
+            action   = r["action_taken"] or "?"
+
+            # Keyword matches don't impersonate a specific user — show the
+            # matched pattern instead of an empty target link.
+            if dtype == "keyword":
+                details = r.get("details") or ""
+                pattern = (
+                    details[len("Matched: "):]
+                    if details.startswith("Matched: ") else details
+                )
+                tgt_display = (
+                    f"keyword <code>{html.escape(pattern)}</code>"
+                    if pattern else "keyword"
+                )
+            else:
+                tgt_display = _user_link(
+                    r["target_user_id"], r["target_name"], r.get("target_username")
+                )
+
             parts.append(
-                f"<b>{dt}</b> — {imp_link} → {tgt_link} | <i>{dtype}</i> | {action}"
+                f"<b>{dt}</b> — {imp_link} → {tgt_display} | <i>{dtype}</i> | {action}"
             )
 
     if actions:

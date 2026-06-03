@@ -273,27 +273,48 @@ async def ban_and_log(
             f"({u_handle}) | ID: <code>{snapshot.user_id}</code>"
         )
 
-        # Target line — clickable only when we have a target_user_id
-        # (group-identity matches don't have one).
-        if result.target_user_id:
-            t_handle = (
-                f"@{html.escape(result.target_username)}"
-                if result.target_username else "no username"
-            )
-            target_line = (
-                f"<a href='tg://user?id={result.target_user_id}'>{html.escape(target_display)}</a> "
-                f"({t_handle}) | ID: <code>{result.target_user_id}</code>"
-            )
+        # "Why this fired" line — phrasing depends on the match type.
+        #
+        #   keyword                         → a reserved word/pattern matched.
+        #                                     There's no specific person being
+        #                                     impersonated; show the pattern.
+        #   group_name / group_pfp          → the group itself is the target.
+        #                                     target_name is "[Group] X"; not
+        #                                     clickable (no user to link to).
+        #   username / name / homoglyph_*   → a specific whitelisted user.
+        #                                     Clickable when we have an ID.
+        #   pfp                             → same as above.
+        if result.match_type == "keyword":
+            reason_label = "Reserved keyword"
+            reason_value = f"<code>{html.escape(str(result.matched_val))}</code>"
         else:
-            target_line = html.escape(target_display)
+            reason_label = "Impersonating"
+            if result.target_user_id:
+                t_handle = (
+                    f"@{html.escape(result.target_username)}"
+                    if result.target_username else "no username"
+                )
+                reason_value = (
+                    f"<a href='tg://user?id={result.target_user_id}'>{html.escape(target_display)}</a> "
+                    f"({t_handle}) | ID: <code>{result.target_user_id}</code>"
+                )
+            else:
+                # Group-identity match, or a target row that wasn't found
+                reason_value = html.escape(target_display)
+
+        # Match line is redundant when we already showed the keyword above
+        match_line = (
+            "" if result.match_type == "keyword"
+            else f"<b>Match:</b> <code>{html.escape(str(result.matched_val))}</code>\n"
+        )
 
         log_msg = (
             f"🚨 <b>Impersonation Detected</b>\n\n"
             f"<b>Group ID:</b> <code>{group_id}</code>\n"
             f"<b>User:</b> {user_line}\n"
-            f"<b>Impersonating:</b> {target_line}\n"
+            f"<b>{reason_label}:</b> {reason_value}\n"
             f"<b>Method:</b> {result.match_type}\n"
-            f"<b>Match:</b> <code>{html.escape(str(result.matched_val))}</code>\n"
+            f"{match_line}"
             f"<b>Score:</b> <code>{result.score}</code>\n"
             f"<b>Trigger:</b> {trigger}\n"
             f"<b>Invite link:</b> {invite_link or 'N/A'}\n"

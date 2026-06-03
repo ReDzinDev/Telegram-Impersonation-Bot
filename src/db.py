@@ -891,7 +891,7 @@ def get_recent_logs(group_id: int, limit: int = 10) -> list[dict]:
                     l.target_user_id, l.target_name,
                     wl.username AS target_username,
                     l.detection_type, l.similarity_score,
-                    l.action_taken, l.trigger, l.created_at
+                    l.action_taken, l.details, l.trigger, l.created_at
                 FROM logs l
                 LEFT JOIN whitelisted_users wl
                        ON wl.group_id = l.group_id
