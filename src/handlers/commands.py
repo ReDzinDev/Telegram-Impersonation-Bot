@@ -11,7 +11,7 @@ from telegram.constants import ChatMemberStatus, ChatType
 
 from src.db import (
     get_group, upsert_group,
-    upsert_whitelisted_user, remove_whitelisted_user,
+    upsert_whitelisted_user, remove_whitelisted_user, remove_stale_admin_whitelist,
     set_group_action_mode, set_group_log_channel,
     get_stats_windowed, get_latest_log_entry, get_whitelist, mark_seen,
     add_reserved_keyword, remove_reserved_keyword, get_reserved_keywords,
@@ -158,6 +158,32 @@ async def _fetch_group_pfp_hash(bot, chat) -> str | None:
     return None
 
 
+def _resolve_log_channel(group_id: int, context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    """Per-group log channel → global bot_data fallback → global env fallback."""
+    group = get_group(group_id)
+    return (
+        (group and group.get("log_channel_id"))
+        or context.bot_data.get("log_channel_id")
+        or LOG_CHANNEL_ID
+    )
+
+
+async def _post_to_log_channel(
+    context: ContextTypes.DEFAULT_TYPE, group_id: int, text: str,
+) -> None:
+    """Send an HTML message to the group's resolved log channel. No-op if none configured.
+    Errors are logged at WARNING and swallowed — the caller's own reply must still succeed."""
+    channel = _resolve_log_channel(group_id, context)
+    if not channel:
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=channel, text=text, parse_mode="HTML", disable_web_page_preview=True
+        )
+    except Exception as e:
+        logger.warning(f"Could not post to log channel {channel} for group {group_id}: {e}")
+
+
 # ── /start ─────────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -296,13 +322,21 @@ async def handle_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ── /import_admins ─────────────────────────────────────────────────────────────
 
 async def import_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /import_admins         — add/refresh the current admin list
+    /import_admins refresh — also prune admin-typed whitelist entries for
+                              users who are no longer in the admin list
+    """
     ctx = await _get_admin_group(update, context)
     if not ctx:
         return
     group_id, _ = ctx
 
+    refresh = bool(context.args) and context.args[0].lower() in ("refresh", "--refresh", "prune")
+
     ok, msg = await _import_admins_logic(
-        group_id, update.effective_user.id, update.effective_user.full_name, context
+        group_id, update.effective_user.id, update.effective_user.full_name,
+        context, refresh=refresh,
     )
     await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -310,6 +344,7 @@ async def import_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _import_admins_logic(
     chat_id: int, requester_id: int, requester_name: str,
     context: ContextTypes.DEFAULT_TYPE,
+    refresh: bool = False,
 ):
     try:
         chat   = await context.bot.get_chat(chat_id)
@@ -321,8 +356,9 @@ async def _import_admins_logic(
     group_pfp_hash = await _fetch_group_pfp_hash(context.bot, chat)
     upsert_group(chat_id, title=chat.title, pfp_hash=group_pfp_hash)
 
-    count      = 0
-    bot_count  = 0
+    count             = 0
+    bot_count         = 0
+    current_admin_ids: set[int] = set()
     for admin in admins:
         user = admin.user
         # Skip the Anti-Impersonator Bot itself, but keep other admin bots
@@ -342,21 +378,37 @@ async def _import_admins_logic(
             is_bot=bool(user.is_bot),
         )
         mark_seen(chat_id, user.id)
+        current_admin_ids.add(user.id)
         count += 1
         if user.is_bot:
             bot_count += 1
+
+    # Refresh mode: remove admin-typed rows for users no longer in the
+    # admin list. Manual entries are untouched — only `user_type='admin'`
+    # rows are pruned. This is opt-in because a "former admin" may still
+    # be someone you want to protect against impersonation.
+    pruned = 0
+    if refresh:
+        pruned = remove_stale_admin_whitelist(chat_id, current_admin_ids)
 
     log_admin_action(
         group_id=chat_id,
         admin_id=requester_id,
         admin_name=requester_name,
-        action="import_admins",
-        details=f"Imported {count} admin(s) ({bot_count} bot(s))",
+        action="import_admins" + (" (refresh)" if refresh else ""),
+        details=(
+            f"Imported {count} admin(s) ({bot_count} bot(s))"
+            + (f", pruned {pruned} stale" if refresh else "")
+        ),
     )
-    bot_note = f", including <b>{bot_count}</b> bot(s)" if bot_count else ""
+    bot_note   = f", including <b>{bot_count}</b> bot(s)" if bot_count else ""
+    prune_note = f"\n🧹 Pruned <b>{pruned}</b> former admin(s) from the whitelist." if refresh and pruned else (
+        "\n<i>No stale admin entries found.</i>" if refresh else ""
+    )
     return True, (
         f"✅ Imported/updated <b>{count}</b> admin(s){bot_note} "
         f"for <b>{html.escape(str(chat.title or chat_id))}</b>."
+        f"{prune_note}"
     )
 
 
@@ -524,31 +576,73 @@ async def unwhitelist_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /ban ───────────────────────────────────────────────────────────────────────
 
 async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Manual ban — reply, by ID, or by @username (Pyrogram-resolved).
+
+    On success, posts a short notice to the group's log channel so the
+    action shows up alongside automatic detections in the audit trail.
+    """
     ctx = await _get_admin_group(update, context)
     if not ctx:
         return
     group_id, _ = ctx
 
-    target_user = None
-    target_id   = None
+    target_user      = None      # PTB-resolved User, when we have one
+    target_username  = None      # for @username resolution via Pyrogram
+    target_id        = None
+
     if update.message.reply_to_message:
         target_user = update.message.reply_to_message.from_user
         target_id   = target_user.id
     elif context.args:
-        try:
-            target_id = int(context.args[0])
-            # Try to resolve user details so the log entry is complete
+        arg = context.args[0].lstrip()
+        # @username path — needs Pyrogram (Bot API can't resolve handles)
+        if arg.startswith("@"):
+            pyro = context.bot_data.get("pyro_client")
+            if not pyro:
+                await update.message.reply_text(
+                    "⚠️ Resolving @usernames requires the Pyrogram watcher. "
+                    "Use a numeric user ID, or enable Pyrogram in env.",
+                    parse_mode="HTML",
+                )
+                return
             try:
-                member    = await context.bot.get_chat_member(group_id, target_id)
-                target_user = member.user
-            except Exception:
-                pass
-        except ValueError:
-            await update.message.reply_text("Usage: /ban &lt;user_id&gt; or reply to a message.", parse_mode="HTML")
-            return
+                pyro_user = await pyro.get_users(arg)
+                target_id        = pyro_user.id
+                target_username  = (
+                    pyro_user.usernames[0].username if getattr(pyro_user, "usernames", None)
+                    else getattr(pyro_user, "username", None)
+                )
+                # Synthesize a minimal user-like obj for logging fields below
+                target_user = type("U", (), {
+                    "id":        pyro_user.id,
+                    "username":  target_username,
+                    "full_name": f"{pyro_user.first_name or ''} {pyro_user.last_name or ''}".strip(),
+                })()
+            except Exception as e:
+                await update.message.reply_text(
+                    f"❌ Could not resolve <code>{html.escape(arg)}</code>: <code>{e}</code>",
+                    parse_mode="HTML",
+                )
+                return
+        else:
+            try:
+                target_id = int(arg)
+                # Try Bot API for richer log entry; OK if it fails (e.g. user not in chat)
+                try:
+                    member      = await context.bot.get_chat_member(group_id, target_id)
+                    target_user = member.user
+                except Exception:
+                    pass
+            except ValueError:
+                await update.message.reply_text(
+                    "Usage: /ban &lt;user_id&gt; · /ban @username · or reply to a message.",
+                    parse_mode="HTML",
+                )
+                return
 
     if not target_id:
-        await update.message.reply_text("Reply to a message or provide a user ID.")
+        await update.message.reply_text("Reply to a message or provide a user ID / @username.")
         return
 
     try:
@@ -573,6 +667,20 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             details=target_user.full_name if target_user else None,
         )
         await update.message.reply_text(f"🚫 User <code>{target_id}</code> has been banned.", parse_mode="HTML")
+
+        # Post to the group's log channel so it shows up alongside auto-detections
+        admin = update.effective_user
+        target_display = (
+            f"<a href='tg://user?id={target_id}'>{html.escape(target_user.full_name)}</a>"
+            if target_user and target_user.full_name
+            else f"<code>{target_id}</code>"
+        )
+        await _post_to_log_channel(
+            context, group_id,
+            f"🚫 <b>Manual ban</b>\n"
+            f"<b>User:</b> {target_display} | ID: <code>{target_id}</code>\n"
+            f"<b>By:</b> <a href='tg://user?id={admin.id}'>{html.escape(admin.full_name)}</a>"
+        )
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to ban: <code>{e}</code>", parse_mode="HTML")
 
@@ -597,7 +705,22 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await context.bot.unban_chat_member(chat_id=group_id, user_id=target_id, only_if_banned=True)
+        log_admin_action(
+            group_id=group_id,
+            admin_id=update.effective_user.id,
+            admin_name=update.effective_user.full_name,
+            action="unban",
+            target_id=target_id,
+        )
         await update.message.reply_text(f"✅ User <code>{target_id}</code> has been unbanned.", parse_mode="HTML")
+
+        admin = update.effective_user
+        await _post_to_log_channel(
+            context, group_id,
+            f"🔓 <b>Manual unban</b>\n"
+            f"<b>User ID:</b> <a href='tg://user?id={target_id}'><code>{target_id}</code></a>\n"
+            f"<b>By:</b> <a href='tg://user?id={admin.id}'>{html.escape(admin.full_name)}</a>"
+        )
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to unban: <code>{e}</code>", parse_mode="HTML")
 
@@ -637,7 +760,9 @@ async def sweep(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     try:
-        result = await sweep_group(pyro, context.bot, group_id, log_channel, progress_cb=progress)
+        result = await sweep_group(
+            pyro, context.bot, group_id, log_channel, progress_cb=progress, trigger="manual"
+        )
     except Exception as e:
         logger.error(f"Sweep command error for {group_id}: {e}")
         await status_msg.edit_text(f"❌ Sweep failed: <code>{e}</code>", parse_mode="HTML")
@@ -662,6 +787,19 @@ async def sweep(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Flagged & actioned: <code>{flagged}</code>\n"
         f"Errors: <code>{errors}</code>{note}",
         parse_mode="HTML",
+    )
+
+    # Mirror auto-sweep behavior: post the summary to the group's log channel
+    # so audit-watchers see manual and automatic sweeps side by side.
+    admin = update.effective_user
+    await _post_to_log_channel(
+        context, group_id,
+        f"🧹 <b>Manual sweep complete</b>\n"
+        f"<b>Triggered by:</b> <a href='tg://user?id={admin.id}'>{html.escape(admin.full_name)}</a>\n"
+        f"Members seen: <code>{iterated}</code>\n"
+        f"Checked: <code>{checked}</code>\n"
+        f"Flagged: <code>{flagged}</code>\n"
+        f"Errors: <code>{errors}</code>"
     )
 
 
@@ -966,6 +1104,14 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
     admin_name = query.from_user.full_name
 
     if action == "dismiss":
+        log_admin_action(
+            group_id=group_id,
+            admin_id=query.from_user.id,
+            admin_name=admin_name,
+            action="dismiss_alert",
+            target_id=user_id,
+            details="from alert button",
+        )
         await query.edit_message_reply_markup(reply_markup=None)
         return
 

@@ -23,8 +23,8 @@ from pyrogram.errors import FloodWait, ChatAdminRequired, UserNotParticipant
 from telegram import Bot
 
 from src.db import (
-    get_all_group_ids, get_group, get_whitelist, is_whitelisted, mark_seen,
-    record_sweep_run, upsert_whitelisted_user,
+    get_all_group_ids, get_group, get_reserved_keywords, get_whitelist,
+    is_whitelisted, mark_seen, record_sweep_run, upsert_whitelisted_user,
 )
 from src.utils.checker import UserSnapshot, check_user, ban_and_log
 from src.utils.image import compute_pfp_hash_bytes
@@ -80,6 +80,12 @@ async def sweep_group(
             return {"iterated": 0, "checked": 0, "flagged": 0, "errors": 1}
 
         sweep_deadline = time.monotonic() + 7200  # 2-hour hard cap per group
+
+        # Bios are expensive (one MTProto GetFullUser call each) and irrelevant
+        # for groups with no reserved keywords — bio is only consulted by the
+        # keyword detection stage. Resolve once and skip the call otherwise.
+        has_keywords = bool(get_reserved_keywords(group_id))
+        from src.watcher.events import _fetch_bio   # local import — avoids module cycle
 
         # Notify immediately so the admin knows the loop has started
         if progress_cb:
@@ -152,6 +158,18 @@ async def sweep_group(
                         )
                         result = await check_user(snapshot, group_id)
 
+                # Lazy bio: name/username were clean, but the group has reserved
+                # keywords — a scammer's banned word might be hiding in their bio
+                # (which Bot API can't see and `get_chat_members` doesn't return).
+                # One extra MTProto call per still-unflagged non-bot member.
+                bio_fetched = False
+                if not result.flagged and has_keywords:
+                    bio = await _fetch_bio(pyro, user.id)
+                    bio_fetched = True
+                    if bio:
+                        snapshot.bio = bio
+                        result = await check_user(snapshot, group_id)
+
                 checked += 1
 
                 if result.flagged:
@@ -190,11 +208,13 @@ async def sweep_group(
                 # responses without timing out.
                 await asyncio.sleep(0)
 
-                # Only pace after an actual PFP download — username/name checks
+                # Only pace after an actual network call — username/name checks
                 # are pure CPU and need no delay. Sleeping unconditionally was
                 # the reason sweeps took 8+ minutes for 1,000-member groups.
                 if result.needs_pfp and pfp_bytes:
                     await asyncio.sleep(0.5)  # back off after a CDN media fetch
+                elif bio_fetched:
+                    await asyncio.sleep(0.3)  # back off after a GetFullUser call
 
         except FloodWait as e:
             logger.warning(f"Sweep flood wait {e.value}s for group {group_id}")

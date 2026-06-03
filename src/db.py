@@ -484,6 +484,48 @@ def upsert_whitelisted_user(group_id: int, user_id: int, username: str,
         conn.close()
 
 
+def remove_stale_admin_whitelist(group_id: int, keep_user_ids: set[int]) -> int:
+    """
+    Delete admin-typed rows in this group whose user_id is NOT in keep_user_ids.
+
+    Used by /import_admins refresh to prune entries for users who were
+    once admins but have since been demoted. Manual / bot-admin entries
+    are untouched — only `user_type='admin'` rows are considered.
+    Returns the number of rows deleted.
+    """
+    conn = get_connection()
+    if not conn:
+        return 0
+    try:
+        with conn.cursor() as cur:
+            if keep_user_ids:
+                cur.execute(
+                    """
+                    DELETE FROM whitelisted_users
+                     WHERE group_id  = %s
+                       AND user_type = 'admin'
+                       AND user_id <> ALL(%s)
+                    """,
+                    (group_id, list(keep_user_ids)),
+                )
+            else:
+                # No current admins — wipe all admin-typed rows for this group
+                cur.execute(
+                    "DELETE FROM whitelisted_users WHERE group_id = %s AND user_type = 'admin'",
+                    (group_id,),
+                )
+            count = cur.rowcount
+        conn.commit()
+        _invalidate_whitelist_cache(group_id)
+        return count
+    except Exception as e:
+        logger.error(f"remove_stale_admin_whitelist error: {e}")
+        conn.rollback()
+        return 0
+    finally:
+        conn.close()
+
+
 def remove_whitelisted_user(group_id: int, user_id: int) -> bool:
     conn = get_connection()
     if not conn:

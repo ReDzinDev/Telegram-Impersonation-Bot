@@ -22,7 +22,10 @@ from typing import TYPE_CHECKING
 from pyrogram import Client, raw
 from telegram import Bot
 
-from src.db import get_all_group_ids, get_groups_for_user, unmark_seen, log_name_change, count_recent_name_changes
+from src.db import (
+    get_all_group_ids, get_group, get_groups_for_user, unmark_seen,
+    log_name_change, count_recent_name_changes,
+)
 from src.utils.checker import UserSnapshot, check_user, ban_and_log
 
 if TYPE_CHECKING:
@@ -78,16 +81,34 @@ async def _handle_name_change(
             f"{change_count} changes in the last 60 min"
         )
         if log_channel_id:
+            # Render the user as a clickable profile link with their current
+            # name/handle (from the update payload itself — no extra API call).
+            import html as _html
+            display = f"{first_name} {last_name}".strip() or (
+                f"@{username}" if username else f"ID {user_id}"
+            )
+            user_link = (
+                f"<a href='tg://user?id={user_id}'>{_html.escape(display)}</a>"
+            )
+
+            # Replace bare group IDs with stored titles where we have them.
+            def _group_label(gid: int) -> str:
+                g = get_group(gid)
+                title = (g and g.get("title")) or str(gid)
+                return _html.escape(title)
+            groups_label = ", ".join(_group_label(g) for g in group_ids)
+
             try:
                 await bot.send_message(
                     chat_id=log_channel_id,
                     text=(
                         f"⚠️ <b>Name-change velocity alert</b>\n\n"
-                        f"User ID: <code>{user_id}</code> changed their name "
-                        f"<b>{change_count} times</b> in the last 60 minutes.\n"
-                        f"Groups affected: {', '.join(f'<code>{g}</code>' for g in group_ids)}"
+                        f"<b>User:</b> {user_link} | ID: <code>{user_id}</code>\n"
+                        f"Changed their name <b>{change_count} times</b> in the last 60 minutes.\n"
+                        f"<b>Groups:</b> {groups_label}"
                     ),
                     parse_mode="HTML",
+                    disable_web_page_preview=True,
                 )
             except Exception as e:
                 logger.error(f"Failed to send velocity alert: {e}")
