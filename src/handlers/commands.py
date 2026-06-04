@@ -1082,6 +1082,47 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Detection alert inline buttons ────────────────────────────────────────────
 
+async def _resolve_alert(query, action_label: str) -> None:
+    """
+    Edit the detection-alert message in place: drop the buttons AND append a
+    "Resolved" line naming the action taken and who took it. Falls back to
+    just removing the buttons if the edit fails (e.g. message too old to edit,
+    or message originated outside the bot).
+
+    Called after every successful callback so the log channel keeps a
+    permanent record of who pressed what — the original transient toast
+    notification (query.answer) disappears once the admin closes Telegram.
+    """
+    admin = query.from_user
+    admin_link = f"<a href='tg://user?id={admin.id}'>{html.escape(admin.full_name)}</a>"
+
+    # text_html preserves the original HTML formatting (bold, links, etc.).
+    # text_html_urled adds web previews; we don't want those.
+    original = (query.message.text_html if query.message and query.message.text else "") or ""
+
+    new_text = (
+        f"{original}\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"{action_label} by {admin_link}"
+    )
+
+    try:
+        await query.edit_message_text(
+            new_text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=None,
+        )
+    except Exception as e:
+        # Common failure: "Message is not modified" or "Message to edit not found".
+        # Strip the buttons at minimum so the admin sees their press registered.
+        logger.warning(f"Could not edit alert text (falling back to button removal): {e}")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+
 async def handle_detection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handles inline button presses on log-channel detection alerts.
@@ -1092,6 +1133,10 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
       dismiss   — remove the buttons without taking action
       ban_now   — escalate an alert-mode detection to a permanent ban
       kick_now  — escalate an alert-mode detection to a kick (no ban)
+
+    On success, every branch edits the original alert to remove the buttons
+    AND appends a resolution line so the audit is permanently visible.
+    On failure, the buttons stay so the admin can retry.
     """
     query = update.callback_query
     await query.answer()
@@ -1112,7 +1157,7 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
             target_id=user_id,
             details="from alert button",
         )
-        await query.edit_message_reply_markup(reply_markup=None)
+        await _resolve_alert(query, "🗑 <b>Dismissed</b>")
         return
 
     # Escalation actions from alert-mode detections
@@ -1150,7 +1195,8 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
             target_id=user_id,
             details="from alert button",
         )
-        await query.edit_message_reply_markup(reply_markup=None)
+        label = "🚫 <b>Banned</b>" if verb == "banned" else "👢 <b>Kicked</b>"
+        await _resolve_alert(query, label)
         await query.answer(f"{verb.capitalize()} by {admin_name}.", show_alert=False)
         return
 
@@ -1195,12 +1241,14 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
             details="from alert button",
         )
 
-        await query.edit_message_reply_markup(reply_markup=None)
+        label = "✅ <b>Unbanned + Whitelisted</b>" if was_banned else "✅ <b>Whitelisted</b>"
+        await _resolve_alert(query, label)
         msg = (
             f"Unbanned + whitelisted by {admin_name}." if was_banned
             else f"Whitelisted by {admin_name} (alert cleared)."
         )
         await query.answer(msg, show_alert=False)
+        return
 
     if action == "unban_fp":
         # only_if_banned=True makes this safe for alert-mode (no-op if not banned)
@@ -1223,12 +1271,17 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
             target_id=user_id,
             details="30-day grace, from alert button",
         )
-        await query.edit_message_reply_markup(reply_markup=None)
+        label = (
+            "🔓 <b>Unbanned</b> (30-day grace)" if was_banned
+            else "🔕 <b>Ignored</b> (30-day grace)"
+        )
+        await _resolve_alert(query, label)
         msg = (
             f"Unbanned (30-day grace) by {admin_name}." if was_banned
             else f"Alert ignored — 30-day grace set by {admin_name}."
         )
         await query.answer(msg, show_alert=False)
+        return
 
 
 # ── /addkeyword ───────────────────────────────────────────────────────────────
