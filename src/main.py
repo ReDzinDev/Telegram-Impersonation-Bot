@@ -3,7 +3,7 @@ import asyncio
 import logging
 
 from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, Update
-from telegram.error import TimedOut, NetworkError
+from telegram.error import TimedOut, NetworkError, Conflict
 from telegram.ext import (
     ApplicationBuilder, CallbackQueryHandler, CommandHandler, ChatMemberHandler,
     ContextTypes, MessageHandler, PicklePersistence, filters,
@@ -67,13 +67,24 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
 
     Network timeouts and transient connection errors are logged at WARNING level
     (they're expected during heavy sweeps and resolve on the next poll cycle).
+    Conflict errors are also WARNING — they happen during Railway redeploys when
+    the new container starts polling before the old one has fully exited, and
+    self-resolve in <30s. Only persistent Conflicts indicate a real duplicate
+    instance that needs operator attention.
     Everything else is logged at ERROR so real problems are still visible.
     """
     err = context.error
     if isinstance(err, (TimedOut, NetworkError)):
         logger.warning(f"Transient network error (ignored): {err}")
         return
-    logger.error(f"Unhandled PTB exception", exc_info=err)
+    if isinstance(err, Conflict):
+        logger.warning(
+            "getUpdates Conflict — another bot instance is polling with the same "
+            "token. If this persists for more than a minute, check Railway for "
+            "duplicate services or a leftover local dev process."
+        )
+        return
+    logger.error("Unhandled PTB exception", exc_info=err)
 
 
 def build_ptb_app(pyro_client=None):
