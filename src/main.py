@@ -13,7 +13,7 @@ from src.config import (
     BOT_TOKEN, LOG_CHANNEL_ID,
     PYROGRAM_API_ID, PYROGRAM_API_HASH, PYROGRAM_SESSION, PYROGRAM_ENABLED,
 )
-from src.db import init_db, get_connection
+from src.db import init_db, get_connection, put_connection
 from src.handlers.commands import (
     start, handle_chat_shared, import_admins, whitelist_user,
     unwhitelist_user, ban_user, unban_user,
@@ -21,6 +21,8 @@ from src.handlers.commands import (
     handle_detection_callback,
     add_keyword, remove_keyword, list_keywords, set_threshold, logs, import_whitelist,
     clear_whitelist_cmd,
+    settings, set_bands, set_type_threshold, blocklist_toggle, protect_identity,
+    handle_whitelist_undo, handle_whitelist_page, handle_logs_page,
 )
 from src.handlers.member_join import check_impersonation, on_bot_added_to_group
 from src.handlers.messages import scan_message_sender
@@ -43,22 +45,29 @@ async def _db_keepalive(interval: int = 270) -> None:
     Uses 270 s (just under 5 min) to stay inside psycopg's implicit
     idle-connection timeout and Railway's own inactivity window.
     On failure we log a warning and keep retrying — get_connection() will
-    do its own exponential-backoff retry before giving up.
+    do its own exponential-backoff retry before giving up. The whole
+    body is wrapped in try/except so nothing here can kill the task.
     """
     while True:
-        await asyncio.sleep(interval)
-        conn = get_connection()
-        if conn:
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1")
-                logger.debug("DB keep-alive ping OK")
-            except Exception as e:
-                logger.warning(f"DB keep-alive query failed: {e}")
-            finally:
-                conn.close()
-        else:
-            logger.warning("DB keep-alive: could not connect (database may be waking up)")
+        try:
+            await asyncio.sleep(interval)
+            conn = get_connection()
+            if conn:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+                    logger.debug("DB keep-alive ping OK")
+                except Exception as e:
+                    logger.warning(f"DB keep-alive query failed: {e}")
+                finally:
+                    put_connection(conn)
+            else:
+                logger.warning("DB keep-alive: could not connect (database may be waking up)")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception(f"DB keep-alive loop body crashed: {e}")
+            await asyncio.sleep(30)
 
 
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -115,6 +124,11 @@ def build_ptb_app(pyro_client=None):
     app.add_handler(CommandHandler("removekeyword",   remove_keyword))
     app.add_handler(CommandHandler("listkeywords",    list_keywords))
     app.add_handler(CommandHandler("setthreshold",    set_threshold))
+    app.add_handler(CommandHandler("setthresholds",   set_type_threshold))
+    app.add_handler(CommandHandler("setbands",        set_bands))
+    app.add_handler(CommandHandler("blocklist",       blocklist_toggle))
+    app.add_handler(CommandHandler("protect",         protect_identity))
+    app.add_handler(CommandHandler("settings",        settings))
     app.add_handler(CommandHandler("logs",            logs))
     app.add_handler(CommandHandler("clearwhitelist",  clear_whitelist_cmd))
     app.add_handler(MessageHandler(
@@ -127,6 +141,13 @@ def build_ptb_app(pyro_client=None):
         handle_detection_callback,
         pattern=r"^(unban_wl|unban_fp|dismiss|ban_now|kick_now)\|",
     ))
+    # Undo button on /clearwhitelist success message
+    app.add_handler(CallbackQueryHandler(
+        handle_whitelist_undo, pattern=r"^wl_undo\|",
+    ))
+    # Inline pagination nav for /listwhitelist and /logs
+    app.add_handler(CallbackQueryHandler(handle_whitelist_page, pattern=r"^wl_pg\|"))
+    app.add_handler(CallbackQueryHandler(handle_logs_page,      pattern=r"^logs_pg\|"))
 
     # Global error handler: keeps TimedOut / NetworkError out of the ERROR log
     app.add_error_handler(_error_handler)
@@ -195,6 +216,11 @@ async def main():
         BotCommand("removekeyword",   "Remove a reserved keyword"),
         BotCommand("listkeywords",    "List all reserved keywords"),
         BotCommand("setthreshold",    "Set fuzzy-match sensitivity (default 85)"),
+        BotCommand("setthresholds",   "Per-type thresholds (username=88 name=85)"),
+        BotCommand("setbands",        "Set severity bands (e.g. /setbands 90 78)"),
+        BotCommand("blocklist",       "Toggle cross-group blocklist (on/off)"),
+        BotCommand("protect",         "Protect an external identity by name (+ photo)"),
+        BotCommand("settings",        "Show this group's full configuration"),
         BotCommand("logs",            "Recent detections + admin actions"),
         BotCommand("clearwhitelist",  "⚠️ Remove all protected users (requires confirm)"),
     ]
@@ -217,6 +243,49 @@ async def main():
 
     logger.info("Bot is running.")
 
+    def _supervise(name: str, task: asyncio.Task) -> None:
+        """
+        Attach a done-callback that screams loudly if a background task
+        exits unexpectedly. The per-task while loops already catch most
+        exceptions internally — this is the last line of defence for
+        anything that escapes them (e.g. a programmer error in the
+        try/except itself, or an unhandled CancelledError race).
+
+        Posts to the global LOG_CHANNEL_ID if configured, so the operator
+        sees task death without tailing Railway logs.
+        """
+        def _on_done(t: asyncio.Task) -> None:
+            if t.cancelled():
+                logger.info(f"Background task '{name}' cancelled (shutdown).")
+                return
+            exc = t.exception()
+            if exc is None:
+                # A `while True` exiting without exception is itself a bug
+                logger.error(
+                    f"Background task '{name}' exited cleanly — this should never happen."
+                )
+                return
+            logger.error(
+                f"Background task '{name}' died with an unhandled exception",
+                exc_info=exc,
+            )
+            if LOG_CHANNEL_ID:
+                async def _notify(_exc=exc, _name=name):
+                    try:
+                        await ptb_app.bot.send_message(
+                            chat_id=LOG_CHANNEL_ID,
+                            text=(
+                                f"💀 <b>Background task died:</b> <code>{_name}</code>\n"
+                                f"<code>{type(_exc).__name__}: {str(_exc)[:300]}</code>\n"
+                                "Restart the bot to recover. Check logs for the full traceback."
+                            ),
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+                asyncio.create_task(_notify())
+        task.add_done_callback(_on_done)
+
     if pyro_client:
         await pyro_client.start()
         logger.info("Pyrogram client started.")
@@ -234,12 +303,15 @@ async def main():
         sweep_task = asyncio.create_task(
             run_periodic_sweeps(pyro_client, ptb_app.bot, LOG_CHANNEL_ID)
         )
+        _supervise("periodic_sweep", sweep_task)
         health_task = asyncio.create_task(
             run_health_check(pyro_client, ptb_app.bot, LOG_CHANNEL_ID)
         )
+        _supervise("health_check", health_task)
 
     # DB keep-alive — prevents Railway Hobby Postgres from sleeping
     keepalive_task = asyncio.create_task(_db_keepalive())
+    _supervise("db_keepalive", keepalive_task)
 
     summary_task = None
     if LOG_CHANNEL_ID:
@@ -247,6 +319,7 @@ async def main():
         summary_task = asyncio.create_task(
             run_daily_summary(ptb_app.bot, LOG_CHANNEL_ID)
         )
+        _supervise("daily_summary", summary_task)
 
     try:
         await asyncio.Event().wait()  # run forever

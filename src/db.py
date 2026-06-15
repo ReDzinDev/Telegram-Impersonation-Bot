@@ -3,39 +3,89 @@ import time
 import logging
 import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 from src.config import DATABASE_URL
 
 logger = logging.getLogger(__name__)
 
+# ── Connection pool ──────────────────────────────────────────────────────────
+# Previously every DB call opened a fresh psycopg connection; a 1,000-member
+# sweep meant 2,000+ TCP+TLS handshakes. A process-wide pool reuses a handful
+# of live connections instead — far less overhead on Railway Hobby.
+#
+# Callers keep the existing contract: `conn = get_connection()` (None on
+# failure) then `put_connection(conn)` in a finally block. put_connection
+# returns the connection to the pool rather than closing it.
+
+DB_POOL_MAX_SIZE = 10
+_pool: ConnectionPool | None = None
+
+
+def _get_pool() -> ConnectionPool:
+    """
+    Lazily build the process-wide pool.
+
+    min_size=0 → we never eagerly open a connection at construction time
+    (Railway Hobby Postgres may be asleep at boot, which would make eager
+    opening fail). check_connection validates each borrowed connection and
+    transparently replaces any the server dropped during a sleep window,
+    so callers never receive a dead socket.
+    """
+    global _pool
+    if _pool is None:
+        _pool = ConnectionPool(
+            conninfo=DATABASE_URL,
+            min_size=0,
+            max_size=DB_POOL_MAX_SIZE,
+            max_idle=300,
+            timeout=30,
+            kwargs={"row_factory": dict_row, "connect_timeout": 30},
+            check=ConnectionPool.check_connection,
+            open=True,
+        )
+    return _pool
+
 
 def get_connection(retries: int = 8, base_delay: float = 2.0):
     """
-    Open a new psycopg connection with exponential-backoff retries.
+    Borrow a pooled connection, with exponential-backoff retries to ride out
+    Railway Hobby cold starts (the DB can take 15-30 s to wake).
 
-    Railway Hobby databases go to sleep after inactivity and can take
-    15-30 s to wake up.  Exponential backoff (2 → 4 → 8 → 16 → 30 → 30…)
-    gives us up to ~2 minutes to wait for a cold-start without hammering
-    the server.  connect_timeout=30 ensures a sleeping DB fails fast
-    (rather than hanging) so the retry loop fires promptly.
+    Returns None after exhausting retries — every caller already handles the
+    None case. ALWAYS return the connection via put_connection() when done.
     """
     for attempt in range(retries):
         try:
-            return psycopg.connect(
-                DATABASE_URL,
-                row_factory=dict_row,
-                connect_timeout=30,
-            )
+            return _get_pool().getconn(timeout=30)
         except Exception as e:
             if attempt < retries - 1:
                 delay = min(base_delay * (2 ** attempt), 30)
                 logger.warning(
-                    f"DB connection attempt {attempt + 1}/{retries} failed, "
+                    f"DB pool getconn attempt {attempt + 1}/{retries} failed, "
                     f"retrying in {delay:.0f}s: {e}"
                 )
                 time.sleep(delay)
             else:
-                logger.error(f"DB connection failed after {retries} attempts: {e}")
+                logger.error(f"DB pool getconn failed after {retries} attempts: {e}")
                 return None
+
+
+def put_connection(conn) -> None:
+    """
+    Return a connection to the pool. Safe to call with None. If the pool
+    rejects it (e.g. the connection is broken), close the raw socket so we
+    don't leak it — the pool will open a fresh one on the next borrow.
+    """
+    if conn is None:
+        return
+    try:
+        _get_pool().putconn(conn)
+    except Exception as e:
+        logger.warning(f"put_connection failed, closing raw socket: {e}")
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def init_db():
@@ -145,13 +195,30 @@ def init_db():
                 ALTER TABLE logs
                     ADD COLUMN IF NOT EXISTS invite_link TEXT;
             """)
+            # Detection-time profile snapshot: freeze the impersonator's bio and
+            # own PFP hash at the moment of detection, so the record stays
+            # accurate even after the scammer changes their profile.
+            cur.execute("ALTER TABLE logs ADD COLUMN IF NOT EXISTS bio          TEXT;")
+            cur.execute("ALTER TABLE logs ADD COLUMN IF NOT EXISTS user_pfp_hash TEXT;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_group ON logs(group_id, created_at DESC);")
 
-            # Per-group similarity threshold
+            # Per-group similarity threshold (legacy general fallback)
             cur.execute("""
                 ALTER TABLE groups
                     ADD COLUMN IF NOT EXISTS similarity_threshold INTEGER;
             """)
+            # Per-match-type threshold overrides. NULL → fall back to
+            # similarity_threshold → global config default.
+            cur.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS username_threshold INTEGER;")
+            cur.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS name_threshold     INTEGER;")
+            # Severity score bands. NULL → global config defaults
+            # (DEFAULT_BAN_SCORE / DEFAULT_ALERT_SCORE).
+            cur.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS ban_score   INTEGER;")
+            cur.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS alert_score INTEGER;")
+            # Cross-group blocklist participation (on by default, opt-out).
+            cur.execute(
+                "ALTER TABLE groups ADD COLUMN IF NOT EXISTS use_global_blocklist BOOLEAN NOT NULL DEFAULT TRUE;"
+            )
 
             # Reserved keywords / regex patterns per group
             cur.execute("""
@@ -233,13 +300,31 @@ def init_db():
                 "CREATE INDEX IF NOT EXISTS idx_sweep_group ON sweep_runs(group_id, created_at DESC);"
             )
 
+            # Cross-group blocklist: confirmed bad actors shared across every
+            # group the bot manages. Populated only by HUMAN-confirmed bans
+            # (manual /ban, alert-escalation ban). A group with
+            # use_global_blocklist=TRUE acts on these at join/scan time.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS known_bad_actors (
+                    user_id        BIGINT PRIMARY KEY,
+                    username       TEXT,
+                    full_name      TEXT,
+                    reason         TEXT,
+                    confirmed_by   BIGINT,
+                    source_group_id BIGINT,
+                    ban_count      INTEGER NOT NULL DEFAULT 1,
+                    first_seen_at  TIMESTAMPTZ DEFAULT NOW(),
+                    last_seen_at   TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+
         conn.commit()
         logger.info("Database initialized.")
     except Exception as e:
         logger.error(f"DB init error: {e}")
         conn.rollback()
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 # ── Group helpers ──────────────────────────────────────────────────────────────
@@ -295,7 +380,7 @@ def upsert_group(group_id: int, title: str = None,
         conn.rollback()
         return False
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def get_group(group_id: int) -> dict | None:
@@ -316,7 +401,7 @@ def get_group(group_id: int) -> dict | None:
         logger.error(f"get_group error: {e}")
         return None
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def get_all_group_ids() -> list[int]:
@@ -331,7 +416,7 @@ def get_all_group_ids() -> list[int]:
         logger.error(f"get_all_group_ids error: {e}")
         return []
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def set_group_log_channel(group_id: int, log_channel_id: int | None) -> bool:
@@ -352,7 +437,7 @@ def set_group_log_channel(group_id: int, log_channel_id: int | None) -> bool:
         conn.rollback()
         return False
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def set_group_action_mode(group_id: int, mode: str) -> bool:
@@ -373,7 +458,7 @@ def set_group_action_mode(group_id: int, mode: str) -> bool:
         conn.rollback()
         return False
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 # ── Whitelist helpers ──────────────────────────────────────────────────────────
@@ -404,7 +489,7 @@ def get_whitelist(group_id: int) -> list[dict]:
         logger.error(f"get_whitelist error: {e}")
         return []
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def is_whitelisted(group_id: int, user_id: int) -> bool:
@@ -428,7 +513,7 @@ def _is_whitelisted_db(group_id: int, user_id: int) -> bool:
         logger.error(f"is_whitelisted error: {e}")
         return False
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def get_groups_for_user(user_id: int) -> list[int]:
@@ -447,7 +532,7 @@ def get_groups_for_user(user_id: int) -> list[int]:
         logger.error(f"get_groups_for_user error: {e}")
         return []
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def upsert_whitelisted_user(group_id: int, user_id: int, username: str,
@@ -481,7 +566,7 @@ def upsert_whitelisted_user(group_id: int, user_id: int, username: str,
         conn.rollback()
         return False
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def remove_stale_admin_whitelist(group_id: int, keep_user_ids: set[int]) -> int:
@@ -523,7 +608,7 @@ def remove_stale_admin_whitelist(group_id: int, keep_user_ids: set[int]) -> int:
         conn.rollback()
         return 0
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def remove_whitelisted_user(group_id: int, user_id: int) -> bool:
@@ -545,7 +630,7 @@ def remove_whitelisted_user(group_id: int, user_id: int) -> bool:
         conn.rollback()
         return False
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 # ── Seen-member helpers (RELAXED mode) ────────────────────────────────────────
@@ -565,7 +650,7 @@ def is_seen(group_id: int, user_id: int) -> bool:
         logger.error(f"is_seen error: {e}")
         return False
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def mark_seen(group_id: int, user_id: int):
@@ -584,7 +669,7 @@ def mark_seen(group_id: int, user_id: int):
         logger.error(f"mark_seen error: {e}")
         conn.rollback()
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def unmark_seen(group_id: int, user_id: int):
@@ -602,7 +687,7 @@ def unmark_seen(group_id: int, user_id: int):
     except Exception as e:
         logger.error(f"unmark_seen error: {e}")
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 # ── Log helpers ────────────────────────────────────────────────────────────────
@@ -610,7 +695,8 @@ def unmark_seen(group_id: int, user_id: int):
 def insert_log(group_id: int, user_id: int, username: str, full_name: str,
                target_user_id: int, target_name: str, detection_type: str,
                similarity_score: float, action_taken: str, details: str,
-               trigger: str = "join", invite_link: str = None):
+               trigger: str = "join", invite_link: str = None,
+               bio: str = None, user_pfp_hash: str = None):
     conn = get_connection()
     if not conn:
         return
@@ -619,16 +705,18 @@ def insert_log(group_id: int, user_id: int, username: str, full_name: str,
             cur.execute("""
                 INSERT INTO logs
                     (group_id, user_id, username, full_name, target_user_id, target_name,
-                     detection_type, similarity_score, action_taken, details, trigger, invite_link)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     detection_type, similarity_score, action_taken, details, trigger,
+                     invite_link, bio, user_pfp_hash)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (group_id, user_id, username, full_name, target_user_id, target_name,
-                  detection_type, similarity_score, action_taken, details, trigger, invite_link))
+                  detection_type, similarity_score, action_taken, details, trigger,
+                  invite_link, bio, user_pfp_hash))
         conn.commit()
     except Exception as e:
         logger.error(f"insert_log error: {e}")
         conn.rollback()
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def get_latest_log_entry(group_id: int, user_id: int) -> dict | None:
@@ -647,7 +735,7 @@ def get_latest_log_entry(group_id: int, user_id: int) -> dict | None:
         logger.error(f"get_latest_log_entry error: {e}")
         return None
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def get_stats_windowed(group_id: int) -> dict:
@@ -684,7 +772,7 @@ def get_stats_windowed(group_id: int) -> dict:
         logger.error(f"get_stats_windowed error: {e}")
         return {}
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def get_all_group_stats_windowed() -> list[dict]:
@@ -720,7 +808,7 @@ def get_all_group_stats_windowed() -> list[dict]:
         logger.error(f"get_all_group_stats_windowed error: {e}")
         return []
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def get_recent_activity(group_id: int, hours: int = 24) -> dict:
@@ -751,7 +839,7 @@ def get_recent_activity(group_id: int, hours: int = 24) -> dict:
         logger.error(f"get_recent_activity error: {e}")
         return {}
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 # ── Sweep run history ─────────────────────────────────────────────────────────
@@ -776,7 +864,7 @@ def record_sweep_run(
         logger.error(f"record_sweep_run error: {e}")
         conn.rollback()
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 # ── Reserved keyword helpers ───────────────────────────────────────────────────
@@ -800,7 +888,7 @@ def add_reserved_keyword(group_id: int, pattern: str, is_regex: bool, created_by
         conn.rollback()
         return False
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def remove_reserved_keyword(group_id: int, pattern: str) -> bool:
@@ -822,7 +910,7 @@ def remove_reserved_keyword(group_id: int, pattern: str) -> bool:
         conn.rollback()
         return False
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def get_reserved_keywords(group_id: int) -> list[dict]:
@@ -846,7 +934,7 @@ def get_reserved_keywords(group_id: int) -> list[dict]:
         logger.error(f"get_reserved_keywords error: {e}")
         return []
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 # ── Per-group threshold ────────────────────────────────────────────────────────
@@ -869,7 +957,7 @@ def set_group_threshold(group_id: int, threshold: int) -> bool:
         conn.rollback()
         return False
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 # ── Name-change velocity ───────────────────────────────────────────────────────
@@ -889,7 +977,7 @@ def log_name_change(user_id: int):
         logger.error(f"log_name_change error: {e}")
         conn.rollback()
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def count_recent_name_changes(user_id: int, window_minutes: int = 60) -> int:
@@ -908,7 +996,7 @@ def count_recent_name_changes(user_id: int, window_minutes: int = 60) -> int:
         logger.error(f"count_recent_name_changes error: {e}")
         return 0
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 # ── Recent detections log ──────────────────────────────────────────────────────
@@ -947,7 +1035,7 @@ def get_recent_logs(group_id: int, limit: int = 10) -> list[dict]:
         logger.error(f"get_recent_logs error: {e}")
         return []
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 # ── Admin action audit log ─────────────────────────────────────────────────────
@@ -975,7 +1063,7 @@ def log_admin_action(
         logger.error(f"log_admin_action error: {e}")
         conn.rollback()
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def get_recent_admin_actions(group_id: int, limit: int = 20) -> list[dict]:
@@ -996,7 +1084,7 @@ def get_recent_admin_actions(group_id: int, limit: int = 20) -> list[dict]:
         logger.error(f"get_recent_admin_actions error: {e}")
         return []
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 # ── Bulk whitelist clear ───────────────────────────────────────────────────────
@@ -1021,7 +1109,7 @@ def clear_whitelist(group_id: int) -> int:
         conn.rollback()
         return 0
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 # ── False-positive grace period ────────────────────────────────────────────────
@@ -1054,7 +1142,7 @@ def mark_false_positive(
         logger.error(f"mark_false_positive error: {e}")
         conn.rollback()
     finally:
-        conn.close()
+        put_connection(conn)
 
 
 def is_false_positive(group_id: int, user_id: int) -> bool:
@@ -1081,4 +1169,182 @@ def is_false_positive(group_id: int, user_id: int) -> bool:
         logger.error(f"is_false_positive error: {e}")
         return False
     finally:
-        conn.close()
+        put_connection(conn)
+
+
+# ── Per-type thresholds & severity score bands ─────────────────────────────────
+
+def set_group_thresholds(
+    group_id: int, username_threshold: int | None = None,
+    name_threshold: int | None = None,
+) -> bool:
+    """
+    Set per-match-type similarity thresholds. Only the provided values are
+    updated (pass None to leave one unchanged). NULL in the DB means "fall
+    back to similarity_threshold, then the global config default".
+    """
+    sets, params = [], []
+    if username_threshold is not None:
+        sets.append("username_threshold = %s")
+        params.append(username_threshold)
+    if name_threshold is not None:
+        sets.append("name_threshold = %s")
+        params.append(name_threshold)
+    if not sets:
+        return False
+    params.append(group_id)
+    conn = get_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE groups SET {', '.join(sets)}, updated_at = NOW() WHERE group_id = %s",
+                tuple(params),
+            )
+        conn.commit()
+        _invalidate_group_cache(group_id)
+        return True
+    except Exception as e:
+        logger.error(f"set_group_thresholds error: {e}")
+        conn.rollback()
+        return False
+    finally:
+        put_connection(conn)
+
+
+def set_group_score_bands(group_id: int, ban_score: int, alert_score: int) -> bool:
+    """Set the severity bands. ban_score >= alert_score is enforced by the caller."""
+    conn = get_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE groups SET ban_score = %s, alert_score = %s, updated_at = NOW() "
+                "WHERE group_id = %s",
+                (ban_score, alert_score, group_id),
+            )
+        conn.commit()
+        _invalidate_group_cache(group_id)
+        return True
+    except Exception as e:
+        logger.error(f"set_group_score_bands error: {e}")
+        conn.rollback()
+        return False
+    finally:
+        put_connection(conn)
+
+
+def set_group_blocklist(group_id: int, enabled: bool) -> bool:
+    """Toggle this group's participation in the cross-group blocklist."""
+    conn = get_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE groups SET use_global_blocklist = %s, updated_at = NOW() WHERE group_id = %s",
+                (enabled, group_id),
+            )
+        conn.commit()
+        _invalidate_group_cache(group_id)
+        return True
+    except Exception as e:
+        logger.error(f"set_group_blocklist error: {e}")
+        conn.rollback()
+        return False
+    finally:
+        put_connection(conn)
+
+
+# ── Cross-group blocklist (known bad actors) ───────────────────────────────────
+
+_bad_actor_cache: dict[int, tuple[float, dict | None]] = {}
+_BAD_ACTOR_CACHE_TTL = 300
+
+
+def _invalidate_bad_actor_cache(user_id: int):
+    _bad_actor_cache.pop(user_id, None)
+
+
+def add_known_bad_actor(
+    user_id: int, username: str | None, full_name: str | None,
+    reason: str, confirmed_by: int | None, source_group_id: int | None,
+) -> bool:
+    """
+    Record (or re-confirm) a confirmed bad actor in the cross-group blocklist.
+    On a repeat confirmation we bump ban_count and refresh last_seen_at so the
+    list doubles as a "how widespread is this scammer" signal.
+    Only HUMAN-confirmed bans should call this.
+    """
+    conn = get_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO known_bad_actors
+                    (user_id, username, full_name, reason, confirmed_by, source_group_id)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    username        = COALESCE(EXCLUDED.username, known_bad_actors.username),
+                    full_name       = COALESCE(EXCLUDED.full_name, known_bad_actors.full_name),
+                    reason          = EXCLUDED.reason,
+                    confirmed_by    = EXCLUDED.confirmed_by,
+                    source_group_id = EXCLUDED.source_group_id,
+                    ban_count       = known_bad_actors.ban_count + 1,
+                    last_seen_at    = NOW();
+            """, (user_id, username, full_name, reason, confirmed_by, source_group_id))
+        conn.commit()
+        _invalidate_bad_actor_cache(user_id)
+        return True
+    except Exception as e:
+        logger.error(f"add_known_bad_actor error: {e}")
+        conn.rollback()
+        return False
+    finally:
+        put_connection(conn)
+
+
+def get_known_bad_actor(user_id: int) -> dict | None:
+    """Return the blocklist row for a user, or None. Cached for 5 min — this
+    is consulted in the detection hot path (join / message / sweep)."""
+    cached = _bad_actor_cache.get(user_id)
+    if cached and time.time() - cached[0] < _BAD_ACTOR_CACHE_TTL:
+        return cached[1]
+    conn = get_connection()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM known_bad_actors WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+        _bad_actor_cache[user_id] = (time.time(), row)
+        return row
+    except Exception as e:
+        logger.error(f"get_known_bad_actor error: {e}")
+        return None
+    finally:
+        put_connection(conn)
+
+
+def remove_known_bad_actor(user_id: int) -> bool:
+    """Remove a user from the blocklist (used when a ban is reversed as a
+    false positive, so they're not re-banned cross-group)."""
+    conn = get_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM known_bad_actors WHERE user_id = %s", (user_id,))
+            removed = cur.rowcount > 0
+        conn.commit()
+        _invalidate_bad_actor_cache(user_id)
+        return removed
+    except Exception as e:
+        logger.error(f"remove_known_bad_actor error: {e}")
+        conn.rollback()
+        return False
+    finally:
+        put_connection(conn)

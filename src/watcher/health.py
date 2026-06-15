@@ -14,47 +14,60 @@ from typing import Optional
 from pyrogram import Client
 from telegram import Bot
 
-logger = logging.getLogger(__name__)
+from src.config import HEALTH_CHECK_INTERVAL
 
-HEALTH_CHECK_INTERVAL = 300  # 5 minutes
+logger = logging.getLogger(__name__)
 
 
 async def run_health_check(pyro: Client, bot: Bot, log_channel_id: Optional[str] = None):
+    """
+    Periodic Pyrogram session liveness check.
+
+    Loop body wrapped in try/except so an unexpected exception (e.g. a
+    quirky pyrogram internal state during reconnect) can't permanently
+    kill the watchdog. CancelledError still propagates so shutdown works.
+    """
     while True:
-        await asyncio.sleep(HEALTH_CHECK_INTERVAL)
-
-        if pyro.is_connected:
-            continue
-
-        logger.warning("Pyrogram client disconnected — attempting reconnect.")
-
-        if log_channel_id:
-            try:
-                await bot.send_message(
-                    chat_id=log_channel_id,
-                    text="⚠️ <b>Pyrogram watcher disconnected.</b> Attempting to reconnect…",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-
         try:
-            await pyro.start()
-            logger.info("Pyrogram client reconnected.")
-            if log_channel_id:
-                await bot.send_message(
-                    chat_id=log_channel_id,
-                    text="✅ <b>Pyrogram watcher reconnected.</b>",
-                    parse_mode="HTML",
-                )
-        except Exception as e:
-            logger.error(f"Pyrogram reconnect failed: {e}")
+            await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+
+            if pyro.is_connected:
+                continue
+
+            logger.warning("Pyrogram client disconnected — attempting reconnect.")
+
             if log_channel_id:
                 try:
                     await bot.send_message(
                         chat_id=log_channel_id,
-                        text=f"❌ <b>Pyrogram reconnect failed:</b> <code>{e}</code>",
+                        text="⚠️ <b>Pyrogram watcher disconnected.</b> Attempting to reconnect…",
                         parse_mode="HTML",
                     )
                 except Exception:
                     pass
+
+            try:
+                await pyro.start()
+                logger.info("Pyrogram client reconnected.")
+                if log_channel_id:
+                    await bot.send_message(
+                        chat_id=log_channel_id,
+                        text="✅ <b>Pyrogram watcher reconnected.</b>",
+                        parse_mode="HTML",
+                    )
+            except Exception as e:
+                logger.error(f"Pyrogram reconnect failed: {e}")
+                if log_channel_id:
+                    try:
+                        await bot.send_message(
+                            chat_id=log_channel_id,
+                            text=f"❌ <b>Pyrogram reconnect failed:</b> <code>{e}</code>",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception(f"Pyrogram health-check loop body crashed: {e}")
+            await asyncio.sleep(30)

@@ -14,14 +14,17 @@ from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 
 from src.db import (
     get_whitelist, is_whitelisted, insert_log, get_group, get_reserved_keywords,
-    is_false_positive, mark_false_positive,
+    is_false_positive, mark_false_positive, get_known_bad_actor,
 )
 from src.utils.detector import (
     check_username_similarity, check_name_similarity,
     check_homoglyph_danger, check_reserved_keywords,
 )
 from src.utils.image import compute_pfp_hash_bytes, check_pfp_similarity
-from src.config import NAME_SIMILARITY_THRESHOLD, PFP_HASH_THRESHOLD
+from src.config import (
+    NAME_SIMILARITY_THRESHOLD, USERNAME_SIMILARITY_THRESHOLD, PFP_HASH_THRESHOLD,
+    DEFAULT_BAN_SCORE, DEFAULT_ALERT_SCORE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,9 +78,31 @@ async def check_user(
     if is_false_positive(group_id, snapshot.user_id):
         return DetectionResult(flagged=False)
 
-    # Per-group similarity threshold (falls back to global config)
     group_cfg = get_group(group_id)
-    threshold = (group_cfg.get("similarity_threshold") if group_cfg else None) or NAME_SIMILARITY_THRESHOLD
+
+    # Cross-group blocklist: a user confirmed-banned in any managed group is
+    # flagged here at full confidence (score 100 → ban-band) unless this group
+    # opted out. Checked after whitelist/false-positive so trusted users win.
+    if (group_cfg is None) or group_cfg.get("use_global_blocklist", True):
+        bad = get_known_bad_actor(snapshot.user_id)
+        if bad:
+            return DetectionResult(
+                flagged=True, match_type="known_bad_actor",
+                matched_val=bad.get("reason") or "known bad actor",
+                score=100.0,
+            )
+
+    # Per-match-type thresholds. Each falls back: per-type override →
+    # legacy general similarity_threshold → global config default.
+    general_threshold = group_cfg.get("similarity_threshold") if group_cfg else None
+    username_threshold = (
+        (group_cfg.get("username_threshold") if group_cfg else None)
+        or general_threshold or USERNAME_SIMILARITY_THRESHOLD
+    )
+    name_threshold = (
+        (group_cfg.get("name_threshold") if group_cfg else None)
+        or general_threshold or NAME_SIMILARITY_THRESHOLD
+    )
 
     whitelist = get_whitelist(group_id)
     full_name = f"{snapshot.first_name} {snapshot.last_name or ''}".strip()
@@ -107,7 +132,7 @@ async def check_user(
     # 1 — Username similarity (username vs whitelist usernames only)
     if snapshot.username and usernames:
         match, matched_val, score = check_username_similarity(
-            snapshot.username, usernames, threshold
+            snapshot.username, usernames, username_threshold
         )
         if match:
             target = _find_by_username(others, matched_val)
@@ -119,7 +144,7 @@ async def check_user(
     # 2 — Homoglyph username: only flag if it also fuzzy-matches a whitelisted username
     if snapshot.username and usernames and check_homoglyph_danger(snapshot.username):
         match, matched_val, score = check_username_similarity(
-            snapshot.username, usernames, threshold
+            snapshot.username, usernames, username_threshold
         )
         if match:
             target = _find_by_username(others, matched_val)
@@ -130,7 +155,7 @@ async def check_user(
 
     # 3 — Homoglyph name: only flag if it also fuzzy-matches a whitelisted display name
     if check_homoglyph_danger(full_name):
-        match, matched_val, score = check_name_similarity(full_name, names, threshold)
+        match, matched_val, score = check_name_similarity(full_name, names, name_threshold)
         if match and not (len(full_name.split()) <= 1 or len(matched_val.split()) <= 1):
             target = _find_by_name(others, matched_val)
             return DetectionResult(
@@ -139,7 +164,7 @@ async def check_user(
             )
 
     # 4 — Display name similarity (name vs whitelist names only)
-    match, matched_val, score = check_name_similarity(full_name, names, threshold)
+    match, matched_val, score = check_name_similarity(full_name, names, name_threshold)
     is_weak = match and (len(full_name.split()) <= 1 or len(matched_val.split()) <= 1)
 
     if match and not is_weak:
@@ -175,7 +200,7 @@ async def check_user(
         group_pfp_hash = group_cfg.get("pfp_hash")
 
         if group_title:
-            g_match, g_matched, g_score = check_name_similarity(full_name, [group_title], threshold)
+            g_match, g_matched, g_score = check_name_similarity(full_name, [group_title], name_threshold)
             g_is_weak = g_match and (
                 len(full_name.split()) <= 1 or len(group_title.split()) <= 1
             )
@@ -233,22 +258,52 @@ async def ban_and_log(
     group = get_group(group_id)
     action_mode = (group.get("action_mode", "ban") if group else None) or "ban"
 
+    # ── Severity score bands ──────────────────────────────────────────────────
+    # Similarity matches carry a 0-100 confidence score. Keyword / pfp /
+    # group-identity / blocklist matches are high-confidence by construction, so
+    # they're treated as full confidence (100) and always land in the ban band.
+    #
+    #   effective >= ban_score   → execute the group's action_mode (ban/kick)
+    #   alert_score..ban_score   → downgrade to alert, even in ban/kick mode
+    #   below alert_score        → ignore (no action, no log)
+    SIMILARITY_TYPES = {"username", "name", "homoglyph_username", "homoglyph_name"}
+    effective_score = float(result.score) if result.match_type in SIMILARITY_TYPES else 100.0
+    ban_score   = (group.get("ban_score")   if group else None) or DEFAULT_BAN_SCORE
+    alert_score = (group.get("alert_score") if group else None) or DEFAULT_ALERT_SCORE
+
+    if effective_score < alert_score:
+        logger.info(
+            f"Ignoring low-confidence match ({effective_score:.0f} < {alert_score}) "
+            f"for {snapshot.user_id} in {group_id} ({result.match_type})"
+        )
+        return
+
+    # Mid band, or the group is alert-only → notify but don't remove.
+    if action_mode == "alert" or effective_score < ban_score:
+        effective_action_mode = "alert"
+    else:
+        effective_action_mode = action_mode  # ban or kick
+
     action = "failed"
-    if action_mode == "alert":
+    if effective_action_mode == "alert":
         action = "alerted"
-        logger.info(f"Alert (no ban) for {snapshot.user_id} in {group_id} via {trigger} ({result.match_type})")
+        logger.info(f"Alert (no ban) for {snapshot.user_id} in {group_id} via {trigger} ({result.match_type}, score {effective_score:.0f})")
     else:
         try:
             await ban_func(group_id, snapshot.user_id)
-            if action_mode == "kick" and unban_func:
+            if effective_action_mode == "kick" and unban_func:
                 await unban_func(group_id, snapshot.user_id)
                 action = "kicked"
             else:
                 action = "banned"
-            logger.info(f"{action.capitalize()} {snapshot.user_id} in {group_id} via {trigger} ({result.match_type})")
+            logger.info(f"{action.capitalize()} {snapshot.user_id} in {group_id} via {trigger} ({result.match_type}, score {effective_score:.0f})")
         except Exception as e:
             action = f"ban_failed: {e}"
             logger.error(f"Failed to ban {snapshot.user_id} in {group_id}: {e}")
+
+    # Detection-time snapshot: freeze the impersonator's bio + own PFP hash so
+    # the record stays accurate even after the scammer changes their profile.
+    user_pfp_hash = compute_pfp_hash_bytes(snapshot.pfp_bytes) if snapshot.pfp_bytes else None
 
     insert_log(
         group_id=group_id,
@@ -263,6 +318,8 @@ async def ban_and_log(
         details=f"Matched: {result.matched_val}",
         trigger=trigger,
         invite_link=invite_link,
+        bio=snapshot.bio,
+        user_pfp_hash=user_pfp_hash,
     )
 
     if log_channel_notify:

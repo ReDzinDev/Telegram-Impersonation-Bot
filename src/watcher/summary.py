@@ -15,101 +15,85 @@ from datetime import datetime, timedelta, timezone
 from telegram import Bot
 
 from src.db import get_all_group_ids, get_group, get_recent_activity
+from src.utils.notify import send_log_message
 
 logger = logging.getLogger(__name__)
 
 
 async def run_daily_summary(bot: Bot, log_channel_id: int):
+    """
+    Background task: posts a 24h activity digest at midnight UTC.
+
+    The whole loop body is wrapped in try/except so a transient DB error
+    or send failure doesn't permanently kill the task. A failure logs +
+    waits a minute + restarts the next-midnight calculation.
+    """
     first_run = True
     while True:
-        now = datetime.now(timezone.utc)
-        tomorrow_midnight = (now + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        wait_seconds = (tomorrow_midnight - now).total_seconds()
-
-        # Startup grace: if we'd fire within an hour of booting, skip the
-        # imminent midnight and wait for the next one. Otherwise a deploy
-        # at 23:55 UTC posts a near-empty digest 5 minutes later.
-        if first_run and wait_seconds < 3600:
-            logger.info(
-                f"Skipping next midnight digest (only {wait_seconds/60:.0f} min away); "
-                "will post tomorrow instead."
-            )
-            wait_seconds += 24 * 3600
-        first_run = False
-
-        await asyncio.sleep(wait_seconds)
-
-        group_ids = get_all_group_ids()
-        if not group_ids:
-            continue
-
-        # Build per-group rows AND aggregate totals so the digest is useful at a glance.
-        # Every number on the digest comes from get_recent_activity(hours=24),
-        # so it's strictly last-24h — never cumulative.
-        per_group_lines = []
-        totals = {"detections": 0, "banned": 0, "kicked": 0, "alerted": 0, "sweeps": 0}
-
-        for gid in group_ids:
-            act = get_recent_activity(gid, hours=24)
-            if not act:
-                continue
-            for k in totals:
-                totals[k] += act.get(k, 0) or 0
-            # Skip groups with zero activity to keep the digest tight
-            if not any(act.get(k) for k in totals):
-                continue
-
-            group = get_group(gid)
-            title = (group and group.get("title")) or str(gid)
-            per_group_lines.append(
-                f"• <b>{title}</b> — "
-                f"🚨 {act.get('detections', 0)} · "
-                f"🚫 {act.get('banned', 0)} · "
-                f"👢 {act.get('kicked', 0)} · "
-                f"🔕 {act.get('alerted', 0)} · "
-                f"🧹 {act.get('sweeps', 0)}"
-            )
-
-        # If the whole window is empty, post a one-line "quiet day" message
-        # instead of a zero-filled table — avoids confusion with cumulative figures.
-        any_activity = any(totals[k] for k in totals)
-        if not any_activity:
-            try:
-                await bot.send_message(
-                    chat_id=log_channel_id,
-                    text=(
-                        f"📋 <b>Daily Summary — last 24h</b> "
-                        f"({now.strftime('%Y-%m-%d UTC')})\n\n"
-                        "<i>No activity across any group in the last 24h.</i>"
-                    ),
-                    parse_mode="HTML",
-                )
-            except Exception as e:
-                logger.error(f"Failed to send daily summary: {e}")
-            continue
-
-        header = (
-            f"📋 <b>Daily Summary — last 24h</b> "
-            f"({now.strftime('%Y-%m-%d UTC')})\n"
-            f"<i>All numbers below are for the last 24 hours only — "
-            f"use /stats for cumulative + windowed totals.</i>\n\n"
-            f"<b>Across all groups (24h):</b> "
-            f"🚨 {totals['detections']} detections · "
-            f"🚫 {totals['banned']} bans · "
-            f"👢 {totals['kicked']} kicks · "
-            f"🔕 {totals['alerted']} alerts · "
-            f"🧹 {totals['sweeps']} sweeps\n"
-        )
-
-        body = "\n<b>By group (24h):</b>\n" + "\n".join(per_group_lines)
-
         try:
-            await bot.send_message(
-                chat_id=log_channel_id,
-                text=header + body,
-                parse_mode="HTML",
+            now = datetime.now(timezone.utc)
+            tomorrow_midnight = (now + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
             )
+            wait_seconds = (tomorrow_midnight - now).total_seconds()
+
+            # Startup grace: if we'd fire within an hour of booting, skip the
+            # imminent midnight and wait for the next one. Otherwise a deploy
+            # at 23:55 UTC posts a near-empty digest 5 minutes later.
+            if first_run and wait_seconds < 3600:
+                logger.info(
+                    f"Skipping next midnight digest (only {wait_seconds/60:.0f} min away); "
+                    "will post tomorrow instead."
+                )
+                wait_seconds += 24 * 3600
+            first_run = False
+
+            await asyncio.sleep(wait_seconds)
+
+            group_ids = get_all_group_ids()
+            if not group_ids:
+                continue
+
+            date_str = now.strftime("%Y-%m-%d UTC")
+            _KEYS = ("detections", "banned", "kicked", "alerted", "sweeps")
+
+            for gid in group_ids:
+                act = get_recent_activity(gid, hours=24)
+                if not act:
+                    continue
+
+                # Skip groups with zero activity — no point posting a blank digest.
+                if not any(act.get(k) for k in _KEYS):
+                    continue
+
+                group = get_group(gid)
+                title = (group and group.get("title")) or str(gid)
+
+                # Route to this group's own log channel; fall back to the global one.
+                channel = (group and group.get("log_channel_id")) or log_channel_id
+                if not channel:
+                    logger.debug(f"No log channel for group {gid} — skipping daily summary.")
+                    continue
+
+                text = (
+                    f"📋 <b>Daily Summary — {title}</b> ({date_str})\n"
+                    f"<i>Last 24 hours only — use /stats for cumulative totals.</i>\n\n"
+                    f"🚨 Detections: <code>{act.get('detections', 0)}</code>\n"
+                    f"🚫 Banned: <code>{act.get('banned', 0)}</code>\n"
+                    f"👢 Kicked: <code>{act.get('kicked', 0)}</code>\n"
+                    f"🔕 Alerted: <code>{act.get('alerted', 0)}</code>\n"
+                    f"🧹 Sweeps: <code>{act.get('sweeps', 0)}</code>"
+                )
+
+                try:
+                    await send_log_message(bot, channel, text)
+                except Exception as e:
+                    logger.error(f"Failed to send daily summary for group {gid}: {e}")
+
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.error(f"Failed to send daily summary: {e}")
+            # Catch-all so a transient bug doesn't permanently kill the daily digest.
+            # Brief sleep prevents tight-looping if something is persistently broken.
+            logger.exception(f"Daily summary loop body crashed: {e}")
+            await asyncio.sleep(60)

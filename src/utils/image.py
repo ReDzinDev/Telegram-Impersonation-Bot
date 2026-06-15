@@ -9,13 +9,33 @@ logger = logging.getLogger(__name__)
 
 
 def compute_pfp_hash_bytes(image_data: bytes) -> Optional[str]:
+    """
+    Perceptual-hash a profile photo. Returns a hex phash string, or None if
+    the bytes can't be hashed.
+
+    Robust to animated / Premium video avatars: Telegram usually hands us a
+    static JPEG preview, but for multi-frame formats (animated GIF/WEBP/APNG)
+    we hash the FIRST frame so the result is deterministic. Frames are
+    converted to RGB first — phash on palette ('P') or alpha ('RGBA') images
+    can vary by decoder. A genuinely un-openable blob (true video container)
+    returns None and is logged at debug, not error, so video-avatar users
+    don't spam the logs.
+    """
     if not image_data:
         return None
     try:
         img = Image.open(BytesIO(image_data))
+        # Multi-frame image → pin to the first frame for a stable hash
+        if getattr(img, "n_frames", 1) > 1:
+            try:
+                img.seek(0)
+            except Exception:
+                pass
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
         return str(imagehash.phash(img))
     except Exception as e:
-        logger.error(f"Error computing PFP hash: {e}")
+        logger.debug(f"Could not compute PFP hash (likely an animated/video avatar): {e}")
         return None
 
 

@@ -5,9 +5,10 @@ from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ChatMemberStatus, ChatType
 
-from src.db import upsert_group, is_whitelisted, get_group, upsert_whitelisted_user, mark_seen
+from src.db import upsert_group, is_whitelisted, get_group, get_reserved_keywords, upsert_whitelisted_user, mark_seen
 from src.utils.checker import UserSnapshot, check_user, ban_and_log
 from src.utils.image import compute_pfp_hash_bytes
+from src.watcher.events import _fetch_bio
 from src.config import LOG_CHANNEL_ID
 
 logger = logging.getLogger(__name__)
@@ -133,12 +134,23 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logger.warning(f"Could not fetch PFP for {user.id}: {e}")
 
+    # Fetch bio via Pyrogram when the group has reserved keywords — the Bot API
+    # cannot read bios, so a keyword hiding there would be missed without this.
+    bio: str | None = None
+    pyro = context.bot_data.get("pyro_client")
+    if pyro and get_reserved_keywords(group_id):
+        try:
+            bio = await _fetch_bio(pyro, user.id)
+        except Exception:
+            bio = None
+
     snapshot = UserSnapshot(
         user_id=user.id,
         username=user.username,
         first_name=user.first_name,
         last_name=user.last_name,
         pfp_bytes=pfp_bytes,
+        bio=bio,
     )
 
     detection = await check_user(snapshot, group_id)

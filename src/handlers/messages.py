@@ -106,9 +106,13 @@ async def scan_message_sender(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     log_notify = None
     if log_channel:
+        from src.utils.notify import send_log_message
         async def log_notify(text: str, markup=None, _lc=log_channel):
-            await context.bot.send_message(
-                chat_id=_lc, text=text, parse_mode="HTML", reply_markup=markup
+            # raise_on_error=True so ban_and_log's existing handler still
+            # logs the detection-level failure, while notify still tracks
+            # consecutive failures for the unreachability alert.
+            await send_log_message(
+                context.bot, _lc, text, reply_markup=markup, raise_on_error=True,
             )
 
     await ban_and_log(

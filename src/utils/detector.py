@@ -4,6 +4,22 @@ from rapidfuzz import fuzz, process
 from typing import List, Tuple, Optional
 from confusable_homoglyphs import confusables
 
+# Leetspeak / lookalike character folding for username comparison.
+# Scammers swap visually-similar characters (j0hn vs john, mike_admin vs
+# mikeadmin) to dodge exact and even fuzzy matching. We score BOTH the raw
+# lowercase form and a folded form, then keep the higher score — so an
+# obfuscated handle scores as high as the clean one it imitates.
+_LEET_MAP = str.maketrans({
+    "0": "o", "1": "l", "3": "e", "4": "a", "5": "s",
+    "7": "t", "8": "b", "9": "g", "@": "a", "$": "s",
+})
+
+
+def _normalize_handle(s: str) -> str:
+    """Lowercase, drop separators (_ . - space), and fold leetspeak."""
+    s = s.lower().translate(_LEET_MAP)
+    return re.sub(r"[\s._\-]+", "", s)
+
 
 def check_username_similarity(
     target: str, stored: List[str], threshold: int
@@ -11,15 +27,29 @@ def check_username_similarity(
     if not target or not stored:
         return False, None, 0
 
-    # Normalize: Telegram usernames are case-insensitive
+    # Telegram usernames are case-insensitive
     target_lower = target.lower()
     stored_lower = [u.lower() for u in stored]
 
-    result = process.extractOne(target_lower, stored_lower, scorer=fuzz.ratio)
-    if result and result[1] >= threshold:
-        # Return the original stored value (not lowercased)
-        original = stored[stored_lower.index(result[0])]
-        return True, original, int(result[1])
+    # Pass 1 — raw lowercase fuzzy match
+    best_val: Optional[str] = None
+    best_score = 0
+    raw = process.extractOne(target_lower, stored_lower, scorer=fuzz.ratio)
+    if raw:
+        best_val = stored[stored_lower.index(raw[0])]
+        best_score = int(raw[1])
+
+    # Pass 2 — separator-stripped + leetspeak-folded fuzzy match. Catches
+    # j0hn_smith vs johnsmith that the raw pass scores too low.
+    target_norm = _normalize_handle(target)
+    stored_norm = [_normalize_handle(u) for u in stored]
+    norm = process.extractOne(target_norm, stored_norm, scorer=fuzz.ratio)
+    if norm and int(norm[1]) > best_score:
+        best_score = int(norm[1])
+        best_val = stored[stored_norm.index(norm[0])]
+
+    if best_val is not None and best_score >= threshold:
+        return True, best_val, best_score
     return False, None, 0
 
 

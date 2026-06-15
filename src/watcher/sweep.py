@@ -22,6 +22,7 @@ from pyrogram.enums import ChatMemberStatus as PyroChatMemberStatus
 from pyrogram.errors import FloodWait, ChatAdminRequired, UserNotParticipant
 from telegram import Bot
 
+from src.config import SWEEP_INTERVAL_HOURS, SWEEP_HARD_CAP_SECONDS
 from src.db import (
     get_all_group_ids, get_group, get_reserved_keywords, get_whitelist,
     is_whitelisted, mark_seen, record_sweep_run, upsert_whitelisted_user,
@@ -30,8 +31,6 @@ from src.utils.checker import UserSnapshot, check_user, ban_and_log
 from src.utils.image import compute_pfp_hash_bytes
 
 logger = logging.getLogger(__name__)
-
-SWEEP_INTERVAL_HOURS = 6
 
 
 _sweep_locks: dict[int, asyncio.Lock] = {}
@@ -79,7 +78,7 @@ async def sweep_group(
             logger.error(f"Cannot resolve group {group_id} for sweep: {e}")
             return {"iterated": 0, "checked": 0, "flagged": 0, "errors": 1}
 
-        sweep_deadline = time.monotonic() + 7200  # 2-hour hard cap per group
+        sweep_deadline = time.monotonic() + SWEEP_HARD_CAP_SECONDS  # hard cap per group
 
         # Bios are expensive (one MTProto GetFullUser call each) and irrelevant
         # for groups with no reserved keywords — bio is only consulted by the
@@ -180,8 +179,11 @@ async def sweep_group(
 
                     log_notify = None
                     if log_channel_id:
+                        from src.utils.notify import send_log_message
                         async def log_notify(text: str, markup=None, _lcid=log_channel_id):
-                            await bot.send_message(chat_id=_lcid, text=text, parse_mode="HTML", reply_markup=markup)
+                            await send_log_message(
+                                bot, _lcid, text, reply_markup=markup, raise_on_error=True,
+                            )
 
                     async def _unban(gid: int, uid: int):
                         await bot.unban_chat_member(chat_id=gid, user_id=uid)
@@ -273,21 +275,39 @@ async def run_periodic_sweeps(pyro: Client, bot: Bot, log_channel_id: Optional[s
 
     After each sweep we post a short per-group summary to that group's
     configured log channel (falling back to the global LOG_CHANNEL_ID).
+
+    The entire loop body is wrapped in try/except so a transient failure
+    (DB down, network blip) just logs and waits for the next cycle —
+    never kills the task. Per-group failures inside sweep_group already
+    have their own handlers; this catches anything that escapes.
     """
     while True:
-        await asyncio.sleep(SWEEP_INTERVAL_HOURS * 3600)
-        all_ids = get_all_group_ids()
-        # Only sweep groups that have at least one whitelisted user — others
-        # have nothing to check against
-        group_ids = [gid for gid in all_ids if get_whitelist(gid)]
-        logger.info(
-            f"Starting scheduled sweep of {len(group_ids)}/{len(all_ids)} "
-            "group(s) (skipping unconfigured)."
-        )
-        for gid in group_ids:
-            result = await sweep_group(pyro, bot, gid, log_channel_id, trigger="auto")
-            logger.info(f"Scheduled sweep complete for {gid}: {result}")
-            await _post_sweep_summary(bot, gid, result, log_channel_id)
+        try:
+            await asyncio.sleep(SWEEP_INTERVAL_HOURS * 3600)
+            all_ids = get_all_group_ids()
+            # Only sweep groups that have at least one whitelisted user — others
+            # have nothing to check against
+            group_ids = [gid for gid in all_ids if get_whitelist(gid)]
+            logger.info(
+                f"Starting scheduled sweep of {len(group_ids)}/{len(all_ids)} "
+                "group(s) (skipping unconfigured)."
+            )
+            for gid in group_ids:
+                try:
+                    result = await sweep_group(pyro, bot, gid, log_channel_id, trigger="auto")
+                    logger.info(f"Scheduled sweep complete for {gid}: {result}")
+                    await _post_sweep_summary(bot, gid, result, log_channel_id)
+                except Exception as e:
+                    # Per-group failure: log and keep going for other groups
+                    logger.exception(f"Periodic sweep failed for group {gid}: {e}")
+        except asyncio.CancelledError:
+            # Propagate cancellation so the task can exit cleanly on shutdown
+            raise
+        except Exception as e:
+            # Outer-loop failure: log and let the while True re-enter after
+            # a short delay so we don't tight-loop on a persistent error
+            logger.exception(f"Periodic sweep loop body crashed: {e}")
+            await asyncio.sleep(60)
 
 
 async def _post_sweep_summary(
@@ -312,10 +332,8 @@ async def _post_sweep_summary(
         f"Flagged: <code>{result.get('flagged', 0)}</code>\n"
         f"Errors: <code>{result.get('errors', 0)}</code>"
     )
-    try:
-        await bot.send_message(chat_id=channel, text=text, parse_mode="HTML")
-    except Exception as e:
-        logger.warning(f"Failed to post auto-sweep summary for {group_id}: {e}")
+    from src.utils.notify import send_log_message
+    await send_log_message(bot, channel, text)
 
 
 async def _fetch_pfp(pyro: Client, user_id: int) -> Optional[bytes]:

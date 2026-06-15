@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 from pyrogram import Client, raw
 from telegram import Bot
 
+from src.config import NAME_CHANGE_VELOCITY_THRESHOLD, NAME_CHANGE_WINDOW_MINUTES
 from src.db import (
     get_all_group_ids, get_group, get_groups_for_user, unmark_seen,
     log_name_change, count_recent_name_changes,
@@ -73,12 +74,11 @@ async def _handle_name_change(
 
     # Track name-change velocity — rapid renames are a common evasion tactic
     log_name_change(user_id)
-    change_count = count_recent_name_changes(user_id, window_minutes=60)
-    NAME_CHANGE_VELOCITY_THRESHOLD = 3
+    change_count = count_recent_name_changes(user_id, window_minutes=NAME_CHANGE_WINDOW_MINUTES)
     if change_count >= NAME_CHANGE_VELOCITY_THRESHOLD:
         logger.warning(
             f"Name-change velocity alert for {user_id}: "
-            f"{change_count} changes in the last 60 min"
+            f"{change_count} changes in the last {NAME_CHANGE_WINDOW_MINUTES} min"
         )
         if log_channel_id:
             # Render the user as a clickable profile link with their current
@@ -98,20 +98,16 @@ async def _handle_name_change(
                 return _html.escape(title)
             groups_label = ", ".join(_group_label(g) for g in group_ids)
 
-            try:
-                await bot.send_message(
-                    chat_id=log_channel_id,
-                    text=(
-                        f"⚠️ <b>Name-change velocity alert</b>\n\n"
-                        f"<b>User:</b> {user_link} | ID: <code>{user_id}</code>\n"
-                        f"Changed their name <b>{change_count} times</b> in the last 60 minutes.\n"
-                        f"<b>Groups:</b> {groups_label}"
-                    ),
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
-            except Exception as e:
-                logger.error(f"Failed to send velocity alert: {e}")
+            from src.utils.notify import send_log_message
+            await send_log_message(
+                bot, log_channel_id,
+                (
+                    f"⚠️ <b>Name-change velocity alert</b>\n\n"
+                    f"<b>User:</b> {user_link} | ID: <code>{user_id}</code>\n"
+                    f"Changed their name <b>{change_count} times</b> in the last {NAME_CHANGE_WINDOW_MINUTES} minutes.\n"
+                    f"<b>Groups:</b> {groups_label}"
+                ),
+            )
 
     # Fetch current PFP for a full check
     pfp_bytes = await _fetch_pfp(pyro, user_id)
@@ -196,8 +192,11 @@ async def _check_and_act(
 
         log_notify = None
         if log_channel_id:
+            from src.utils.notify import send_log_message
             async def log_notify(text: str, markup=None, _lcid=log_channel_id):
-                await bot.send_message(chat_id=_lcid, text=text, parse_mode="HTML", reply_markup=markup)
+                await send_log_message(
+                    bot, _lcid, text, reply_markup=markup, raise_on_error=True,
+                )
 
         async def _unban(gid: int, uid: int):
             await bot.unban_chat_member(chat_id=gid, user_id=uid)
