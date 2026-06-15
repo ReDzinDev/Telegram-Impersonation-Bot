@@ -10,7 +10,7 @@ from confusable_homoglyphs import confusables
 # lowercase form and a folded form, then keep the higher score — so an
 # obfuscated handle scores as high as the clean one it imitates.
 _LEET_MAP = str.maketrans({
-    "0": "o", "1": "l", "3": "e", "4": "a", "5": "s",
+    "0": "o", "1": "i", "3": "e", "4": "a", "5": "s",
     "7": "t", "8": "b", "9": "g", "@": "a", "$": "s",
 })
 
