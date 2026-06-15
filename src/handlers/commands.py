@@ -540,16 +540,9 @@ async def whitelist_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _fetch_pfp_pyro(pyro, user_id: int) -> str | None:
-    """Download and hash a user's PFP via the Pyrogram userbot."""
-    from io import BytesIO
-    try:
-        photo = await pyro.get_chat_photos(user_id, limit=1).__anext__()
-        buf = BytesIO()
-        async for chunk in pyro.stream_media(photo):
-            buf.write(chunk)
-        return compute_pfp_hash_bytes(buf.getvalue())
-    except Exception:
-        return None
+    """Download and hash a user's PFP via the Pyrogram userbot (shared helper)."""
+    from src.watcher.fetch import fetch_pfp_hash
+    return await fetch_pfp_hash(pyro, user_id)
 
 
 # ── /unwhitelist ───────────────────────────────────────────────────────────────

@@ -84,7 +84,7 @@ async def sweep_group(
         # for groups with no reserved keywords — bio is only consulted by the
         # keyword detection stage. Resolve once and skip the call otherwise.
         has_keywords = bool(get_reserved_keywords(group_id))
-        from src.watcher.events import _fetch_bio   # local import — avoids module cycle
+        from src.watcher.fetch import fetch_bio as _fetch_bio
 
         # Notify immediately so the admin knows the loop has started
         if progress_cb:
@@ -174,27 +174,16 @@ async def sweep_group(
                 if result.flagged:
                     flagged += 1
 
-                    async def _ban(gid: int, uid: int):
-                        await bot.ban_chat_member(chat_id=gid, user_id=uid)
-
-                    log_notify = None
-                    if log_channel_id:
-                        from src.utils.notify import send_log_message
-                        async def log_notify(text: str, markup=None, _lcid=log_channel_id):
-                            await send_log_message(
-                                bot, _lcid, text, reply_markup=markup, raise_on_error=True,
-                            )
-
-                    async def _unban(gid: int, uid: int):
-                        await bot.unban_chat_member(chat_id=gid, user_id=uid)
+                    from src.utils.checker import make_action_funcs
+                    ban_func, unban_func, log_notify = make_action_funcs(bot, log_channel_id)
 
                     await ban_and_log(
                         result=result,
                         snapshot=snapshot,
                         group_id=group_id,
                         trigger="sweep",
-                        ban_func=_ban,
-                        unban_func=_unban,
+                        ban_func=ban_func,
+                        unban_func=unban_func,
                         log_channel_notify=log_notify,
                     )
                 else:
@@ -336,20 +325,6 @@ async def _post_sweep_summary(
     await send_log_message(bot, channel, text)
 
 
-async def _fetch_pfp(pyro: Client, user_id: int) -> Optional[bytes]:
-    try:
-        photos = pyro.get_chat_photos(user_id, limit=1)
-        photo = await photos.__anext__()
-        buf = BytesIO()
-        async for chunk in pyro.stream_media(photo):
-            buf.write(chunk)
-        return buf.getvalue() or None
-    except StopAsyncIteration:
-        return None
-    except FloodWait as e:
-        # DC-level rate limit on media downloads — skip this PFP rather than
-        # blocking the entire sweep for potentially 20+ minutes.
-        logger.warning(f"PFP flood wait {e.value}s for user {user_id} — skipping photo check.")
-        return None
-    except Exception:
-        return None
+# PFP / bio fetch helpers live in src.watcher.fetch (shared, deduplicated).
+# Aliased to the historical private names used throughout this module.
+from src.watcher.fetch import fetch_pfp_bytes as _fetch_pfp  # noqa: E402

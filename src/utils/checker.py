@@ -432,6 +432,31 @@ async def ban_and_log(
             logger.error(f"Failed to send log channel notification: {e}")
 
 
+def make_action_funcs(bot, log_channel_id):
+    """
+    Build the (ban_func, unban_func, log_notify) trio that ban_and_log needs,
+    for a PTB bot. Centralizes the identical closures that used to be copy-pasted
+    into the message scan, join handler, sweep, and profile-change watcher.
+
+    log_notify routes through src.utils.notify.send_log_message (per-channel
+    failure tracking) and is None when no log channel is configured.
+    """
+    async def ban_func(gid: int, uid: int):
+        await bot.ban_chat_member(chat_id=gid, user_id=uid)
+
+    async def unban_func(gid: int, uid: int):
+        await bot.unban_chat_member(chat_id=gid, user_id=uid)
+
+    log_notify = None
+    if log_channel_id:
+        from src.utils.notify import send_log_message
+
+        async def log_notify(text: str, markup=None, _lc=log_channel_id):
+            await send_log_message(bot, _lc, text, reply_markup=markup, raise_on_error=True)
+
+    return ban_func, unban_func, log_notify
+
+
 # ── Private helpers ────────────────────────────────────────────────────────────
 
 def _target_fields(row: Optional[dict]) -> dict:

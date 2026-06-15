@@ -187,51 +187,20 @@ async def _check_and_act(
         if not result.flagged:
             continue
 
-        async def _ban(gid: int, uid: int):
-            await bot.ban_chat_member(chat_id=gid, user_id=uid)
-
-        log_notify = None
-        if log_channel_id:
-            from src.utils.notify import send_log_message
-            async def log_notify(text: str, markup=None, _lcid=log_channel_id):
-                await send_log_message(
-                    bot, _lcid, text, reply_markup=markup, raise_on_error=True,
-                )
-
-        async def _unban(gid: int, uid: int):
-            await bot.unban_chat_member(chat_id=gid, user_id=uid)
+        from src.utils.checker import make_action_funcs
+        ban_func, unban_func, log_notify = make_action_funcs(bot, log_channel_id)
 
         await ban_and_log(
             result=result,
             snapshot=snapshot,
             group_id=group_id,
             trigger=trigger,
-            ban_func=_ban,
-            unban_func=_unban,
+            ban_func=ban_func,
+            unban_func=unban_func,
             log_channel_notify=log_notify,
         )
 
 
-async def _fetch_pfp(pyro: Client, user_id: int) -> bytes | None:
-    try:
-        buf = BytesIO()
-        async for chunk in pyro.stream_media(
-            await pyro.get_chat_photos(user_id, limit=1).__anext__()
-        ):
-            buf.write(chunk)
-        return buf.getvalue() or None
-    except StopAsyncIteration:
-        return None
-    except Exception as e:
-        logger.debug(f"Could not fetch PFP for {user_id}: {e}")
-        return None
-
-
-async def _fetch_bio(pyro: Client, user_id: int) -> str | None:
-    """Fetch user bio via MTProto GetFullUser (Pyrogram user client only)."""
-    try:
-        peer = await pyro.resolve_peer(user_id)
-        full = await pyro.invoke(raw.functions.users.GetFullUser(id=peer))
-        return full.full_user.about or None
-    except Exception:
-        return None
+# PFP / bio fetch helpers are shared in src.watcher.fetch (deduplicated).
+from src.watcher.fetch import fetch_pfp_bytes as _fetch_pfp  # noqa: E402
+from src.watcher.fetch import fetch_bio as _fetch_bio        # noqa: E402

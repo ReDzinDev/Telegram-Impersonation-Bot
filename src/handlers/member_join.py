@@ -8,7 +8,7 @@ from telegram.constants import ChatMemberStatus, ChatType
 from src.db import upsert_group, is_whitelisted, get_group, get_reserved_keywords, upsert_whitelisted_user, mark_seen
 from src.utils.checker import UserSnapshot, check_user, ban_and_log
 from src.utils.image import compute_pfp_hash_bytes
-from src.watcher.events import _fetch_bio
+from src.watcher.fetch import fetch_bio as _fetch_bio
 from src.config import LOG_CHANNEL_ID
 
 logger = logging.getLogger(__name__)
@@ -182,24 +182,16 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
     group = get_group(group_id)
     log_channel = (group["log_channel_id"] if group else None) or context.bot_data.get("log_channel_id") or LOG_CHANNEL_ID
 
-    async def _ban(gid: int, uid: int):
-        await context.bot.ban_chat_member(chat_id=gid, user_id=uid)
-
-    log_notify = None
-    if log_channel:
-        async def log_notify(text: str, markup=None, _lc=log_channel):
-            await context.bot.send_message(chat_id=_lc, text=text, parse_mode="HTML", reply_markup=markup)
-
-    async def _unban(gid: int, uid: int):
-        await context.bot.unban_chat_member(chat_id=gid, user_id=uid)
+    from src.utils.checker import make_action_funcs
+    ban_func, unban_func, log_notify = make_action_funcs(context.bot, log_channel)
 
     await ban_and_log(
         result=detection,
         snapshot=snapshot,
         group_id=group_id,
         trigger="join",
-        ban_func=_ban,
-        unban_func=_unban,
+        ban_func=ban_func,
+        unban_func=unban_func,
         log_channel_notify=log_notify,
         invite_link=invite_link,
     )

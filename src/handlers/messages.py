@@ -98,29 +98,15 @@ async def scan_message_sender(update: Update, context: ContextTypes.DEFAULT_TYPE
         or LOG_CHANNEL_ID
     )
 
-    async def _ban(gid: int, uid: int):
-        await context.bot.ban_chat_member(chat_id=gid, user_id=uid)
-
-    async def _unban(gid: int, uid: int):
-        await context.bot.unban_chat_member(chat_id=gid, user_id=uid)
-
-    log_notify = None
-    if log_channel:
-        from src.utils.notify import send_log_message
-        async def log_notify(text: str, markup=None, _lc=log_channel):
-            # raise_on_error=True so ban_and_log's existing handler still
-            # logs the detection-level failure, while notify still tracks
-            # consecutive failures for the unreachability alert.
-            await send_log_message(
-                context.bot, _lc, text, reply_markup=markup, raise_on_error=True,
-            )
+    from src.utils.checker import make_action_funcs
+    ban_func, unban_func, log_notify = make_action_funcs(context.bot, log_channel)
 
     await ban_and_log(
         result=detection,
         snapshot=snapshot,
         group_id=group_id,
         trigger="message",
-        ban_func=_ban,
-        unban_func=_unban,
+        ban_func=ban_func,
+        unban_func=unban_func,
         log_channel_notify=log_notify,
     )
