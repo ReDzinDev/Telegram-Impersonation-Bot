@@ -39,7 +39,12 @@ def _get_pool() -> ConnectionPool:
             max_size=DB_POOL_MAX_SIZE,
             max_idle=300,
             timeout=30,
-            kwargs={"row_factory": dict_row, "connect_timeout": 30},
+            # autocommit=True so read helpers (a bare SELECT) don't leave the
+            # connection in an open transaction when returned to the pool —
+            # otherwise psycopg_pool logs "rolling back returned connection".
+            # Every write helper does a single statement + an explicit commit()
+            # which is a harmless no-op under autocommit, so nothing is lost.
+            kwargs={"row_factory": dict_row, "connect_timeout": 30, "autocommit": True},
             check=ConnectionPool.check_connection,
             open=True,
         )
