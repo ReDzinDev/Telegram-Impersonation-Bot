@@ -376,8 +376,7 @@ async def _import_admins_logic(
     current_admin_ids: set[int] = set()
     for admin in admins:
         user = admin.user
-        # Skip the Anti-Impersonator Bot itself, but keep other admin bots
-        # (Rose, Combot, etc.) so their names/usernames are also protected.
+        # Skip the Anti-Impersonator Bot itself.
         if user.id == context.bot.id:
             continue
         pfp_hash = await _fetch_pfp(user) if not user.is_bot else None
@@ -397,6 +396,46 @@ async def _import_admins_logic(
         count += 1
         if user.is_bot:
             bot_count += 1
+
+    # The Bot API's getChatAdministrators deliberately omits *other bots*, so
+    # admin bots (Rose, Combot, …) never appear in the loop above. Backfill
+    # them via MTProto, which does return bot admins. Requires the Pyrogram
+    # userbot to be a member of the group (same assumption as /sweep).
+    pyro = context.bot_data.get("pyro_client")
+    if pyro:
+        try:
+            from pyrogram.enums import ChatMembersFilter
+            async for m in pyro.get_chat_members(
+                chat_id, filter=ChatMembersFilter.ADMINISTRATORS
+            ):
+                u = m.user
+                if not u or not u.is_bot:
+                    continue
+                if u.id == context.bot.id or u.id in current_admin_ids:
+                    continue
+                username = (
+                    u.usernames[0].username if getattr(u, "usernames", None)
+                    else getattr(u, "username", None)
+                )
+                upsert_whitelisted_user(
+                    group_id=chat_id,
+                    user_id=u.id,
+                    username=username,
+                    first_name=u.first_name or "",
+                    last_name=u.last_name or "",
+                    pfp_hash=None,
+                    whitelisted_by=requester_id,
+                    user_type="admin",
+                    is_bot=True,
+                )
+                mark_seen(chat_id, u.id)
+                current_admin_ids.add(u.id)
+                count += 1
+                bot_count += 1
+        except Exception as e:
+            logger.warning(
+                f"Could not enumerate admin bots via MTProto for {chat_id}: {e}"
+            )
 
     # Refresh mode: remove admin-typed rows for users no longer in the
     # admin list. Manual entries are untouched — only `user_type='admin'`
