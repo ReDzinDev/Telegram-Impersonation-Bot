@@ -104,6 +104,43 @@ def test_name_similarity_unrelated():
     assert match is False
 
 
+# ── name normalization: evasions that must now be caught ──────────────────────
+
+@pytest.mark.parametrize("evasion", [
+    "JOHN SMITH",              # all-caps
+    "Ｊｏｈｎ　Ｓｍｉｔｈ",           # fullwidth unicode
+    "Јоhn Ѕмітh",              # whole-script Cyrillic confusables
+    "John​Smith",         # zero-width space injected
+    "John Smith | Support",    # suffix-append dilution
+])
+def test_name_similarity_catches_unicode_evasions(evasion):
+    match, val, score = check_name_similarity(evasion, ["John Smith"], threshold=85)
+    assert match is True, f"{evasion!r} should match after normalization"
+    assert val == "John Smith"
+    assert score >= 85
+
+
+def test_name_normalization_does_not_match_different_person():
+    # Normalization must not turn an unrelated name into a match
+    match, _, _ = check_name_similarity("Michael Brown", ["John Smith"], threshold=85)
+    assert match is False
+
+
+def test_keyword_matching_folds_confusables_and_fullwidth():
+    kws = [{"pattern": "admin", "is_regex": False}]
+    assert check_reserved_keywords("аdmin", None, None, kws) == "admin"       # Cyrillic а
+    assert check_reserved_keywords("ａｄｍｉｎ", None, None, kws) == "admin"      # fullwidth
+    assert check_reserved_keywords("moderator", None, None, kws) is None       # clean negative
+
+
+def test_fold_text_strips_and_normalizes():
+    from src.utils.detector import fold_text
+    assert fold_text("ＡＢＣ") == "abc"
+    assert fold_text("A​B‌C") == "abc"
+    assert fold_text("  Hello   World  ") == "hello world"
+    assert fold_text("") == ""
+
+
 # ── homoglyph detection ───────────────────────────────────────────────────────
 
 def test_homoglyph_flags_cyrillic_lookalike():
