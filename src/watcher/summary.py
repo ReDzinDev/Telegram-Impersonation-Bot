@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 from telegram import Bot
 
-from src.db import get_all_group_ids, get_group, get_recent_activity
+from src.db import get_all_group_ids, get_group, get_recent_activity, purge_old_records
 from src.utils.notify import send_log_message
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,13 @@ async def run_daily_summary(bot: Bot, log_channel_id: int):
             first_run = False
 
             await asyncio.sleep(wait_seconds)
+
+            # Nightly retention purge — piggybacks on the once-a-day cadence so
+            # bounded-window tables don't grow forever on small Railway disks.
+            try:
+                purge_old_records()
+            except Exception as e:
+                logger.error(f"Retention purge failed: {e}")
 
             group_ids = get_all_group_ids()
             if not group_ids:

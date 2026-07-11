@@ -4,14 +4,12 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies for PostgreSQL and image processing
-RUN apt-get update && apt-get install -y \
-    gcc \
-    postgresql-client \
-    libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
+# No system build deps needed: psycopg[binary] ships prebuilt libpq, and
+# pillow / imagehash / tgcrypto all have manylinux wheels for 3.11-slim.
+# (Previously installed gcc/libpq-dev/postgresql-client — ~150-200 MB of
+# dead weight.)
 
-# Copy requirements first for better caching
+# Copy requirements first for better layer caching
 COPY requirements.txt .
 
 # Install Python dependencies
@@ -19,6 +17,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
+
+# Run as a non-root user — the bot holds a Pyrogram user-session credential,
+# so we don't want it running with root inside the container.
+RUN useradd --create-home --uid 10001 appuser && chown -R appuser /app
+USER appuser
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

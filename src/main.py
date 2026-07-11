@@ -28,14 +28,20 @@ from src.handlers.commands import (
 from src.handlers.member_join import check_impersonation, on_bot_added_to_group
 from src.handlers.messages import scan_message_sender
 
+# force=True makes this authoritative even though src.config also calls
+# basicConfig at import time (whichever ran first would otherwise win and the
+# two disagreed on level). Root at INFO so operators can see detection/sweep
+# activity in Railway logs; third-party libs are quieted to WARNING.
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.WARNING,
+    level=logging.INFO,
+    force=True,
 )
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext.Updater").setLevel(logging.WARNING)
 
 
 async def _db_keepalive(interval: int = 270) -> None:

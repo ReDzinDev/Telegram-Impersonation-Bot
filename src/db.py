@@ -209,6 +209,10 @@ def init_db():
             cur.execute("ALTER TABLE logs ADD COLUMN IF NOT EXISTS bio          TEXT;")
             cur.execute("ALTER TABLE logs ADD COLUMN IF NOT EXISTS user_pfp_hash TEXT;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_group ON logs(group_id, created_at DESC);")
+            # Backs get_latest_log_entry, which runs on every alert-button press
+            # (filters group_id + user_id, newest first). Without this it scans
+            # all of the group's logs.
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_group_user ON logs(group_id, user_id, created_at DESC);")
 
             # Per-group similarity threshold (legacy general fallback)
             cur.execute("""
@@ -892,6 +896,48 @@ def record_sweep_run(
         conn.rollback()
     finally:
         put_connection(conn)
+
+
+def purge_old_records(logs_days: int = 90, sweeps_days: int = 90) -> dict:
+    """
+    Delete rows that only matter for a bounded window, so the (small, Railway
+    Hobby) Postgres disk doesn't grow without bound. Returns a per-table count
+    of deleted rows. Safe to run repeatedly (idempotent).
+
+      name_change_log  — only queried over a ~60-minute velocity window
+      false_positives  — expired grace records
+      logs / sweep_runs — older than the retention window
+    """
+    deleted = {"name_change_log": 0, "false_positives": 0, "logs": 0, "sweep_runs": 0}
+    conn = get_connection()
+    if not conn:
+        return deleted
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM name_change_log WHERE changed_at < NOW() - INTERVAL '1 day'"
+            )
+            deleted["name_change_log"] = cur.rowcount or 0
+            cur.execute("DELETE FROM false_positives WHERE expires_at < NOW()")
+            deleted["false_positives"] = cur.rowcount or 0
+            cur.execute(
+                "DELETE FROM logs WHERE created_at < NOW() - (%(d)s * INTERVAL '1 day')",
+                {"d": logs_days},
+            )
+            deleted["logs"] = cur.rowcount or 0
+            cur.execute(
+                "DELETE FROM sweep_runs WHERE created_at < NOW() - (%(d)s * INTERVAL '1 day')",
+                {"d": sweeps_days},
+            )
+            deleted["sweep_runs"] = cur.rowcount or 0
+        conn.commit()
+        logger.info(f"Retention purge: {deleted}")
+    except Exception as e:
+        logger.error(f"purge_old_records error: {e}", exc_info=True)
+        conn.rollback()
+    finally:
+        put_connection(conn)
+    return deleted
 
 
 # ── Reserved keyword helpers ───────────────────────────────────────────────────
