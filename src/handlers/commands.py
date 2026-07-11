@@ -632,7 +632,7 @@ async def whitelist_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_bot     = bool(getattr(pyro_user, "is_bot", False))
         pfp_hash   = await _fetch_pfp_pyro(context.bot_data["pyro_client"], user_id)
 
-    upsert_whitelisted_user(
+    ok = upsert_whitelisted_user(
         group_id=group_id,
         user_id=user_id,
         username=username,
@@ -643,6 +643,14 @@ async def whitelist_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_type="manual",
         is_bot=is_bot,
     )
+    if not ok:
+        # Don't tell the admin someone is protected when the write failed —
+        # for security tooling a silent lie is worse than a visible error.
+        await update.message.reply_text(
+            "❌ Could not save the whitelist entry (database error). "
+            "Nothing was changed — please try again."
+        )
+        return
     mark_seen(group_id, user_id)
     log_admin_action(
         group_id=group_id,
@@ -1244,10 +1252,18 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"  🚫 bans — all: {tot['banned_all']} · "
             f"30d: {tot['banned_30d']} · 7d: {tot['banned_7d']}"
         )
-        # Chunk for the 4096-char cap
-        msg = "\n".join(lines)
-        for i in range(0, len(msg), 4000):
-            await update.message.reply_text(msg[i:i+4000], parse_mode="HTML")
+        # Chunk for the 4096-char cap on line boundaries — a naive fixed-offset
+        # slice can split an HTML tag/entity, which Telegram then rejects and
+        # the whole send raises. Each `lines` entry is one group block.
+        chunk = ""
+        for block in lines:
+            piece = (block + "\n")
+            if len(chunk) + len(piece) > 4000 and chunk:
+                await update.message.reply_text(chunk, parse_mode="HTML")
+                chunk = ""
+            chunk += piece
+        if chunk:
+            await update.message.reply_text(chunk, parse_mode="HTML")
         return
 
     # Group chat: windowed breakdown
