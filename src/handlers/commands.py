@@ -120,7 +120,40 @@ async def _is_admin(
         logger.warning(f"Admin check failed for user {user_id} in group {gid}: {e}")
         result = False
 
-    _admin_cache[cache_key] = (now + _ADMIN_CACHE_TTL, result)
+    if result:
+        # Only cache positive results. Caching a transient get_chat_member
+        # failure (network blip) as False would lock a real admin out of every
+        # command for the full TTL.
+        _admin_cache[cache_key] = (now + _ADMIN_CACHE_TTL, result)
+    return result
+
+
+async def _is_admin_of_group(
+    context: ContextTypes.DEFAULT_TYPE, group_id: int, user_id: int
+) -> bool:
+    """
+    Verify a user is an admin/owner of a specific group by user_id + group_id.
+
+    Used for inline-button callbacks, where update.effective_chat is the log
+    channel (not the moderated group) so _is_admin would check the wrong chat.
+    The group_id here comes from untrusted callback data, so this MUST be
+    called before acting on any callback that moderates a group. Shares
+    _admin_cache with _is_admin.
+    """
+    cache_key = (user_id, group_id)
+    now = _time.monotonic()
+    if cache_key in _admin_cache:
+        expires_at, cached = _admin_cache[cache_key]
+        if now < expires_at:
+            return cached
+    try:
+        member = await context.bot.get_chat_member(group_id, user_id)
+        result = member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
+    except Exception as e:
+        logger.warning(f"Admin check failed for user {user_id} in group {group_id}: {e}")
+        return False  # don't cache transient failures
+    if result:
+        _admin_cache[cache_key] = (now + _ADMIN_CACHE_TTL, result)
     return result
 
 
@@ -276,6 +309,18 @@ async def handle_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception:
             group_title = str(chat_id)
 
+        # The chat picker offers any group the bot is a member of, so the
+        # selector isn't necessarily an admin. Selecting an active group is
+        # harmless (every command re-checks _is_admin), but the auto-import
+        # below writes whitelist rows — gate it on real admin status.
+        if not await _is_admin_of_group(context, chat_id, update.effective_user.id):
+            await update.message.reply_text(
+                "You're not an admin of that group, so I can't set it up. "
+                "Ask a group admin to run /start and select it.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+
         context.user_data["active_group_id"]    = chat_id
         context.user_data["active_group_title"] = group_title
 
@@ -302,6 +347,15 @@ async def handle_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not g_id:
             await update.message.reply_text(
                 "No active group selected. Use /start to pick a group first.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+
+        # The CHAT_SHARED update itself is unauthenticated (could arrive from a
+        # stale keyboard); confirm the caller still admins the target group.
+        if not await _is_admin_of_group(context, g_id, update.effective_user.id):
+            await update.message.reply_text(
+                "Only admins of the active group can set its log channel.",
                 reply_markup=ReplyKeyboardRemove(),
             )
             return
@@ -402,15 +456,26 @@ async def _import_admins_logic(
     # them via MTProto, which does return bot admins. Requires the Pyrogram
     # userbot to be a member of the group (same assumption as /sweep).
     pyro = context.bot_data.get("pyro_client")
-    if pyro:
+    mtproto_note = ""
+    if not pyro:
+        mtproto_note = (
+            "\n⚠️ <i>Pyrogram userbot not configured — admin bots can't be "
+            "imported (Bot API hides them). Add bots manually with /whitelist.</i>"
+        )
+        logger.warning("import_admins: pyro_client not configured; skipping bot-admin backfill.")
+    else:
         try:
             from pyrogram.enums import ChatMembersFilter
+            mt_admins = 0
+            mt_bots   = 0
             async for m in pyro.get_chat_members(
                 chat_id, filter=ChatMembersFilter.ADMINISTRATORS
             ):
+                mt_admins += 1
                 u = m.user
                 if not u or not u.is_bot:
                     continue
+                mt_bots += 1
                 if u.id == context.bot.id or u.id in current_admin_ids:
                     continue
                 username = (
@@ -432,9 +497,23 @@ async def _import_admins_logic(
                 current_admin_ids.add(u.id)
                 count += 1
                 bot_count += 1
+            logger.info(
+                f"import_admins MTProto backfill for {chat_id}: "
+                f"{mt_admins} admin(s) seen, {mt_bots} bot(s)."
+            )
+            if mt_admins == 0:
+                mtproto_note = (
+                    "\n⚠️ <i>The userbot returned 0 admins via MTProto — it's "
+                    "likely not a member of this group. Add it to the group so "
+                    "it can see the admin bots.</i>"
+                )
         except Exception as e:
             logger.warning(
                 f"Could not enumerate admin bots via MTProto for {chat_id}: {e}"
+            )
+            mtproto_note = (
+                f"\n⚠️ <i>Couldn't read admin bots via MTProto: "
+                f"{html.escape(str(e))}</i>"
             )
 
     # Refresh mode: remove admin-typed rows for users no longer in the
@@ -462,7 +541,7 @@ async def _import_admins_logic(
     return True, (
         f"✅ Imported/updated <b>{count}</b> admin(s){bot_note} "
         f"for <b>{html.escape(str(chat.title or chat_id))}</b>."
-        f"{prune_note}"
+        f"{prune_note}{mtproto_note}"
     )
 
 
@@ -1010,6 +1089,11 @@ async def handle_whitelist_page(update: Update, context: ContextTypes.DEFAULT_TY
         group_id, page = int(gid), int(page)
     except (ValueError, IndexError):
         return
+    # group_id is from (forgeable) callback data — confirm the presser admins it
+    # before rendering another group's whitelist (names, usernames, IDs).
+    if not await _is_admin_of_group(context, group_id, query.from_user.id):
+        await query.answer("Only admins of that group can view this.", show_alert=True)
+        return
     header, lines, _ = _build_whitelist_view(group_id)
     text, markup = _paginate(lines, header, page, "wl_pg", group_id)
     try:
@@ -1106,8 +1190,18 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Private chat: per-group rollup with All / 30d / 7d windows
     if update.effective_chat.type == ChatType.PRIVATE:
         all_gs = get_all_group_stats_windowed()
+        # Restrict to groups the caller actually administers — otherwise any
+        # single-group admin would see every tenant's titles and counts.
+        uid = update.effective_user.id
+        scoped = []
+        for g in all_gs:
+            if await _is_admin_of_group(context, g["group_id"], uid):
+                scoped.append(g)
+        all_gs = scoped
         if not all_gs:
-            await update.message.reply_text("No groups registered yet.")
+            await update.message.reply_text(
+                "No groups found where you're an admin. Use /start to pick one."
+            )
             return
 
         # Aggregate totals across every group, per window
@@ -1240,13 +1334,27 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
     On failure, the buttons stay so the admin can retry.
     """
     query = update.callback_query
-    await query.answer()
 
-    parts = query.data.split("|")
+    # Parse "<action>|<group_id>|<user_id>" defensively — this is untrusted
+    # data that can be forged/replayed by any client.
+    parts = (query.data or "").split("|")
     if len(parts) != 3:
+        await query.answer("Malformed action.", show_alert=True)
+        return
+    try:
+        action, group_id, user_id = parts[0], int(parts[1]), int(parts[2])
+    except ValueError:
+        await query.answer("Malformed action.", show_alert=True)
         return
 
-    action, group_id, user_id = parts[0], int(parts[1]), int(parts[2])
+    # AUTHORIZATION: these buttons ban/unban/whitelist and edit the cross-group
+    # blocklist. They live in a log channel that may contain non-admins, and
+    # group_id comes from the (forgeable) payload — so we MUST confirm the
+    # presser is actually an admin of *that* group before doing anything.
+    if not await _is_admin_of_group(context, group_id, query.from_user.id):
+        await query.answer("Only admins of that group can do this.", show_alert=True)
+        return
+
     admin_name = query.from_user.full_name
 
     if action == "dismiss":
@@ -1259,6 +1367,7 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
             details="from alert button",
         )
         await _resolve_alert(query, "🗑 <b>Dismissed</b>")
+        await query.answer("Dismissed.")
         return
 
     # Escalation actions from alert-mode detections
@@ -1665,6 +1774,11 @@ async def handle_logs_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, gid, page = query.data.split("|")
         group_id, page = int(gid), int(page)
     except (ValueError, IndexError):
+        return
+    # group_id is from (forgeable) callback data — confirm the presser admins it
+    # before rendering another group's detection/admin logs.
+    if not await _is_admin_of_group(context, group_id, query.from_user.id):
+        await query.answer("Only admins of that group can view this.", show_alert=True)
         return
     header, lines = _build_logs_view(group_id)
     text, markup = _paginate(lines, header, page, "logs_pg", group_id)
@@ -2145,6 +2259,12 @@ async def handle_whitelist_undo(update: Update, context: ContextTypes.DEFAULT_TY
         group_id = int(parts[1])
     except ValueError:
         await query.answer("Invalid group ID.", show_alert=True)
+        return
+
+    # The confirmation (and this button) is posted in the group, so any member
+    # could otherwise press it to restore the whole whitelist. Gate on admin.
+    if not await _is_admin_of_group(context, group_id, query.from_user.id):
+        await query.answer("Only admins of that group can undo this.", show_alert=True)
         return
 
     rows = _clearwhitelist_undo.get(group_id)
