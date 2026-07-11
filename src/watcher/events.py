@@ -24,7 +24,7 @@ from telegram import Bot
 
 from src.config import NAME_CHANGE_VELOCITY_THRESHOLD, NAME_CHANGE_WINDOW_MINUTES
 from src.db import (
-    get_all_group_ids, get_group, get_groups_for_user, unmark_seen,
+    get_all_group_ids, get_group, get_watched_groups_for_user, unmark_seen,
     log_name_change, count_recent_name_changes,
 )
 from src.utils.checker import UserSnapshot, check_user, ban_and_log
@@ -57,7 +57,7 @@ async def _handle_name_change(
     user_id = update.user_id
 
     # Resolve which of our groups this user belongs to
-    group_ids = get_groups_for_user(user_id)
+    group_ids = get_watched_groups_for_user(user_id)
     if not group_ids:
         return
 
@@ -132,7 +132,7 @@ async def _handle_photo_change(
 ):
     user_id = update.user_id
 
-    group_ids = get_groups_for_user(user_id)
+    group_ids = get_watched_groups_for_user(user_id)
     if not group_ids:
         return
 

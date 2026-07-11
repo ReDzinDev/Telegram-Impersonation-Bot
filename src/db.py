@@ -521,20 +521,38 @@ def _is_whitelisted_db(group_id: int, user_id: int) -> bool:
         put_connection(conn)
 
 
-def get_groups_for_user(user_id: int) -> list[int]:
-    """Return all group_ids where user_id is whitelisted (used by Pyrogram watcher)."""
+def get_watched_groups_for_user(user_id: int) -> list[int]:
+    """
+    Return group_ids where this user is a *watched* member — i.e. they've been
+    seen (messaged/swept) in the group and are NOT whitelisted.
+
+    Used by the Pyrogram watcher to decide whether a profile change is worth
+    checking. Whitelisted users are excluded because they're the protected
+    identities, not impersonation suspects (check_user() would skip them
+    anyway), and including them would fire the name-change velocity alert for
+    admins instead of scammers.
+    """
     conn = get_connection()
     if not conn:
         return []
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT group_id FROM whitelisted_users WHERE user_id = %s",
-                (user_id,)
+                """
+                SELECT s.group_id
+                  FROM seen_members s
+                 WHERE s.user_id = %s
+                   AND NOT EXISTS (
+                       SELECT 1 FROM whitelisted_users w
+                        WHERE w.group_id = s.group_id
+                          AND w.user_id  = s.user_id
+                   )
+                """,
+                (user_id,),
             )
             return [row["group_id"] for row in cur.fetchall()]
     except Exception as e:
-        logger.error(f"get_groups_for_user error: {e}")
+        logger.error(f"get_watched_groups_for_user error: {e}")
         return []
     finally:
         put_connection(conn)
@@ -991,10 +1009,16 @@ def count_recent_name_changes(user_id: int, window_minutes: int = 60) -> int:
         return 0
     try:
         with conn.cursor() as cur:
+            # Bind the interval as a multiplied unit literal — psycopg can't
+            # substitute a parameter *inside* a quoted INTERVAL '...' string
+            # (it becomes the literal '$n minutes'), which silently threw and
+            # made this whole velocity signal return 0. Same pattern as
+            # get_recent_activity below.
             cur.execute("""
                 SELECT COUNT(*) AS cnt FROM name_change_log
-                WHERE user_id = %s AND changed_at > NOW() - INTERVAL '%s minutes'
-            """, (user_id, window_minutes))
+                WHERE user_id = %(uid)s
+                  AND changed_at > NOW() - (%(mins)s * INTERVAL '1 minute')
+            """, {"uid": user_id, "mins": window_minutes})
             row = cur.fetchone()
             return row["cnt"] if row else 0
     except Exception as e:
@@ -1143,6 +1167,9 @@ def mark_false_positive(
                     expires_at = EXCLUDED.expires_at;
             """, (group_id, user_id, cleared_by, expires))
         conn.commit()
+        # Drop the negative cache entry so a just-cleared user isn't re-flagged
+        # from a stale `is_false_positive` result (cached for _FP_CACHE_TTL).
+        _fp_cache.pop((group_id, user_id), None)
     except Exception as e:
         logger.error(f"mark_false_positive error: {e}")
         conn.rollback()
