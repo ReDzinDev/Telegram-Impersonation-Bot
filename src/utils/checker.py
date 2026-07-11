@@ -20,7 +20,9 @@ from src.utils.detector import (
     check_username_similarity, check_name_similarity,
     check_homoglyph_danger, check_reserved_keywords,
 )
-from src.utils.image import compute_pfp_hash_bytes, check_pfp_similarity
+from src.utils.image import (
+    compute_pfp_hash_bytes, compute_pfp_hash_variants_bytes, check_pfp_similarity,
+)
 from src.config import (
     NAME_SIMILARITY_THRESHOLD, USERNAME_SIMILARITY_THRESHOLD, PFP_HASH_THRESHOLD,
     DEFAULT_BAN_SCORE, DEFAULT_ALERT_SCORE,
@@ -180,10 +182,10 @@ async def check_user(
         if not snapshot.pfp_bytes:
             # Signal the caller to fetch the PFP and re-run (lazy loading for sweep)
             return DetectionResult(flagged=False, needs_pfp=True)
-        target_hash = compute_pfp_hash_bytes(snapshot.pfp_bytes)
-        if target_hash:
+        target_hashes = compute_pfp_hash_variants_bytes(snapshot.pfp_bytes)
+        if target_hashes:
             pfp_match, pfp_matched_val, pfp_dist = check_pfp_similarity(
-                target_hash, pfp_hashes, PFP_HASH_THRESHOLD
+                target_hashes, pfp_hashes, PFP_HASH_THRESHOLD
             )
             if pfp_match:
                 target = _find_by_pfp(others, pfp_matched_val)
@@ -217,10 +219,10 @@ async def check_user(
             if g_is_weak and group_pfp_hash:
                 if not snapshot.pfp_bytes:
                     return DetectionResult(flagged=False, needs_pfp=True)
-                g_user_hash = compute_pfp_hash_bytes(snapshot.pfp_bytes)
-                if g_user_hash:
+                g_user_hashes = compute_pfp_hash_variants_bytes(snapshot.pfp_bytes)
+                if g_user_hashes:
                     g_pfp_match, _, g_pfp_dist = check_pfp_similarity(
-                        g_user_hash, [group_pfp_hash], PFP_HASH_THRESHOLD
+                        g_user_hashes, [group_pfp_hash], PFP_HASH_THRESHOLD
                     )
                     if g_pfp_match:
                         return DetectionResult(

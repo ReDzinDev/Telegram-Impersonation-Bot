@@ -3,12 +3,28 @@ from io import BytesIO
 
 from PIL import Image
 
-from src.utils.image import compute_pfp_hash_bytes, check_pfp_similarity
+from src.utils.image import (
+    compute_pfp_hash_bytes,
+    compute_pfp_hash_variants_bytes,
+    check_pfp_similarity,
+)
 
 
 def _png_bytes(color=(120, 30, 200), size=(64, 64)) -> bytes:
     buf = BytesIO()
     Image.new("RGB", size, color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _asymmetric_png() -> bytes:
+    """A left/right-asymmetric image so a horizontal flip actually changes it."""
+    img = Image.new("RGB", (64, 64), (240, 240, 240))
+    for x in range(64):
+        for y in range(64):
+            if x < 20 or (x + y) % 7 == 0:  # bias content to the left half
+                img.putpixel((x, y), (10, 10, 10))
+    buf = BytesIO()
+    img.save(buf, format="PNG")
     return buf.getvalue()
 
 
@@ -39,6 +55,28 @@ def test_identical_images_match():
     h2 = compute_pfp_hash_bytes(data)
     match, _, dist = check_pfp_similarity(h1, [h2], threshold=10)
     assert match is True and dist == 0
+
+
+def test_flipped_image_matches_via_variants():
+    """A horizontally-mirrored avatar should still match the original's stored
+    hash, because compute_pfp_hash_variants_bytes hashes both orientations."""
+    original = _asymmetric_png()
+    stored = compute_pfp_hash_bytes(original)
+
+    flipped_img = Image.open(BytesIO(original)).transpose(Image.FLIP_LEFT_RIGHT)
+    buf = BytesIO()
+    flipped_img.save(buf, format="PNG")
+
+    # A single-hash check misses the flip; the variant list catches it.
+    single = compute_pfp_hash_bytes(buf.getvalue())
+    variants = compute_pfp_hash_variants_bytes(buf.getvalue())
+
+    single_match, _, single_dist = check_pfp_similarity(single, [stored], threshold=10)
+    variant_match, _, variant_dist = check_pfp_similarity(variants, [stored], threshold=10)
+
+    assert variant_match is True and variant_dist <= 10
+    # sanity: the flip genuinely changed the single hash (otherwise the test is vacuous)
+    assert single_dist >= variant_dist
 
 
 # check_pfp_similarity threshold logic, tested with explicit 64-bit hex hashes

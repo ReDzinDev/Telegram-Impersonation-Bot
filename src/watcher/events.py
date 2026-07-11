@@ -2,9 +2,14 @@
 """
 Pyrogram raw-update handlers for profile changes.
 
-UpdateUserName fires when any Telegram user changes their first name,
-last name, or username. UpdateUserPhoto fires on profile picture changes.
-Both are MTProto-only — the Bot API has no equivalent event.
+UpdateUserName fires when a user changes their first/last name or username.
+Profile-photo changes arrive as UpdateUserPhoto on old API layers and as the
+generic UpdateUser ("refetch this user") on modern layers — we handle both.
+All are MTProto-only — the Bot API has no equivalent event.
+
+Note: Telegram only pushes these for peers the userbot shares context with;
+arbitrary large-group members may not be covered in real time, so the periodic
+sweep remains the authoritative safety net.
 
 When a change is detected for a user who is a member of one of our
 monitored groups, we:
@@ -38,14 +43,23 @@ logger = logging.getLogger(__name__)
 def register_event_handlers(pyro: Client, bot: Bot, log_channel_id: str | None):
     """Attach raw-update handlers to the Pyrogram client."""
 
-    # UpdateUserPhoto was removed in newer Telegram API layers; guard with getattr
+    # UpdateUserPhoto was removed around API layer 152 (late 2022) in favour of
+    # the generic UpdateUser ("this user's profile changed, refetch it") signal.
+    # Guard both with getattr so we work across Pyrogram/layer versions: on old
+    # layers UpdateUserPhoto exists; on new ones UpdateUser carries photo changes.
     _UpdateUserPhoto = getattr(raw.types, "UpdateUserPhoto", None)
+    _UpdateUser      = getattr(raw.types, "UpdateUser", None)
 
     @pyro.on_raw_update()
     async def on_raw_update(client: Client, update, users, chats):
         if isinstance(update, raw.types.UpdateUserName):
             await _handle_name_change(client, bot, update, log_channel_id)
         elif _UpdateUserPhoto and isinstance(update, _UpdateUserPhoto):
+            await _handle_photo_change(client, bot, update, log_channel_id)
+        elif _UpdateUser and isinstance(update, _UpdateUser):
+            # Generic "profile changed" — covers PFP swaps on modern layers.
+            # _handle_photo_change only reads update.user_id then refetches, so
+            # it handles this update shape too.
             await _handle_photo_change(client, bot, update, log_channel_id)
 
 
