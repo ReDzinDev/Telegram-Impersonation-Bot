@@ -877,7 +877,10 @@ async def sweep(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    log_channel  = context.bot_data.get("log_channel_id") or LOG_CHANNEL_ID
+    # Route detections to the group's own configured log channel, not just the
+    # global one — otherwise a group with a per-group channel gets its manual
+    # sweep results (and action buttons) posted to the wrong place.
+    log_channel  = _resolve_log_channel(group_id, context)
     status_msg   = await update.message.reply_text("🔍 Sweep started — fetching member list…")
 
     from src.watcher.sweep import sweep_group
@@ -1576,6 +1579,16 @@ async def add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             failed.append((entry, "DB error"))
 
+    if added:
+        # Audit the change — detection behaviour is being modified.
+        log_admin_action(
+            group_id=group_id,
+            admin_id=update.effective_user.id,
+            admin_name=update.effective_user.full_name,
+            action="add_keyword",
+            details=", ".join(e for e in entries)[:500],
+        )
+
     parts = []
     if added:
         parts.append(f"✅ Added {len(added)}: " + ", ".join(added))
@@ -1604,11 +1617,19 @@ async def remove_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pattern = pattern[2:].strip()
 
     removed = remove_reserved_keyword(group_id, pattern)
+    esc = html.escape(pattern)
     if removed:
-        await update.message.reply_text(f"✅ Keyword <code>{pattern}</code> removed.", parse_mode="HTML")
+        log_admin_action(
+            group_id=group_id,
+            admin_id=update.effective_user.id,
+            admin_name=update.effective_user.full_name,
+            action="remove_keyword",
+            details=pattern[:500],
+        )
+        await update.message.reply_text(f"✅ Keyword <code>{esc}</code> removed.", parse_mode="HTML")
     else:
         await update.message.reply_text(
-            f"⚠️ <code>{pattern}</code> not found in keyword list.", parse_mode="HTML"
+            f"⚠️ <code>{esc}</code> not found in keyword list.", parse_mode="HTML"
         )
 
 
@@ -1632,7 +1653,7 @@ async def list_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
     for r in rows:
         tag = "regex" if r["is_regex"] else "keyword"
-        lines.append(f"• <code>{r['pattern']}</code> <i>({tag})</i>")
+        lines.append(f"• <code>{html.escape(r['pattern'])}</code> <i>({tag})</i>")
 
     await update.message.reply_text(
         f"🔑 <b>Reserved keywords ({len(rows)})</b>\n\n" + "\n".join(lines),
@@ -1867,15 +1888,16 @@ async def import_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         details=f"Imported {added}, skipped {skipped}",
     )
     await update.message.reply_text(
-        f"✅ Imported <b>{added}</b> user(s) into whitelist for <b>{group_title}</b>."
+        f"✅ Imported <b>{added}</b> user(s) into whitelist for <b>{html.escape(str(group_title))}</b>."
         + (f"\n⚠️ Skipped {skipped} invalid row(s)." if skipped else ""),
         parse_mode="HTML",
     )
     if failed_rows:
+        # failed_rows embed arbitrary CSV cell values (bad_val!r) — escape.
         detail = "Failed rows:\n" + "\n".join(failed_rows[:20])
         if len(failed_rows) > 20:
             detail += f"\n…and {len(failed_rows) - 20} more."
-        await update.message.reply_text(f"<pre>{detail}</pre>", parse_mode="HTML")
+        await update.message.reply_text(f"<pre>{html.escape(detail)}</pre>", parse_mode="HTML")
 
 
 # ── /settings ─────────────────────────────────────────────────────────────────
