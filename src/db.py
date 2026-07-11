@@ -96,8 +96,11 @@ def put_connection(conn) -> None:
 def init_db():
     conn = get_connection()
     if not conn:
-        logger.error("Cannot initialize DB — no connection.")
-        return
+        # Raise, don't return: a soft return here leaves the bot polling
+        # Telegram with no schema — every DB call then fails silently and the
+        # process never exits, so Railway's ON_FAILURE restart never fires
+        # (a "zombie" that protects nothing). Crashing is the correct outcome.
+        raise RuntimeError("Cannot initialize DB — no connection available.")
 
     try:
         with conn.cursor() as cur:
@@ -326,8 +329,9 @@ def init_db():
         conn.commit()
         logger.info("Database initialized.")
     except Exception as e:
-        logger.error(f"DB init error: {e}")
+        logger.error(f"DB init error: {e}", exc_info=True)
         conn.rollback()
+        raise  # let the process crash so Railway restarts instead of zombie-ing
     finally:
         put_connection(conn)
 

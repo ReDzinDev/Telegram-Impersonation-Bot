@@ -1,6 +1,7 @@
 
 import asyncio
 import logging
+import signal
 
 from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, Update
 from telegram.error import TimedOut, NetworkError, Conflict
@@ -321,19 +322,49 @@ async def main():
         )
         _supervise("daily_summary", summary_task)
 
+    # Install a SIGTERM/SIGINT handler so Railway redeploys (which send SIGTERM)
+    # trigger a *graceful* shutdown. Without this, SIGTERM's default disposition
+    # kills the process instantly, the finally block never runs, and the old
+    # container's long-poll getUpdates stays open — which is exactly what makes
+    # the new container log "Conflict: terminated by other getUpdates request".
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            # add_signal_handler isn't supported on Windows' default loop;
+            # KeyboardInterrupt still covers SIGINT there.
+            pass
+
     try:
-        await asyncio.Event().wait()  # run forever
+        await stop_event.wait()  # run until a shutdown signal arrives
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
         logger.info("Shutting down…")
-        keepalive_task.cancel()
+        # Stop polling FIRST so the getUpdates long-poll is released before the
+        # new instance starts — this is what shrinks the redeploy Conflict window.
+        try:
+            await ptb_app.updater.stop()
+        except Exception as e:
+            logger.warning(f"updater.stop() failed: {e}")
+
+        tasks = [keepalive_task]
         if summary_task:
-            summary_task.cancel()
+            tasks.append(summary_task)
         if pyro_client:
-            sweep_task.cancel()
-            health_task.cancel()
-            await pyro_client.stop()
-        await ptb_app.updater.stop()
+            tasks.extend([sweep_task, health_task])
+        for t in tasks:
+            t.cancel()
+        # Await the cancellations so task cleanup actually completes before we
+        # tear down the loop (bare .cancel() doesn't wait).
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        if pyro_client:
+            try:
+                await pyro_client.stop()
+            except Exception as e:
+                logger.warning(f"pyro_client.stop() failed: {e}")
         await ptb_app.stop()
         await ptb_app.shutdown()
