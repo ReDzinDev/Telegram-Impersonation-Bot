@@ -65,6 +65,7 @@ async def sweep_group(
         flagged  = 0
         errors   = 0
         iterated = 0   # every member the loop touches (including admins, bots, whitelisted)
+        partial  = False  # True if the sweep stopped before covering all members
 
         try:
             # Resolve the peer first — required for new sessions where the entity
@@ -93,9 +94,11 @@ async def sweep_group(
         try:
             async for member in pyro.get_chat_members(group_id):
                 if time.monotonic() > sweep_deadline:
+                    partial = True
                     logger.warning(
-                        f"Sweep hard-cap (2 h) reached for group {group_id}; "
-                        f"stopping early after {iterated} members iterated."
+                        f"Sweep hard-cap reached for group {group_id}; stopping early "
+                        f"after {iterated} members iterated — the remainder of the "
+                        f"member list was NOT scanned this run."
                     )
                     break
 
@@ -208,8 +211,19 @@ async def sweep_group(
                     await asyncio.sleep(0.3)  # back off after a GetFullUser call
 
         except FloodWait as e:
-            logger.warning(f"Sweep flood wait {e.value}s for group {group_id}")
+            # The member enumeration itself got rate-limited; we can't cheaply
+            # resume the async generator mid-stream, so this run is partial.
+            # Sleep, mark partial, and DON'T immediately refresh PFPs (that would
+            # fire a fresh media-download burst at the same flooded DC).
+            partial = True
+            logger.warning(
+                f"Sweep flood wait {e.value}s for group {group_id} — ending run as partial."
+            )
             await asyncio.sleep(e.value)
+            result = {"iterated": iterated, "checked": checked, "flagged": flagged,
+                      "errors": errors, "partial": True}
+            record_sweep_run(group_id, iterated, checked, flagged, errors, trigger)
+            return result
         except (ChatAdminRequired, UserNotParticipant) as e:
             logger.error(f"Sweep permission error for group {group_id}: {e}")
             errors += 1
@@ -220,7 +234,8 @@ async def sweep_group(
         # Refresh stored PFP hashes for all whitelisted users after each sweep
         await refresh_whitelist_pfps(pyro, group_id)
 
-        result = {"iterated": iterated, "checked": checked, "flagged": flagged, "errors": errors}
+        result = {"iterated": iterated, "checked": checked, "flagged": flagged,
+                  "errors": errors, "partial": partial}
         # Persist this run so /stats and the daily summary can count it
         record_sweep_run(group_id, iterated, checked, flagged, errors, trigger)
         return result

@@ -10,6 +10,7 @@ to reach _fetch_bio).
 from __future__ import annotations
 
 import logging
+import time
 from io import BytesIO
 from typing import Optional
 
@@ -20,9 +21,27 @@ from src.utils.image import compute_pfp_hash_bytes
 
 logger = logging.getLogger(__name__)
 
+# Shared MTProto cooldown. When Telegram returns a FloodWait on any of these
+# helpers, we record until when we should back off; subsequent calls short-
+# circuit until then. Without this, one FloodWait was immediately followed by
+# the next member's fetch hitting the same limit — the pattern Telegram
+# escalates against (PEER_FLOOD / account limitation).
+_flood_until: float = 0.0
+
+
+def _in_cooldown() -> bool:
+    return time.monotonic() < _flood_until
+
+
+def _enter_cooldown(seconds: float) -> None:
+    global _flood_until
+    _flood_until = max(_flood_until, time.monotonic() + seconds)
+
 
 async def fetch_pfp_bytes(pyro: Client, user_id: int) -> Optional[bytes]:
     """Download a user's current profile photo as raw bytes, or None."""
+    if _in_cooldown():
+        return None
     try:
         photos = pyro.get_chat_photos(user_id, limit=1)
         photo = await photos.__anext__()
@@ -34,8 +53,9 @@ async def fetch_pfp_bytes(pyro: Client, user_id: int) -> Optional[bytes]:
         return None
     except FloodWait as e:
         # DC-level rate limit on media downloads — skip this PFP rather than
-        # blocking a whole sweep for potentially 20+ minutes.
-        logger.warning(f"PFP flood wait {e.value}s for user {user_id} — skipping photo check.")
+        # blocking a whole sweep for 20+ minutes, and pause sibling calls too.
+        _enter_cooldown(e.value)
+        logger.warning(f"PFP flood wait {e.value}s for user {user_id} — cooling down.")
         return None
     except Exception:
         return None
@@ -49,9 +69,17 @@ async def fetch_pfp_hash(pyro: Client, user_id: int) -> Optional[str]:
 
 async def fetch_bio(pyro: Client, user_id: int) -> Optional[str]:
     """Fetch a user's bio / about text via MTProto GetFullUser, or None."""
+    if _in_cooldown():
+        return None
     try:
         peer = await pyro.resolve_peer(user_id)
         full = await pyro.invoke(raw.functions.users.GetFullUser(id=peer))
         return full.full_user.about or None
+    except FloodWait as e:
+        # Don't silently swallow flood here (the old blanket except did) — record
+        # the cooldown so the rest of the sweep stops issuing GetFullUser calls.
+        _enter_cooldown(e.value)
+        logger.warning(f"Bio flood wait {e.value}s for user {user_id} — cooling down.")
+        return None
     except Exception:
         return None

@@ -917,10 +917,15 @@ async def sweep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     checked  = result.get("checked", 0)
     flagged  = result.get("flagged", 0)
     errors   = result.get("errors", 0)
+    partial  = result.get("partial", False)
     note     = "\n<i>(All members were admins or already whitelisted.)</i>" if checked == 0 else ""
+    if partial:
+        note += ("\n⚠️ <b>Partial sweep</b> — stopped early (rate limit or time cap); "
+                 "not all members were scanned. Re-run /sweep to continue.")
+    header = "⚠️ <b>Sweep partial</b>" if partial else "✅ <b>Sweep complete</b>"
 
     await status_msg.edit_text(
-        f"✅ <b>Sweep complete</b>\n"
+        f"{header}\n"
         f"Members seen: <code>{iterated}</code>\n"
         f"Checked (non-whitelisted): <code>{checked}</code>\n"
         f"Flagged & actioned: <code>{flagged}</code>\n"
