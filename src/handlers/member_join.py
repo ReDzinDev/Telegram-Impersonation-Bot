@@ -56,7 +56,8 @@ async def on_bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TY
                     text=(
                         f"➕ <b>Bot added to new group</b>\n"
                         f"<b>{html.escape(chat.title or str(chat.id))}</b> (<code>{chat.id}</code>)\n\n"
-                        f"Run /import_admins in that group to populate the whitelist."
+                        f"DM the bot, /start, select this group, then run "
+                        f"/import_admins to populate the whitelist."
                     ),
                     parse_mode="HTML",
                 )

@@ -163,17 +163,29 @@ async def _get_admin_group(
     """
     Combined helper: resolve the active group then verify the caller is an admin.
 
-    Returns (group_id, group_title) on success.
-    Returns None after sending the appropriate message to the user (group picker
-    or "Only admins" error) so callers can simply do ``if not ctx: return``.
+    Commands are DM-ONLY. If invoked anywhere other than a private chat (i.e.
+    inside a group/channel), this returns None WITHOUT replying — the bot must
+    never respond to commands in a group, for admins or non-admins alike. Admins
+    manage the bot exclusively by DMing it and selecting the group.
+
+    In DM: resolves the selected group and verifies the caller is an admin of it.
+
+    Returns (group_id, group_title) on success, else None (after sending the
+    group picker or an "admins only" notice in DM) so callers do ``if not ctx: return``.
     """
+    if update.effective_chat.type != ChatType.PRIVATE:
+        return None  # silently ignore commands issued in groups/channels
+
     ctx = await _get_active_group(update, context)
     if not ctx:
         return None  # _get_active_group already sent the group picker
 
     group_id, group_title = ctx
     if not await _is_admin(update, context, group_id=group_id):
-        await update.message.reply_text("Only admins can use this command.")
+        await update.message.reply_text(
+            "Only admins of the selected group can use this. "
+            "Use /start to pick a group you administer."
+        )
         return None
 
     return group_id, group_title
@@ -230,6 +242,8 @@ async def _post_to_log_channel(
 # ── /start ─────────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # DM-only: /start does nothing (no reply) inside a group/channel. The bot
+    # is managed exclusively by DMing it and selecting the group.
     if update.effective_chat.type == ChatType.PRIVATE:
         group_id    = context.user_data.get("active_group_id")
         group_title = context.user_data.get("active_group_title")
@@ -281,16 +295,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=ReplyKeyboardMarkup(
                 keyboard, resize_keyboard=True, one_time_keyboard=True
             ),
-        )
-    else:
-        group_id = update.effective_chat.id
-        group = get_group(group_id)
-        action = (group.get("action_mode", "ban") if group else "not registered")
-        await update.message.reply_text(
-            f"🛡 <b>Anti-Impersonator Bot active</b>\n"
-            f"Action mode: <code>{action}</code>\n\n"
-            "Use /import_admins to populate the whitelist.",
-            parse_mode="HTML",
         )
 
 
