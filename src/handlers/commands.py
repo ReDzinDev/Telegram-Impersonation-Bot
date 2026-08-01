@@ -930,10 +930,14 @@ async def sweep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     flagged  = result.get("flagged", 0)
     errors   = result.get("errors", 0)
     partial  = result.get("partial", False)
+    bios_skipped = result.get("bios_skipped", 0)
     note     = "\n<i>(All members were admins or already whitelisted.)</i>" if checked == 0 else ""
     if partial:
         note += ("\n⚠️ <b>Partial sweep</b> — stopped early (rate limit or time cap); "
                  "not all members were scanned. Re-run /sweep to continue.")
+    if bios_skipped:
+        note += (f"\n⚠️ <code>{bios_skipped}</code> member bio(s) could not be "
+                 "keyword-checked (Telegram rate limit).")
     header = "⚠️ <b>Sweep partial</b>" if partial else "✅ <b>Sweep complete</b>"
 
     await status_msg.edit_text(

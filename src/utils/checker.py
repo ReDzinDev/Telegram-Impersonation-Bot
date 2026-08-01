@@ -143,19 +143,12 @@ async def check_user(
                 score=score, **_target_fields(target)
             )
 
-    # 2 — Homoglyph username: only flag if it also fuzzy-matches a whitelisted username
-    if snapshot.username and usernames and check_homoglyph_danger(snapshot.username):
-        match, matched_val, score = check_username_similarity(
-            snapshot.username, usernames, username_threshold
-        )
-        if match:
-            target = _find_by_username(others, matched_val)
-            return DetectionResult(
-                flagged=True, match_type="homoglyph_username",
-                matched_val=matched_val, score=score, **_target_fields(target)
-            )
+    # (A separate homoglyph-username stage used to sit here, but it re-ran the
+    # exact same check_username_similarity call as stage 1 — which had already
+    # returned on a match — so it could never fire. check_username_similarity
+    # folds lookalike characters internally; homoglyph handles are caught above.)
 
-    # 3 — Homoglyph name: only flag if it also fuzzy-matches a whitelisted display name
+    # 2 — Homoglyph name: only flag if it also fuzzy-matches a whitelisted display name
     if check_homoglyph_danger(full_name):
         match, matched_val, score = check_name_similarity(full_name, names, name_threshold)
         if match and not (len(full_name.split()) <= 1 or len(matched_val.split()) <= 1):
@@ -165,7 +158,7 @@ async def check_user(
                 matched_val=matched_val, score=score, **_target_fields(target)
             )
 
-    # 4 — Display name similarity (name vs whitelist names only)
+    # 3 — Display name similarity (name vs whitelist names only)
     match, matched_val, score = check_name_similarity(full_name, names, name_threshold)
     is_weak = match and (len(full_name.split()) <= 1 or len(matched_val.split()) <= 1)
 
@@ -176,7 +169,7 @@ async def check_user(
             score=score, **_target_fields(target)
         )
 
-    # 5 — PFP hash (tiebreaker for weak name matches only)
+    # 4 — PFP hash (tiebreaker for weak name matches only)
     # A standalone photo match without any name/username similarity is too noisy.
     if is_weak and pfp_hashes:
         if not snapshot.pfp_bytes:
@@ -194,7 +187,7 @@ async def check_user(
                     score=pfp_dist, **_target_fields(target)
                 )
 
-    # 6 — Group identity: catch users impersonating the group itself.
+    # 5 — Group identity: catch users impersonating the group itself.
     #     Checks user name similarity to the group title, and (for weak matches)
     #     user PFP similarity to the group's stored logo hash.
     if group_cfg:

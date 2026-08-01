@@ -66,6 +66,7 @@ async def sweep_group(
         errors   = 0
         iterated = 0   # every member the loop touches (including admins, bots, whitelisted)
         partial  = False  # True if the sweep stopped before covering all members
+        bios_skipped = 0  # members whose bio could NOT be keyword-screened (rate limit)
 
         try:
             # Resolve the peer first — required for new sessions where the entity
@@ -85,7 +86,7 @@ async def sweep_group(
         # for groups with no reserved keywords — bio is only consulted by the
         # keyword detection stage. Resolve once and skip the call otherwise.
         has_keywords = bool(get_reserved_keywords(group_id))
-        from src.watcher.fetch import fetch_bio as _fetch_bio
+        from src.watcher.fetch import bio_cooldown_remaining, fetch_bio as _fetch_bio
 
         # Notify immediately so the admin knows the loop has started
         if progress_cb:
@@ -117,7 +118,7 @@ async def sweep_group(
                     if user.id == bot.id:
                         continue
                     # Bots don't usually have meaningful PFPs; skip the CDN download for them
-                    pfp_bytes_admin = None if user.is_bot else await _fetch_pfp(pyro, user.id)
+                    pfp_bytes_admin = None if user.is_bot else await _fetch_pfp(pyro, user.id, wait=True)
                     upsert_whitelisted_user(
                         group_id=group_id,
                         user_id=user.id,
@@ -149,7 +150,7 @@ async def sweep_group(
 
                 # Lazy PFP: only fetch when there's a weak name match that needs confirmation
                 if result.needs_pfp:
-                    pfp_bytes = await _fetch_pfp(pyro, user.id)
+                    pfp_bytes = await _fetch_pfp(pyro, user.id, wait=True)
                     if pfp_bytes:
                         snapshot = UserSnapshot(
                             user_id=user.id,
@@ -164,10 +165,15 @@ async def sweep_group(
                 # keywords — a scammer's banned word might be hiding in their bio
                 # (which Bot API can't see and `get_chat_members` doesn't return).
                 # One extra MTProto call per still-unflagged non-bot member.
-                bio_fetched = False
+                # wait=True rides out flood cooldowns instead of silently
+                # skipping; the pacer in src.watcher.fetch does the throttling.
                 if not result.flagged and has_keywords:
-                    bio = await _fetch_bio(pyro, user.id)
-                    bio_fetched = True
+                    bio = await _fetch_bio(pyro, user.id, wait=True)
+                    if bio is None and bio_cooldown_remaining() > 0:
+                        # The fetch was skipped (or itself flooded) — this
+                        # member's bio was NOT screened. Count it so the
+                        # summary stays honest instead of overstating coverage.
+                        bios_skipped += 1
                     if bio:
                         snapshot.bio = bio
                         result = await check_user(snapshot, group_id)
@@ -199,16 +205,9 @@ async def sweep_group(
 
                 # Yield control to the event loop so concurrent PTB handlers
                 # (e.g. commands run during a sweep) can process their HTTP
-                # responses without timing out.
+                # responses without timing out. Network-call pacing happens
+                # inside src.watcher.fetch, shared with every other caller.
                 await asyncio.sleep(0)
-
-                # Only pace after an actual network call — username/name checks
-                # are pure CPU and need no delay. Sleeping unconditionally was
-                # the reason sweeps took 8+ minutes for 1,000-member groups.
-                if result.needs_pfp and pfp_bytes:
-                    await asyncio.sleep(0.5)  # back off after a CDN media fetch
-                elif bio_fetched:
-                    await asyncio.sleep(0.3)  # back off after a GetFullUser call
 
         except FloodWait as e:
             # The member enumeration itself got rate-limited; we can't cheaply
@@ -221,7 +220,7 @@ async def sweep_group(
             )
             await asyncio.sleep(e.value)
             result = {"iterated": iterated, "checked": checked, "flagged": flagged,
-                      "errors": errors, "partial": True}
+                      "errors": errors, "partial": True, "bios_skipped": bios_skipped}
             record_sweep_run(group_id, iterated, checked, flagged, errors, trigger)
             return result
         except (ChatAdminRequired, UserNotParticipant) as e:
@@ -235,7 +234,7 @@ async def sweep_group(
         await refresh_whitelist_pfps(pyro, group_id)
 
         result = {"iterated": iterated, "checked": checked, "flagged": flagged,
-                  "errors": errors, "partial": partial}
+                  "errors": errors, "partial": partial, "bios_skipped": bios_skipped}
         # Persist this run so /stats and the daily summary can count it
         record_sweep_run(group_id, iterated, checked, flagged, errors, trigger)
         return result
@@ -249,7 +248,8 @@ async def refresh_whitelist_pfps(pyro: Client, group_id: int):
     whitelist = get_whitelist(group_id)
     refreshed = 0
     for row in whitelist:
-        pfp_bytes = await _fetch_pfp(pyro, row["user_id"])
+        # Pacing happens inside fetch; wait=True rides out flood cooldowns.
+        pfp_bytes = await _fetch_pfp(pyro, row["user_id"], wait=True)
         if not pfp_bytes:
             continue
         new_hash = compute_pfp_hash_bytes(pfp_bytes)
@@ -266,7 +266,7 @@ async def refresh_whitelist_pfps(pyro: Client, group_id: int):
                 is_bot=bool(row.get("is_bot", False)),
             )
             refreshed += 1
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0)
     if refreshed:
         logger.info(f"Refreshed {refreshed} PFP hash(es) for group {group_id}.")
 
@@ -336,6 +336,13 @@ async def _post_sweep_summary(
         f"Flagged: <code>{result.get('flagged', 0)}</code>\n"
         f"Errors: <code>{result.get('errors', 0)}</code>"
     )
+    if result.get("partial"):
+        text += "\n⚠️ Partial — stopped early (rate limit or time cap)."
+    if result.get("bios_skipped"):
+        text += (
+            f"\n⚠️ Bio checks skipped (rate limit): "
+            f"<code>{result['bios_skipped']}</code>"
+        )
     from src.utils.notify import send_log_message
     await send_log_message(bot, channel, text)
 

@@ -78,3 +78,12 @@ HEALTH_CHECK_INTERVAL          = int(_optional("HEALTH_CHECK_INTERVAL", "300"))
 DB_KEEPALIVE_INTERVAL          = int(_optional("DB_KEEPALIVE_INTERVAL", "270"))
 NAME_CHANGE_VELOCITY_THRESHOLD = int(_optional("NAME_CHANGE_VELOCITY_THRESHOLD", "3"))
 NAME_CHANGE_WINDOW_MINUTES     = int(_optional("NAME_CHANGE_WINDOW_MINUTES", "60"))
+
+# ── MTProto fetch pacing ────────────────────────────────────────────────────
+# Minimum seconds between users.GetFullUser calls (bio fetches) and between
+# profile-photo downloads, across ALL callers. These are proactive floors —
+# staying under Telegram's sustained budget beats discovering it via
+# FloodWait. On a flood the pacer in src.watcher.fetch ratchets the interval
+# up automatically, so these only need to be roughly right.
+BIO_FETCH_MIN_INTERVAL = float(_optional("BIO_FETCH_MIN_INTERVAL", "1.2"))
+PFP_FETCH_MIN_INTERVAL = float(_optional("PFP_FETCH_MIN_INTERVAL", "0.7"))
