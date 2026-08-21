@@ -1,11 +1,63 @@
 
 import logging
 import imagehash
-from PIL import Image
+from PIL import Image, ImageStat
 from io import BytesIO
 from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# ── Degenerate-image rejection ────────────────────────────────────────────────
+#
+# phash keeps the DCT coefficients above the median. An image with no
+# high-frequency detail has almost no coefficients above it, so nearly every bit
+# collapses to the same value and EVERY such image produces the same hash:
+# solid red, solid blue, solid white and a linear gradient all hash to
+# 8000000000000000. Comparing two of those reports distance 0 — a perfect match
+# between unrelated users.
+#
+# That is a false-ban path, not just noise: ban_and_log treats match_type "pfp"
+# as full confidence, so the score bands cannot soften it. So we refuse to
+# describe an image phash cannot describe, and the photo stage is skipped
+# instead (callers already guard on an empty hash / empty variant list).
+#
+# Popcount is the load-bearing signal, not pixel variance — the linear gradient
+# has a grayscale stddev of ~74 and is still degenerate. Measured margins:
+# a photo and a cartoon avatar sit at popcount 32, a hard two-tone split at 3,
+# bold stripes at 4. A cutoff of 3 clears all of them.
+_MIN_HASH_POPCOUNT = 3
+_MAX_HASH_POPCOUNT = 61   # an all-ones hash is equally uninformative
+
+# Backstop for images that are visually flat but still yield a mid-range
+# popcount (a tiny mark on an otherwise empty field). A real avatar essentially
+# never falls below this; the structured test fixture measures ~57.
+_MIN_PIXEL_STDDEV = 2.0
+
+
+def _describable(img: Image.Image) -> bool:
+    """False when the image carries too little detail for phash to distinguish."""
+    try:
+        if ImageStat.Stat(img.convert("L")).stddev[0] < _MIN_PIXEL_STDDEV:
+            return False
+    except Exception:
+        pass  # stat failure shouldn't block hashing; popcount still applies
+    return True
+
+
+def _phash_or_none(img: Image.Image) -> Optional[str]:
+    """phash the image, or None if the result would be a degenerate hash."""
+    if not _describable(img):
+        logger.debug("Refusing to hash a near-uniform image (no phash signal).")
+        return None
+    h = imagehash.phash(img)
+    popcount = int(h.hash.sum())
+    if not (_MIN_HASH_POPCOUNT <= popcount <= _MAX_HASH_POPCOUNT):
+        logger.debug(
+            f"Refusing degenerate phash {h} (popcount {popcount}) — "
+            "flat or smooth image, would collide with every other such image."
+        )
+        return None
+    return str(h)
 
 
 def compute_pfp_hash_bytes(image_data: bytes) -> Optional[str]:
@@ -25,7 +77,7 @@ def compute_pfp_hash_bytes(image_data: bytes) -> Optional[str]:
         return None
     try:
         img = _load_image(image_data)
-        return str(imagehash.phash(img))
+        return _phash_or_none(img)
     except Exception as e:
         logger.debug(f"Could not compute PFP hash (likely an animated/video avatar): {e}")
         return None
@@ -60,10 +112,16 @@ def compute_pfp_hash_variants_bytes(image_data: bytes) -> list[str]:
     except Exception as e:
         logger.debug(f"Could not compute PFP hash variants: {e}")
         return []
-    out = [str(imagehash.phash(img))]
+    base = _phash_or_none(img)
+    if base is None:
+        # Degenerate image — its mirror is equally undescribable, so there is
+        # nothing to compare and the caller must skip the photo stage.
+        return []
+    out = [base]
     try:
-        flipped = img.transpose(Image.FLIP_LEFT_RIGHT)
-        out.append(str(imagehash.phash(flipped)))
+        flipped = _phash_or_none(img.transpose(Image.FLIP_LEFT_RIGHT))
+        if flipped is not None:
+            out.append(flipped)
     except Exception:
         pass
     return out

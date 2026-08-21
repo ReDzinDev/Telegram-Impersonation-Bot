@@ -10,9 +10,23 @@ from src.utils.image import (
 )
 
 
-def _png_bytes(color=(120, 30, 200), size=(64, 64)) -> bytes:
+def _flat_png(color=(120, 30, 200), size=(64, 64)) -> bytes:
+    """A solid-colour image. phash cannot describe this — see the degenerate-
+    hash tests below — so it is only used where that is the point."""
     buf = BytesIO()
     Image.new("RGB", size, color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _structured_png(seed=(200, 60, 60), size=(64, 64)) -> bytes:
+    """A real-looking avatar: high-frequency detail phash can actually encode."""
+    img = Image.new("RGB", size, (30, 60, 120))
+    for x in range(size[0]):
+        for y in range(size[1]):
+            if (x // 7 + y // 5) % 2 == 0:
+                img.putpixel((x, y), seed)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
     return buf.getvalue()
 
 
@@ -29,7 +43,7 @@ def _asymmetric_png() -> bytes:
 
 
 def test_hash_valid_image():
-    h = compute_pfp_hash_bytes(_png_bytes())
+    h = compute_pfp_hash_bytes(_structured_png())
     assert isinstance(h, str) and len(h) > 0
 
 
@@ -44,13 +58,14 @@ def test_hash_garbage_returns_none_not_raises():
 
 
 def test_hash_rgba_is_handled():
+    img = Image.open(BytesIO(_structured_png())).convert("RGBA")
     buf = BytesIO()
-    Image.new("RGBA", (64, 64), (10, 20, 30, 128)).save(buf, format="PNG")
+    img.save(buf, format="PNG")
     assert compute_pfp_hash_bytes(buf.getvalue()) is not None
 
 
 def test_identical_images_match():
-    data = _png_bytes()
+    data = _structured_png()
     h1 = compute_pfp_hash_bytes(data)
     h2 = compute_pfp_hash_bytes(data)
     match, _, dist = check_pfp_similarity(h1, [h2], threshold=10)
@@ -101,3 +116,76 @@ def test_pfp_similarity_picks_closest_of_many():
         threshold=10,
     )
     assert match is True and val == "0000000000000003" and dist == 2
+
+
+# ── degenerate hashes (F-1) ───────────────────────────────────────────────────
+#
+# phash works by keeping the DCT coefficients above the median. An image with no
+# high-frequency detail — a solid colour, a smooth gradient — has essentially no
+# coefficients above the median, so nearly every bit lands on the same value and
+# every such image collapses to the SAME hash. Measured: solid red, solid blue,
+# solid white and a linear gradient all produce 8000000000000000.
+#
+# That matters because the photo stage is treated as full confidence by
+# ban_and_log, so two unrelated users with plain avatars looked like proof of
+# impersonation. The hashers must refuse to describe an image phash cannot
+# describe. Structured images are unaffected (popcount 32 for a photo, 3-4 even
+# for a two-tone split), so the popcount cutoff has real margin.
+
+
+def _gradient_png() -> bytes:
+    buf = BytesIO()
+    Image.linear_gradient("L").resize((64, 64)).convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_solid_colour_avatar_is_not_hashable():
+    assert compute_pfp_hash_bytes(_flat_png((255, 0, 0))) is None
+    assert compute_pfp_hash_bytes(_flat_png((0, 0, 255))) is None
+    assert compute_pfp_hash_bytes(_flat_png((255, 255, 255))) is None
+
+
+def test_smooth_gradient_avatar_is_not_hashable():
+    """High pixel variance, still no phash signal — variance alone can't catch this."""
+    assert compute_pfp_hash_bytes(_gradient_png()) is None
+
+
+def test_structured_avatar_is_still_hashable():
+    assert compute_pfp_hash_bytes(_structured_png()) is not None
+
+
+def test_flat_avatar_yields_no_hash_variants():
+    assert compute_pfp_hash_variants_bytes(_flat_png((10, 200, 10))) == []
+
+
+def test_structured_avatar_still_yields_variants():
+    assert len(compute_pfp_hash_variants_bytes(_structured_png())) == 2
+
+
+def test_two_unrelated_flat_avatars_cannot_be_compared_at_all():
+    """The end-to-end false-ban path: distinct plain avatars must not match."""
+    admin_stored = compute_pfp_hash_bytes(_flat_png((255, 255, 255)))
+    suspect = compute_pfp_hash_variants_bytes(_flat_png((0, 0, 255)))
+    assert admin_stored is None
+    assert suspect == []
+    # With nothing to compare, the photo stage cannot produce a match.
+    match, _, _ = check_pfp_similarity(suspect, [h for h in [admin_stored] if h])
+    assert match is False
+
+
+def _almost_flat_png() -> bytes:
+    """
+    Visually flat but with a single dark pixel. This slips past the popcount
+    check (measured popcount 32) while carrying no distinguishing detail, so
+    the pixel-variance backstop is the only thing that rejects it. Guards
+    against that backstop being removed as redundant.
+    """
+    img = Image.new("RGB", (64, 64), (128, 128, 128))
+    img.putpixel((5, 5), (0, 0, 0))
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_visually_flat_avatar_with_a_single_mark_is_not_hashable():
+    assert compute_pfp_hash_bytes(_almost_flat_png()) is None
