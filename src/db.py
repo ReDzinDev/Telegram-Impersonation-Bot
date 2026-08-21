@@ -419,9 +419,13 @@ def upsert_group(group_id: int, title: str = None,
                         title          = COALESCE(EXCLUDED.title, groups.title),
                         updated_at     = NOW();
                 """, (group_id, title, log_channel_id))
+            updated = cur.rowcount
         conn.commit()
         _invalidate_group_cache(group_id)
-        return True
+        # rowcount 0 means no such group — the UPDATE matched nothing. Reporting
+        # that as success let admins believe a config change had applied while
+        # detection carried on with the old settings.
+        return updated > 0
     except Exception as e:
         logger.error(f"upsert_group error: {e}")
         conn.rollback()
@@ -483,9 +487,13 @@ def set_group_log_channel(group_id: int, log_channel_id: int | None) -> bool:
                 "UPDATE groups SET log_channel_id = %s, updated_at = NOW() WHERE group_id = %s",
                 (log_channel_id, group_id)
             )
+            updated = cur.rowcount
         conn.commit()
         _invalidate_group_cache(group_id)
-        return True
+        # rowcount 0 means no such group — the UPDATE matched nothing. Reporting
+        # that as success let admins believe a config change had applied while
+        # detection carried on with the old settings.
+        return updated > 0
     except Exception as e:
         logger.error(f"set_group_log_channel error: {e}")
         conn.rollback()
@@ -504,9 +512,13 @@ def set_group_action_mode(group_id: int, mode: str) -> bool:
                 "UPDATE groups SET action_mode = %s, updated_at = NOW() WHERE group_id = %s",
                 (mode, group_id)
             )
+            updated = cur.rowcount
         conn.commit()
         _invalidate_group_cache(group_id)
-        return True
+        # rowcount 0 means no such group — the UPDATE matched nothing. Reporting
+        # that as success let admins believe a config change had applied while
+        # detection carried on with the old settings.
+        return updated > 0
     except Exception as e:
         logger.error(f"set_group_action_mode error: {e}")
         conn.rollback()
@@ -1078,9 +1090,13 @@ def set_group_threshold(group_id: int, threshold: int) -> bool:
                 "UPDATE groups SET similarity_threshold = %s, updated_at = NOW() WHERE group_id = %s",
                 (threshold, group_id)
             )
+            updated = cur.rowcount
         conn.commit()
         _invalidate_group_cache(group_id)
-        return True
+        # rowcount 0 means no such group — the UPDATE matched nothing. Reporting
+        # that as success let admins believe a config change had applied while
+        # detection carried on with the old settings.
+        return updated > 0
     except Exception as e:
         logger.error(f"set_group_threshold error: {e}")
         conn.rollback()
@@ -1251,17 +1267,21 @@ def clear_whitelist(group_id: int) -> int:
 
 def mark_false_positive(
     group_id: int, user_id: int, cleared_by: int, days: int = 30
-) -> None:
+) -> bool:
     """
     Record a user as a confirmed false positive for this group.
     The bot will not re-flag this user for ``days`` days (default: 30).
     If the same user gets cleared again the window is reset.
+
+    Returns whether the record persisted. This used to return None, so the
+    "Unban + false positive" button could report success while the grace window
+    was never written and the next sweep re-banned the user.
     """
     from datetime import datetime, timedelta, timezone
     expires = datetime.now(timezone.utc) + timedelta(days=days)
     conn = get_connection()
     if not conn:
-        return
+        return False
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -1272,13 +1292,16 @@ def mark_false_positive(
                     cleared_at = NOW(),
                     expires_at = EXCLUDED.expires_at;
             """, (group_id, user_id, cleared_by, expires))
+            written = cur.rowcount
         conn.commit()
         # Drop the negative cache entry so a just-cleared user isn't re-flagged
         # from a stale `is_false_positive` result (cached for _FP_CACHE_TTL).
         _fp_cache.pop((group_id, user_id), None)
+        return written > 0
     except Exception as e:
         logger.error(f"mark_false_positive error: {e}")
         conn.rollback()
+        return False
     finally:
         put_connection(conn)
 
@@ -1340,9 +1363,13 @@ def set_group_thresholds(
                 f"UPDATE groups SET {', '.join(sets)}, updated_at = NOW() WHERE group_id = %s",
                 tuple(params),
             )
+            updated = cur.rowcount
         conn.commit()
         _invalidate_group_cache(group_id)
-        return True
+        # rowcount 0 means no such group — the UPDATE matched nothing. Reporting
+        # that as success let admins believe a config change had applied while
+        # detection carried on with the old settings.
+        return updated > 0
     except Exception as e:
         logger.error(f"set_group_thresholds error: {e}")
         conn.rollback()
@@ -1363,9 +1390,13 @@ def set_group_score_bands(group_id: int, ban_score: int, alert_score: int) -> bo
                 "WHERE group_id = %s",
                 (ban_score, alert_score, group_id),
             )
+            updated = cur.rowcount
         conn.commit()
         _invalidate_group_cache(group_id)
-        return True
+        # rowcount 0 means no such group — the UPDATE matched nothing. Reporting
+        # that as success let admins believe a config change had applied while
+        # detection carried on with the old settings.
+        return updated > 0
     except Exception as e:
         logger.error(f"set_group_score_bands error: {e}")
         conn.rollback()
@@ -1385,9 +1416,13 @@ def set_group_blocklist(group_id: int, enabled: bool) -> bool:
                 "UPDATE groups SET use_global_blocklist = %s, updated_at = NOW() WHERE group_id = %s",
                 (enabled, group_id),
             )
+            updated = cur.rowcount
         conn.commit()
         _invalidate_group_cache(group_id)
-        return True
+        # rowcount 0 means no such group — the UPDATE matched nothing. Reporting
+        # that as success let admins believe a config change had applied while
+        # detection carried on with the old settings.
+        return updated > 0
     except Exception as e:
         logger.error(f"set_group_blocklist error: {e}")
         conn.rollback()
