@@ -31,6 +31,8 @@ env/
 .env
 .env.local
 .env.*.local
+# Local docker-compose credentials (the .example template IS tracked)
+.env.dev
 
 # IDE
 .vscode/

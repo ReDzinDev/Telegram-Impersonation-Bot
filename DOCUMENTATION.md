@@ -629,6 +629,40 @@ Python 3.11+. Deployed on Railway via Docker; see `Dockerfile`, `start.sh`, `rai
 
 ---
 
+---
+
+## Local development
+
+`docker-compose.yml` runs the bot against a bundled Postgres. It is deliberately
+incapable of reaching production:
+
+```bash
+cp .env.dev.example .env.dev     # then set DEV_BOT_TOKEN to a throwaway bot
+docker compose --env-file .env.dev up --build
+```
+
+Every value the dev container receives is either a literal or comes from a
+`DEV_`-prefixed variable, and no production variable name appears in the file.
+That matters because Compose resolves `${VAR}` from a `.env` in the working
+directory — and the `.env` here holds live credentials. Previously the bot
+service referenced the production token, database URL **and MTProto session
+string** directly, so `docker compose up` started a second bot polling the live
+token (duplicate `getUpdates`, which is the `Conflict` the error handler warns
+about), writing to the live database, and holding the production user session.
+The bundled `postgres` service made it look safe: it existed, it was started via
+`depends_on`, and nothing pointed at it.
+
+`DEV_BOT_TOKEN` is required rather than defaulted, so a missing one makes Compose
+refuse to start with an explanation instead of booting a bot with an empty token.
+`DATABASE_URL` is a literal targeting the bundled service, so a dev container
+cannot be redirected at production by editing an env file. The MTProto watcher
+stays disabled unless you supply a throwaway account's session — a session string
+is a full credential for whatever account generated it.
+
+`tests/test_compose_safety.py` enforces these properties against the parsed
+document, so the guarantee cannot quietly regress.
+
+
 ## Behaviour changes from the hardening pass
 
 Read this before redeploying over an older version — several defaults changed
@@ -687,7 +721,8 @@ where an admin actually needs them.
 ├── README.md                 ← quick-start setup
 ├── INTERNAL_DOCS.md          ← older technical notes; THIS file is canonical
 ├── Dockerfile
-├── docker-compose.yml
+├── docker-compose.yml        ← LOCAL dev only; see Local development below
+├── .env.dev.example          ← template for the above (the real .env is prod)
 ├── railway.json
 ├── start.sh
 ├── requirements.txt

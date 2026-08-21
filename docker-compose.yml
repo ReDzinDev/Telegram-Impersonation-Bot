@@ -1,33 +1,75 @@
-# Docker Compose for local testing
-version: '3.8'
+# Local development only. This file is deliberately incapable of reaching
+# production.
+#
+# Compose interpolates ${VAR} from your shell environment OR from a .env file in
+# this directory — and the .env here holds live credentials. Referencing
+# ${BOT_TOKEN} therefore started a second bot polling the production token
+# (duplicate getUpdates, which is the Conflict src/main.py warns about), writing
+# to the production database, and holding the production MTProto user session.
+# Real bans, from a container someone spun up to try something out.
+#
+# So nothing here mentions a production variable name. Every value is either a
+# literal or comes from a DEV_-prefixed variable, and the token is required
+# rather than defaulted so a missing one fails loudly instead of booting a bot
+# with an empty string. Copy .env.dev.example to .env.dev and:
+#
+#     docker compose --env-file .env.dev up --build
 
 services:
   bot:
     build: .
     environment:
-      - BOT_TOKEN=${BOT_TOKEN}
-      - DATABASE_URL=${DATABASE_URL}
-      - LOG_CHANNEL_ID=${LOG_CHANNEL_ID}
-      - PYROGRAM_API_ID=${PYROGRAM_API_ID}
-      - PYROGRAM_API_HASH=${PYROGRAM_API_HASH}
-      - PYROGRAM_SESSION=${PYROGRAM_SESSION}
-      - NAME_SIMILARITY_THRESHOLD=${NAME_SIMILARITY_THRESHOLD:-85}
-      - PFP_HASH_THRESHOLD=${PFP_HASH_THRESHOLD:-10}
+      # Distinct name on purpose — see the note above. The `:?` form makes
+      # compose refuse to start, with this message, when it is unset.
+      BOT_TOKEN: ${DEV_BOT_TOKEN:?set DEV_BOT_TOKEN to a THROWAWAY bot token from @BotFather. Never reuse the production token — two pollers on one token fight over getUpdates.}
+
+      # Literal, pointing at the bundled service below. This used to be
+      # ${DATABASE_URL}, so the dev container wrote to the production database
+      # while a perfectly good local postgres sat unused beside it.
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/anti_impersonator_bot
+
+      # Optional, and empty by default. The MTProto watcher stays disabled
+      # unless you supply a throwaway account's session — the production session
+      # must never be handed to a dev container.
+      LOG_CHANNEL_ID: ${DEV_LOG_CHANNEL_ID:-}
+      PYROGRAM_API_ID: ${DEV_PYROGRAM_API_ID:-}
+      PYROGRAM_API_HASH: ${DEV_PYROGRAM_API_HASH:-}
+      PYROGRAM_SESSION: ${DEV_PYROGRAM_SESSION:-}
+
+      # Empty means cross-group ban propagation is off, which is what you want
+      # locally regardless.
+      BLOCKLIST_TRUSTED_GROUPS: ${DEV_BLOCKLIST_TRUSTED_GROUPS:-}
+
+      # Detection tuning is intentionally absent: the code defaults are
+      # validated at startup and documented in README, and passing the
+      # production values through would be another way for prod config to leak
+      # in. Override individually here if you are testing a threshold.
+
     depends_on:
-      - postgres
-    restart: unless-stopped
+      postgres:
+        # depends_on alone only waits for the container to START. Without the
+        # healthcheck below, the bot can race an unready database on first boot.
+        condition: service_healthy
+    # Matches railway.json's ON_FAILURE, so dev and prod fail the same way.
+    restart: on-failure
 
   postgres:
     image: postgres:15-alpine
     environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=anti_impersonator_bot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: anti_impersonator_bot
     ports:
+      # Exposed so you can psql into it from the host while debugging.
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d anti_impersonator_bot"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: on-failure
 
 volumes:
   postgres_data:
