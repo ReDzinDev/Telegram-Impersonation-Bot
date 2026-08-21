@@ -150,3 +150,53 @@ def test_homoglyph_flags_cyrillic_lookalike():
 
 def test_homoglyph_clean_ascii_is_safe():
     assert check_homoglyph_danger("Admin") is False
+
+
+# ── superset name matches (F-2) ───────────────────────────────────────────────
+#
+# fuzz.token_set_ratio returns 100 whenever one token set is a subset of the
+# other, no matter how many extra words the longer side carries. Taking that
+# score at face value means "John Smith Fan Club" is indistinguishable from
+# "John Smith" and lands in the ban band at full confidence.
+#
+# A superset match is still real evidence — "John Smith | Support" is textbook
+# impersonation — so the goal is not to reject it but to scale confidence with
+# how much unmatched text surrounds the borrowed name.
+
+WHITELIST_NAME = ["John Smith"]
+
+
+def test_exact_name_match_keeps_full_confidence():
+    match, matched, score = check_name_similarity("John Smith", WHITELIST_NAME, 85)
+    assert (match, matched, score) == (True, "John Smith", 100)
+
+
+def test_one_extra_token_stays_high_confidence():
+    """'John Smith Support' is impersonation-shaped and should still ban."""
+    match, _, score = check_name_similarity("John Smith Support", WHITELIST_NAME, 85)
+    assert match is True
+    assert score >= 90
+
+
+def test_two_extra_tokens_flag_but_below_ban_band():
+    """Enough signal to alert a human, not enough to ban unreviewed."""
+    match, _, score = check_name_similarity("John Smith Fan Club", WHITELIST_NAME, 85)
+    assert match is True
+    assert 85 <= score < 90
+
+
+def test_name_merely_mentioning_an_admin_is_not_flagged():
+    match, matched, score = check_name_similarity(
+        "I love John Smith memes", WHITELIST_NAME, 85
+    )
+    assert match is False
+    assert score < 85
+
+
+def test_superset_penalty_never_scores_below_plain_token_sort():
+    """The penalty is a ceiling adjustment, not a way to undercut the base score."""
+    from rapidfuzz import fuzz
+
+    target = "John Smith a b c d e f g h"
+    _, _, score = check_name_similarity(target, WHITELIST_NAME, 0)
+    assert score >= int(fuzz.token_sort_ratio(target.casefold(), "john smith"))

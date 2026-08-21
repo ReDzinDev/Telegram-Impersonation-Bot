@@ -47,10 +47,48 @@ def fold_text(s: str) -> str:
     return re.sub(r"\s+", " ", s.casefold()).strip()
 
 
+# Points deducted per unmatched token when one name's tokens are a strict
+# subset of the other's. token_set_ratio returns a flat 100 for that shape
+# regardless of how much extra text surrounds the borrowed name, which made
+# "John Smith Fan Club" score identically to "John Smith" and land in the ban
+# band at full confidence.
+#
+# 6 points per extra token produces a deliberate gradient against the default
+# bands (flag at 85, ban at 90):
+#
+#   "John Smith"          0 extra -> 100  ban    (exact)
+#   "John Smith Support"  1 extra ->  94  ban    (impersonation-shaped)
+#   "John Smith Fan Club" 2 extra ->  88  alert  (human reviews)
+#   "I love John Smith.." 3 extra ->  82  ignored
+#
+# Two extra tokens is where genuine impersonation ("John Smith | Support") and
+# innocent reference ("John Smith Fan Club") become structurally identical, so
+# that row alerts rather than acting — the safe outcome for both readings.
+# Retune this constant to move the boundary.
+_SUPERSET_TOKEN_PENALTY = 6
+
+
 def _name_score(a: str, b: str) -> int:
-    """Best of token_sort (order-insensitive) and token_set (subset-tolerant,
-    so 'John Smith | Support' still matches 'John Smith')."""
-    return int(max(fuzz.token_sort_ratio(a, b), fuzz.token_set_ratio(a, b)))
+    """
+    Best of token_sort (order-insensitive) and token_set (subset-tolerant, so
+    'John Smith | Support' still matches 'John Smith') — with the token_set
+    score scaled down by how many tokens went unmatched, so a name that merely
+    *contains* a whitelisted name cannot claim full confidence.
+    """
+    sort_score = fuzz.token_sort_ratio(a, b)
+    set_score = fuzz.token_set_ratio(a, b)
+
+    tokens_a, tokens_b = set(a.split()), set(b.split())
+    if tokens_a and tokens_b and (tokens_a < tokens_b or tokens_b < tokens_a):
+        # Strict subset: token_set_ratio is saturated at 100 by construction.
+        # Charge for the surrounding text, but never score worse than the
+        # plain token_sort comparison would have on its own.
+        extra_tokens = abs(len(tokens_b) - len(tokens_a))
+        set_score = max(
+            sort_score, set_score - _SUPERSET_TOKEN_PENALTY * extra_tokens
+        )
+
+    return int(max(sort_score, set_score))
 
 
 # Leetspeak / lookalike character folding for username comparison.
