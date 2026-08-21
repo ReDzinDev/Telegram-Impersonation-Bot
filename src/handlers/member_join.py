@@ -49,7 +49,7 @@ async def on_bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TY
                 group_pfp_hash = compute_pfp_hash_bytes(raw)
         except Exception:
             pass
-        upsert_group(chat.id, title=chat.title, pfp_hash=group_pfp_hash)
+        await run_db(upsert_group, chat.id, title=chat.title, pfp_hash=group_pfp_hash)
         logger.info(f"Bot added to group {chat.title} ({chat.id}) — registered.")
 
         log_channel = context.bot_data.get("log_channel_id") or LOG_CHANNEL_ID
@@ -111,7 +111,10 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
             is_bot=bool(user.is_bot),
         )
         await run_db(mark_seen, group_id, user.id)
-        logger.info(f"Auto-whitelisted promoted admin {user.full_name} ({user.id}) in group {group_id}.")
+        logger.info(
+            "Auto-whitelisted promoted admin.",
+            extra={"user_id": user.id, "group_id": group_id},
+        )
         return
 
     # Only continue for fresh joins (not kicks/unbans/demotions)
@@ -134,7 +137,10 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
     if update.chat_member.invite_link:
         invite_link = update.chat_member.invite_link.invite_link
 
-    logger.info(f"New member {user.full_name} ({user.id}) in group {group_id} — running check.")
+    logger.info(
+        "New member — running impersonation check.",
+        extra={"user_id": user.id, "group_id": group_id},
+    )
 
     # Fetch profile photo
     pfp_bytes = None

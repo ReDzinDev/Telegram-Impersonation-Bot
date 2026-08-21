@@ -4,11 +4,11 @@ import logging
 from typing import Optional
 from dotenv import load_dotenv
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-
+# No basicConfig here. A library module configuring root logging as an import
+# side effect meant whichever of config/main imported first won, and it
+# installed a stderr handler — which is what made every INFO line show up red
+# in Railway. Logging is set up once by src.utils.logging_setup.setup_logging(),
+# called from main before this module is imported.
 load_dotenv()
 
 

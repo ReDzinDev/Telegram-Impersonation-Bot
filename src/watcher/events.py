@@ -97,7 +97,18 @@ async def _handle_name_change(
     last_name = update.last_name or ""
     username = update.usernames[0].username if update.usernames else None
 
-    logger.info(f"Profile name change detected for user {user_id}: {first_name} {last_name} @{username}")
+    # The new name itself is personal data and is NOT logged — it belongs in
+    # the log-channel alert, which is the moderation surface, not in Railway's
+    # retained log stream. The redact filter cannot catch a bare name with no
+    # adjacent ID, so this has to be right at the call site.
+    logger.info(
+        "Profile name change detected.",
+        extra={
+            "user_id": user_id,
+            "has_username": bool(username),
+            "name_len": len(f"{first_name} {last_name or ''}".strip()),
+        },
+    )
 
     # Invalidate seen cache so RELAXED mode re-checks on next message
     for gid in group_ids:

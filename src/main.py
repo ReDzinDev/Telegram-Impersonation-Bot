@@ -5,6 +5,22 @@ import logging
 import signal
 from concurrent.futures import ThreadPoolExecutor
 
+# Configure logging BEFORE importing anything under src, so the import-time
+# messages src.config emits are formatted by our handler rather than by
+# logging's last-resort stderr fallback.
+from src.utils.logging_setup import setup_logging
+
+setup_logging(quiet=(
+    "httpx",
+    "httpcore",
+    "pyrogram",
+    "telegram.ext.Updater",
+    # psycopg_pool logs "connection requested"/"connection given" at INFO on
+    # EVERY borrow. A 1,000-member sweep emitted several thousand lines of it —
+    # real noise and real log-ingest cost.
+    "psycopg.pool",
+))
+
 from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, Update
 from telegram.error import TimedOut, NetworkError, Conflict
 from telegram.ext import (
@@ -31,20 +47,15 @@ from src.handlers.commands import (
 from src.handlers.member_join import check_impersonation, on_bot_added_to_group
 from src.handlers.messages import scan_message_sender
 
-# force=True makes this authoritative even though src.config also calls
-# basicConfig at import time (whichever ran first would otherwise win and the
-# two disagreed on level). Root at INFO so operators can see detection/sweep
-# activity in Railway logs; third-party libs are quieted to WARNING.
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-    force=True,
-)
+# Logging is configured by setup_logging() above, before the src imports.
+# Railway derives severity from the STREAM, not the text: stdout is info,
+# stderr is error. basicConfig's default handler writes to stderr, so every
+# INFO line the bot emitted arrived in Railway's error bucket — red, and
+# indistinguishable from a real failure. setup_logging puts a single handler on
+# stdout and, on Railway, emits one JSON object per line with an explicit
+# level, which is the only thing Railway trusts over the stream. That also
+# makes @level:error and @logger:<module> filtering work in the log explorer.
 logger = logging.getLogger(__name__)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("pyrogram").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext.Updater").setLevel(logging.WARNING)
 
 
 async def _db_keepalive(interval: int = 270) -> None:
