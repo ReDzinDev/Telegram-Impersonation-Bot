@@ -14,7 +14,7 @@ from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 
 from src.db import (
     get_whitelist, is_whitelisted, insert_log, get_group, get_reserved_keywords,
-    is_false_positive, mark_false_positive, get_known_bad_actor,
+    is_false_positive, get_known_bad_actor,
     DatabaseUnavailable, run_db,
 )
 from src.utils.detector import (

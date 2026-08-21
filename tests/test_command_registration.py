@@ -14,7 +14,6 @@ mechanical half of that drift can't recur.
 import pathlib
 import re
 
-import pytest
 from telegram.ext import CommandHandler
 
 

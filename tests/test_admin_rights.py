@@ -13,7 +13,6 @@ Two problems:
 """
 import time
 
-import pytest
 from telegram.constants import ChatMemberStatus
 
 from src.handlers import commands

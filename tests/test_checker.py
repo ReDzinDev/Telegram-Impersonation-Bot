@@ -7,7 +7,6 @@ asyncio.run() so no pytest-asyncio plugin is required.
 """
 import asyncio
 
-import pytest
 
 from src.utils import checker
 from src.utils.checker import UserSnapshot, check_user, ban_and_log
@@ -25,7 +24,7 @@ def _patch_db(monkeypatch, *, group=None, whitelist=None, keywords=None,
 
 
 def _snap(**kw):
-    base = dict(user_id=999, username=None, first_name="X", last_name=None)
+    base = {"user_id": 999, "username": None, "first_name": "X", "last_name": None}
     base.update(kw)
     return UserSnapshot(**base)
 

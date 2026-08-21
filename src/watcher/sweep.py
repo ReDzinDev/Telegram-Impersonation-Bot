@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from io import BytesIO
 from typing import Optional
 
 from pyrogram import Client
@@ -74,7 +73,7 @@ async def sweep_group(
             # isn't yet in Pyrogram's local cache.
             # Timeout prevents a Pyrogram network hang from holding the lock forever.
             await asyncio.wait_for(pyro.get_chat(group_id), timeout=30)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(f"Timeout resolving group {group_id} for sweep (>30s) — releasing lock.")
             return {"iterated": 0, "checked": 0, "flagged": 0, "errors": 1}
         except Exception as e:

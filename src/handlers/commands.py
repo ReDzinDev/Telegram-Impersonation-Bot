@@ -21,7 +21,7 @@ from src.db import (
     get_all_group_stats_windowed,
     mark_false_positive,
     set_group_thresholds, set_group_score_bands, set_group_blocklist,
-    add_known_bad_actor, get_known_bad_actor, remove_known_bad_actor,
+    add_known_bad_actor, remove_known_bad_actor,
 )
 from src.utils.image import compute_pfp_hash_bytes
 from src.config import (
@@ -31,6 +31,7 @@ from src.config import (
     DEFAULT_BAN_SCORE,
     DEFAULT_ALERT_SCORE,
 )
+from datetime import UTC
 
 logger = logging.getLogger(__name__)
 
@@ -2731,8 +2732,8 @@ async def clear_whitelist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
                 writer.writeheader()
                 writer.writerows(rows)
                 file_bytes = io.BytesIO(buf.getvalue().encode("utf-8"))
-                from datetime import datetime, timezone
-                stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+                from datetime import datetime
+                stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
                 fname = f"whitelist-backup-{group_id}-{stamp}.csv"
                 await context.bot.send_document(
                     chat_id=log_channel,

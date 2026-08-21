@@ -13,7 +13,6 @@ protected user's id, username and name.
 """
 import asyncio
 
-import pytest
 from telegram.constants import ChatMemberStatus, ChatType
 
 from src.handlers.commands import _verify_log_channel_target

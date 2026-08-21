@@ -14,7 +14,6 @@ exists, users were banned with NO alert and NO undo button — the admin saw onl
 """
 import asyncio
 
-import pytest
 
 from src.utils import checker
 from src.utils.checker import DetectionResult, UserSnapshot, resolve_log_channel

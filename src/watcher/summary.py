@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 
 from telegram import Bot
 
@@ -31,7 +31,7 @@ async def run_daily_summary(bot: Bot, log_channel_id: int):
     first_run = True
     while True:
         try:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             tomorrow_midnight = (now + timedelta(days=1)).replace(
                 hour=0, minute=0, second=0, microsecond=0
             )

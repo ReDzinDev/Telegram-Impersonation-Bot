@@ -160,7 +160,7 @@ def test_granted_calls_are_still_spaced_by_the_interval():
 
     stamps = asyncio.run(run())
     assert len(stamps) == 4
-    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    gaps = [b - a for a, b in zip(stamps, stamps[1:], strict=False)]
     assert all(g >= 0.12 for g in gaps), f"calls bunched up: {gaps}"
 
 

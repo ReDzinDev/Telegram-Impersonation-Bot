@@ -5,3 +5,37 @@ filterwarnings = [
     # pyrogram 2.0.x calls asyncio.get_event_loop() at import time.
     "ignore:There is no current event loop:DeprecationWarning",
 ]
+
+[tool.ruff]
+# Match the deployment target (Dockerfile uses python:3.11-slim), not whatever
+# the developer happens to have installed.
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E", "W",      # pycodestyle
+    "F",           # pyflakes — unused imports/names, undefined names
+    "B",           # bugbear — mutable defaults, except-pass, etc.
+    "ASYNC",       # blocking calls inside async functions (see R-1)
+    "RUF006",      # asyncio.create_task result not retained (see R-6)
+    "S102", "S307", "S608",   # exec, eval, SQL string building
+    "UP",          # pyupgrade
+    "C4",          # comprehension simplifications
+]
+ignore = [
+    "E501",   # line length: enforced loosely, many explanatory comments run long
+    "B008",   # function call in default arg — not a pattern used here
+    "UP045",  # Optional[X] over X | None: the codebase is consistent on Optional
+    "UP006",  # same, for Dict/List in older annotations
+    "UP035",  # deprecated typing imports, paired with the above
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests deliberately poke privates and build odd fixtures.
+"tests/*" = ["S101", "B011", "E402"]
+# main.py calls setup_logging() BEFORE importing anything under src, so that
+# config's import-time messages are formatted by our stdout handler rather than
+# logging's last-resort stderr fallback. The import order is the fix, not an
+# oversight — see the comment at the top of the file.
+"src/main.py" = ["E402"]

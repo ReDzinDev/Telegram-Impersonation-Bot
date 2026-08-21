@@ -50,7 +50,10 @@ def test_pyrogram_client_is_genuinely_not_deep_copyable(current_event_loop):
     from pyrogram import Client
 
     client = Client("probe", api_id=12345, api_hash="0" * 32, in_memory=True)
-    with pytest.raises(Exception):
+    # Pyrogram raises TypeError today ("cannot pickle '_queue.SimpleQueue'"), but
+    # the guarantee we depend on is only "not deep-copyable" — pinning the exact
+    # type would make this brittle across Pyrogram versions.
+    with pytest.raises((TypeError, ValueError, RecursionError)):
         copy.deepcopy(client)
 
 

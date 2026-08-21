@@ -77,7 +77,7 @@ async def run_health_check(pyro: Client, bot: Bot, log_channel_id: Optional[str]
                 report_flood(e.value)
                 await asyncio.sleep(min(e.value, 300))
                 continue
-            except (asyncio.TimeoutError, RPCError, OSError, ConnectionError) as e:
+            except (TimeoutError, RPCError, OSError, ConnectionError) as e:
                 if not unhealthy:
                     unhealthy = True
                     logger.warning(f"Pyrogram health probe failed: {e} (auto-reconnect pending).")

@@ -16,7 +16,6 @@ import asyncio
 import threading
 import time
 
-import pytest
 
 from src import db
 from src.utils import checker

@@ -19,9 +19,7 @@ monitored groups, we:
 """
 from __future__ import annotations
 
-import asyncio
 import logging
-from io import BytesIO
 from typing import TYPE_CHECKING
 
 from pyrogram import Client, raw
@@ -29,7 +27,7 @@ from telegram import Bot
 
 from src.config import NAME_CHANGE_VELOCITY_THRESHOLD, NAME_CHANGE_WINDOW_MINUTES
 from src.db import (
-    get_all_group_ids, get_group, get_watched_groups_for_user, unmark_seen,
+    get_group, get_watched_groups_for_user, unmark_seen,
     log_name_change, count_recent_name_changes, run_db, DatabaseUnavailable,
 )
 from src.utils.checker import UserSnapshot, check_user, ban_and_log

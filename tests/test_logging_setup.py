@@ -250,7 +250,7 @@ def test_importing_main_leaves_exactly_one_stdout_handler():
     # The import itself logs (config messages, the blocklist warning), so pick
     # out our marker line rather than assuming stdout starts with the numbers.
     marker = next(
-        l for l in proc.stdout.splitlines() if l.startswith("HANDLERS")
+        line for line in proc.stdout.splitlines() if line.startswith("HANDLERS")
     )
     total, on_stdout, on_stderr = map(int, marker.split()[1:4])
     assert total == 1, f"{total} root handlers after importing src.main"

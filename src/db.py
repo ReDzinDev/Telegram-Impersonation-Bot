@@ -3,10 +3,10 @@ import asyncio
 import threading
 import time
 import logging
-import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from src.config import DATABASE_URL, BLOCKLIST_TRUSTED_GROUPS
+from datetime import UTC
 
 logger = logging.getLogger(__name__)
 
@@ -1392,8 +1392,8 @@ def mark_false_positive(
     "Unban + false positive" button could report success while the grace window
     was never written and the next sweep re-banned the user.
     """
-    from datetime import datetime, timedelta, timezone
-    expires = datetime.now(timezone.utc) + timedelta(days=days)
+    from datetime import datetime, timedelta
+    expires = datetime.now(UTC) + timedelta(days=days)
     conn = get_connection()
     if not conn:
         return False
@@ -1474,8 +1474,14 @@ def set_group_thresholds(
         return False
     try:
         with conn.cursor() as cur:
+            # noqa justification: `sets` is built only from the two hardcoded
+            # literals above ("username_threshold = %s" / "name_threshold = %s").
+            # No caller data reaches the SQL text — every value is bound as a
+            # parameter. Ruff cannot see that, so this is a false positive, but
+            # keep the invariant in mind if another column is ever added here.
             cur.execute(
-                f"UPDATE groups SET {', '.join(sets)}, updated_at = NOW() WHERE group_id = %s",
+                f"UPDATE groups SET {', '.join(sets)}, updated_at = NOW() "  # noqa: S608
+                "WHERE group_id = %s",
                 tuple(params),
             )
             updated = cur.rowcount

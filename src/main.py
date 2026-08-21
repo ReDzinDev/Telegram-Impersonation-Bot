@@ -57,6 +57,13 @@ from src.handlers.messages import scan_message_sender
 # makes @level:error and @logger:<module> filtering work in the log explorer.
 logger = logging.getLogger(__name__)
 
+# asyncio holds only a WEAK reference to a bare create_task result, so a
+# fire-and-forget task can be garbage-collected before it ever runs. That is
+# unacceptable for the "a background task died" notification specifically: it is
+# the one operator-visible signal that protection has silently stopped. Tasks
+# live here until they finish. (ruff RUF006 flags exactly this pattern.)
+_background_notifications: set[asyncio.Task] = set()
+
 
 async def _db_keepalive(interval: int = 270) -> None:
     """
@@ -440,8 +447,13 @@ async def main():
                             parse_mode="HTML",
                         )
                     except Exception:
-                        pass
-                asyncio.create_task(_notify())
+                        logger.warning(
+                            f"Could not report death of '{_name}' to the log channel."
+                        )
+                notify_task = asyncio.create_task(_notify())
+                # Hold a strong reference until it completes, then let go.
+                _background_notifications.add(notify_task)
+                notify_task.add_done_callback(_background_notifications.discard)
         task.add_done_callback(_on_done)
 
     if pyro_client:

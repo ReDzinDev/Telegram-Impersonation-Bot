@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Match the deployment target: Dockerfile is python:3.11-slim.
+          # Testing on a different minor than we ship is how version-specific
+          # breakage reaches production unnoticed.
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint
+        # ASYNC catches blocking calls inside async functions and RUF006 catches
+        # un-retained create_task — both were real bugs in this codebase.
+        run: ruff check src/ tests/
+
+      - name: Tests
+        # No secrets needed: tests/conftest.py pins dummy config, and every DB
+        # call is monkeypatched at the src.db boundary.
+        run: pytest -q
+
+      - name: Type check (advisory)
+        continue-on-error: true
+        run: mypy --ignore-missing-imports src/
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        # Catches .dockerignore / Dockerfile breakage before a deploy does.
+        run: docker build -t anti-impersonator:ci .
+
+  lockfile:
+    # Advisory for now. A lockfile has to be resolved on 3.11 to be valid for the
+    # image, so it is generated here rather than on a developer machine.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pip-tools
+      - name: Resolve requirements.txt to pinned versions
+        run: pip-compile --generate-hashes --output-file=requirements.lock requirements.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: requirements-lock
+          path: requirements.lock

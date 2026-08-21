@@ -23,6 +23,119 @@ def _optional(name: str, default: Optional[str] = None) -> Optional[str]:
     return os.getenv(name, default)
 
 
+class ConfigError(Exception):
+    """
+    A configuration value is missing, unparseable, or out of range.
+
+    Raised instead of letting a bare `int()` fail mid-import. The old behaviour
+    was `ValueError: invalid literal for int() with base 10: 'eighty'` from
+    somewhere inside the import chain, naming neither the variable nor the
+    value — followed by ten Railway restarts and a permanently dead service.
+    """
+
+
+def _int_env(name: str, default: int, *, lo: int, hi: int) -> int:
+    """
+    Parse an integer env var, enforcing inclusive bounds.
+
+    Bounds are not decoration. SWEEP_INTERVAL_HOURS=0 turns the periodic task
+    into `asyncio.sleep(0)` and sweeps every group back-to-back forever, which
+    is how the userbot account earns a PEER_FLOOD — and that credential is the
+    expensive one to replace. A similarity threshold of 0 flags every user; one
+    over 100 flags nobody and says nothing about it.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ConfigError(
+            f"{name}={raw!r} is not a whole number (expected {lo}-{hi}, "
+            f"default {default})."
+        ) from None
+    if not (lo <= value <= hi):
+        raise ConfigError(
+            f"{name}={value} is out of range — must be between {lo} and {hi} "
+            f"(default {default})."
+        )
+    return value
+
+
+def _float_env(name: str, default: float, *, lo: float, hi: float) -> float:
+    """Parse a float env var, enforcing inclusive bounds."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ConfigError(
+            f"{name}={raw!r} is not a number (expected {lo}-{hi}, "
+            f"default {default})."
+        ) from None
+    if not (lo <= value <= hi):
+        raise ConfigError(
+            f"{name}={value} is out of range — must be between {lo} and {hi} "
+            f"(default {default})."
+        )
+    return value
+
+
+# name -> (default, lo, hi, parser). Bounds chosen from what the value does:
+# an interval must be long enough not to hammer Telegram, a similarity score is
+# a 1-100 percentage, and PFP_HASH_THRESHOLD is a Hamming distance over a
+# 64-bit hash — so 85 is not "strict", it disables photo discrimination.
+_NUMERIC_SETTINGS: dict[str, tuple] = {
+    "NAME_SIMILARITY_THRESHOLD":      (85,   1,   100, _int_env),
+    "USERNAME_SIMILARITY_THRESHOLD":  (88,   1,   100, _int_env),
+    "PFP_HASH_THRESHOLD":             (10,   0,    64, _int_env),
+    "DEFAULT_BAN_SCORE":              (90,   1,   100, _int_env),
+    "DEFAULT_ALERT_SCORE":            (78,   1,   100, _int_env),
+    "SWEEP_INTERVAL_HOURS":           (24,   1,   168, _int_env),
+    "SWEEP_HARD_CAP_SECONDS":         (7200, 60, 86400, _int_env),
+    "HEALTH_CHECK_INTERVAL":          (300,  30, 86400, _int_env),
+    "DB_KEEPALIVE_INTERVAL":          (270,  30, 86400, _int_env),
+    "NAME_CHANGE_VELOCITY_THRESHOLD": (3,    1,   100, _int_env),
+    "NAME_CHANGE_WINDOW_MINUTES":     (60,   1,  1440, _int_env),
+    "BIO_FETCH_MIN_INTERVAL":         (1.2,  0.0, 60.0, _float_env),
+    "PFP_FETCH_MIN_INTERVAL":         (0.7,  0.0, 60.0, _float_env),
+}
+
+
+def load_settings() -> dict:
+    """
+    Parse and validate every numeric setting, reporting ALL problems at once.
+
+    Aggregating matters: fixing configuration one crash-loop at a time is
+    miserable, and on Railway each attempt costs a restart from a budget of ten.
+    """
+    values: dict[str, float | int] = {}
+    problems: list[str] = []
+
+    for name, (default, lo, hi, parser) in _NUMERIC_SETTINGS.items():
+        try:
+            values[name] = parser(name, default, lo=lo, hi=hi)
+        except ConfigError as e:
+            problems.append(str(e))
+            values[name] = default      # keep going to collect the rest
+
+    # Cross-field check: with alert above ban the mid band is empty, so nothing
+    # ever downgrades to an alert and every match either bans or is ignored.
+    if values["DEFAULT_ALERT_SCORE"] > values["DEFAULT_BAN_SCORE"]:
+        problems.append(
+            f"DEFAULT_ALERT_SCORE={values['DEFAULT_ALERT_SCORE']} is above "
+            f"DEFAULT_BAN_SCORE={values['DEFAULT_BAN_SCORE']} — the alert band "
+            "would be empty, so nothing could ever be downgraded to an alert."
+        )
+
+    if problems:
+        raise ConfigError(
+            "Invalid configuration:\n  - " + "\n  - ".join(problems)
+        )
+    return values
+
+
 def _parse_group_ids(raw: Optional[str]) -> frozenset[int]:
     """Parse a comma-separated list of group IDs, ignoring junk entries."""
     if not raw:
@@ -69,12 +182,18 @@ PYROGRAM_SESSION: Optional[str] = _optional("PYROGRAM_SESSION")  # session strin
 
 PYROGRAM_ENABLED = bool(PYROGRAM_API_ID and PYROGRAM_API_HASH and PYROGRAM_SESSION)
 
+# All numeric settings are parsed and range-checked in one pass, so a typo or a
+# nonsense value fails at startup with every problem named at once instead of
+# crash-looping on the first bad cast.
+_SETTINGS = load_settings()
+
 # Default detection thresholds (can be tuned via env, overridable per-group in DB)
-NAME_SIMILARITY_THRESHOLD = int(_optional("NAME_SIMILARITY_THRESHOLD", "85"))
+NAME_SIMILARITY_THRESHOLD = _SETTINGS["NAME_SIMILARITY_THRESHOLD"]
 # Usernames are more structured than display names, so they tolerate a
 # stricter match before we call it impersonation.
-USERNAME_SIMILARITY_THRESHOLD = int(_optional("USERNAME_SIMILARITY_THRESHOLD", "88"))
-PFP_HASH_THRESHOLD = int(_optional("PFP_HASH_THRESHOLD", "10"))
+USERNAME_SIMILARITY_THRESHOLD = _SETTINGS["USERNAME_SIMILARITY_THRESHOLD"]
+# NOTE: a Hamming distance over a 64-bit hash, NOT a percentage.
+PFP_HASH_THRESHOLD = _SETTINGS["PFP_HASH_THRESHOLD"]
 
 # ── Severity score bands ────────────────────────────────────────────────────
 # A flagged similarity match carries a 0-100 confidence score. Score bands turn
@@ -84,8 +203,8 @@ PFP_HASH_THRESHOLD = int(_optional("PFP_HASH_THRESHOLD", "10"))
 #   below                        → ignore
 # Keyword / pfp / group-identity matches are high-confidence by construction and
 # always treated as ban-band (see checker.ban_and_log). Overridable per-group.
-DEFAULT_BAN_SCORE   = int(_optional("DEFAULT_BAN_SCORE", "90"))
-DEFAULT_ALERT_SCORE = int(_optional("DEFAULT_ALERT_SCORE", "78"))
+DEFAULT_BAN_SCORE   = _SETTINGS["DEFAULT_BAN_SCORE"]
+DEFAULT_ALERT_SCORE = _SETTINGS["DEFAULT_ALERT_SCORE"]
 
 # ── Cross-group blocklist trust ─────────────────────────────────────────────
 # known_bad_actors is a GLOBAL table consulted for every non-whitelisted user,
@@ -106,12 +225,12 @@ BLOCKLIST_TRUSTED_GROUPS: frozenset[int] = _parse_group_ids(
 )
 
 # ── Background-task cadence (formerly magic numbers scattered across modules) ──
-SWEEP_INTERVAL_HOURS           = int(_optional("SWEEP_INTERVAL_HOURS", "24"))
-SWEEP_HARD_CAP_SECONDS         = int(_optional("SWEEP_HARD_CAP_SECONDS", "7200"))
-HEALTH_CHECK_INTERVAL          = int(_optional("HEALTH_CHECK_INTERVAL", "300"))
-DB_KEEPALIVE_INTERVAL          = int(_optional("DB_KEEPALIVE_INTERVAL", "270"))
-NAME_CHANGE_VELOCITY_THRESHOLD = int(_optional("NAME_CHANGE_VELOCITY_THRESHOLD", "3"))
-NAME_CHANGE_WINDOW_MINUTES     = int(_optional("NAME_CHANGE_WINDOW_MINUTES", "60"))
+SWEEP_INTERVAL_HOURS           = _SETTINGS["SWEEP_INTERVAL_HOURS"]
+SWEEP_HARD_CAP_SECONDS         = _SETTINGS["SWEEP_HARD_CAP_SECONDS"]
+HEALTH_CHECK_INTERVAL          = _SETTINGS["HEALTH_CHECK_INTERVAL"]
+DB_KEEPALIVE_INTERVAL          = _SETTINGS["DB_KEEPALIVE_INTERVAL"]
+NAME_CHANGE_VELOCITY_THRESHOLD = _SETTINGS["NAME_CHANGE_VELOCITY_THRESHOLD"]
+NAME_CHANGE_WINDOW_MINUTES     = _SETTINGS["NAME_CHANGE_WINDOW_MINUTES"]
 
 # ── MTProto fetch pacing ────────────────────────────────────────────────────
 # Minimum seconds between users.GetFullUser calls (bio fetches) and between
@@ -119,5 +238,5 @@ NAME_CHANGE_WINDOW_MINUTES     = int(_optional("NAME_CHANGE_WINDOW_MINUTES", "60
 # staying under Telegram's sustained budget beats discovering it via
 # FloodWait. On a flood the pacer in src.watcher.fetch ratchets the interval
 # up automatically, so these only need to be roughly right.
-BIO_FETCH_MIN_INTERVAL = float(_optional("BIO_FETCH_MIN_INTERVAL", "1.2"))
-PFP_FETCH_MIN_INTERVAL = float(_optional("PFP_FETCH_MIN_INTERVAL", "0.7"))
+BIO_FETCH_MIN_INTERVAL = _SETTINGS["BIO_FETCH_MIN_INTERVAL"]
+PFP_FETCH_MIN_INTERVAL = _SETTINGS["PFP_FETCH_MIN_INTERVAL"]

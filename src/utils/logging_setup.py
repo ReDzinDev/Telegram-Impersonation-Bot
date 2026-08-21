@@ -39,7 +39,7 @@ import os
 import re
 import sys
 from collections.abc import Iterable
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
 # ── Redaction ────────────────────────────────────────────────────────────────
 
@@ -123,7 +123,7 @@ class RailwayJsonFormatter(logging.Formatter):
             "message": record.getMessage(),
             "logger": record.name,
             "ts": datetime.fromtimestamp(
-                record.created, timezone.utc
+                record.created, UTC
             ).isoformat(timespec="milliseconds"),
         }
         if record.exc_info:
