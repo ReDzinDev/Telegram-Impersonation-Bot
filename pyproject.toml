@@ -33,7 +33,8 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 # Tests deliberately poke privates and build odd fixtures.
-"tests/*" = ["S101", "B011", "E402"]
+# S608: tests assert on the TEXT of SQL statements; they do not build queries.
+"tests/*" = ["S101", "B011", "E402", "S608"]
 # main.py calls setup_logging() BEFORE importing anything under src, so that
 # config's import-time messages are formatted by our stdout handler rather than
 # logging's last-resort stderr fallback. The import order is the fix, not an

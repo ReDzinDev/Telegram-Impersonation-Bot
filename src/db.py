@@ -381,6 +381,38 @@ def init_db():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_aa_group ON admin_actions(group_id, created_at DESC);")
 
+            # Retention predicates. Each purge DELETE filters on a timestamp
+            # ALONE, and a composite index on (group_id, <ts>) cannot serve
+            # that — a btree can't range-scan its trailing column — so every
+            # pass was a sequential scan of the whole table.
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_logs_created ON logs(created_at);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sweep_created ON sweep_runs(created_at);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ncl_changed ON name_change_log(changed_at);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fp_expires ON false_positives(expires_at);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_seen_checked ON seen_members(last_checked_at);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_aa_created ON admin_actions(created_at);"
+            )
+
+            # seen_members is filtered by user_id alone on EVERY raw profile
+            # update (get_watched_groups_for_user), but the table had only its
+            # composite primary key (group_id, user_id) — whose trailing column
+            # a btree cannot range-scan. That query was a full scan on a table
+            # that, until now, was never purged either.
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_seen_user ON seen_members(user_id);"
+            )
+
             # Group identity: store the group's own PFP hash for detecting
             # users who impersonate the group itself.
             cur.execute("""
@@ -1081,7 +1113,12 @@ def record_sweep_run(
         put_connection(conn)
 
 
-def purge_old_records(logs_days: int = 90, sweeps_days: int = 90) -> dict:
+def purge_old_records(
+    logs_days: int = 90,
+    sweeps_days: int = 90,
+    seen_days: int = 180,
+    actions_days: int = 365,
+) -> dict:
     """
     Delete rows that only matter for a bounded window, so the (small, Railway
     Hobby) Postgres disk doesn't grow without bound. Returns a per-table count
@@ -1090,8 +1127,20 @@ def purge_old_records(logs_days: int = 90, sweeps_days: int = 90) -> dict:
       name_change_log  — only queried over a ~60-minute velocity window
       false_positives  — expired grace records
       logs / sweep_runs — older than the retention window
+      seen_members     — a "already checked" marker; dropping an old one just
+                         means that member gets re-screened once, which is the
+                         safe direction. This table had NO purge at all and
+                         grows by one row per (group, user) forever
+      admin_actions    — append-only audit trail, kept a year
+
+    Every predicate here is indexed (see init_db); without those indexes each
+    pass was a sequential scan, because a composite index on
+    (group_id, created_at) cannot serve a query filtering on created_at alone.
     """
-    deleted = {"name_change_log": 0, "false_positives": 0, "logs": 0, "sweep_runs": 0}
+    deleted = {
+        "name_change_log": 0, "false_positives": 0, "logs": 0,
+        "sweep_runs": 0, "seen_members": 0, "admin_actions": 0,
+    }
     conn = get_connection()
     if not conn:
         return deleted
@@ -1113,8 +1162,20 @@ def purge_old_records(logs_days: int = 90, sweeps_days: int = 90) -> dict:
                 {"d": sweeps_days},
             )
             deleted["sweep_runs"] = cur.rowcount or 0
+            cur.execute(
+                "DELETE FROM seen_members "
+                "WHERE last_checked_at < NOW() - (%(d)s * INTERVAL '1 day')",
+                {"d": seen_days},
+            )
+            deleted["seen_members"] = cur.rowcount or 0
+            cur.execute(
+                "DELETE FROM admin_actions "
+                "WHERE created_at < NOW() - (%(d)s * INTERVAL '1 day')",
+                {"d": actions_days},
+            )
+            deleted["admin_actions"] = cur.rowcount or 0
         conn.commit()
-        logger.info(f"Retention purge: {deleted}")
+        logger.info("Retention purge complete.", extra=deleted)
     except Exception as e:
         logger.error(f"purge_old_records error: {e}", exc_info=True)
         conn.rollback()

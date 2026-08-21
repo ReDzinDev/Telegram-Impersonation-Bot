@@ -33,7 +33,10 @@ from src.config import (
     PYROGRAM_API_ID, PYROGRAM_API_HASH, PYROGRAM_SESSION, PYROGRAM_ENABLED,
     BLOCKLIST_TRUSTED_GROUPS,
 )
-from src.db import init_db, get_connection, put_connection, DB_POOL_MAX_SIZE
+from src.db import (
+    init_db, get_connection, put_connection, purge_old_records, run_db,
+    DB_POOL_MAX_SIZE,
+)
 from src.handlers.commands import (
     start, handle_chat_shared, import_admins, whitelist_user,
     unwhitelist_user, ban_user, unban_user,
@@ -96,6 +99,35 @@ async def _db_keepalive(interval: int = 270) -> None:
         except Exception as e:
             logger.exception(f"DB keep-alive loop body crashed: {e}")
             await asyncio.sleep(30)
+
+
+async def _retention_loop(interval_hours: int = 24) -> None:
+    """
+    Delete rows past their retention window, forever, on its own schedule.
+
+    This used to live inside run_daily_summary — and main() only creates that
+    task `if LOG_CHANNEL_ID`. So on a deployment where every group sets its own
+    /setlogchannel and no global channel exists, retention NEVER RAN and logs,
+    sweep_runs, name_change_log, false_positives, seen_members and admin_actions
+    grew without bound on a Hobby-tier disk. Housekeeping the database must not
+    depend on whether Telegram notifications are configured.
+
+    Runs off the event loop, since the DELETEs are blocking psycopg. The first
+    pass is delayed by one interval so it never competes with startup.
+    """
+    while True:
+        try:
+            await asyncio.sleep(interval_hours * 3600)
+            deleted = await run_db(purge_old_records)
+            if any(deleted.values()):
+                logger.info("Retention purge removed old rows.", extra=deleted)
+            else:
+                logger.debug("Retention purge: nothing to remove.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception(f"Retention loop crashed: {e}")
+            await asyncio.sleep(3600)
 
 
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -470,6 +502,10 @@ async def main():
     keepalive_task = asyncio.create_task(_db_keepalive())
     _supervise("db_keepalive", keepalive_task)
 
+    # Retention — unconditional, unlike the daily summary it used to hide in.
+    retention_task = asyncio.create_task(_retention_loop())
+    _supervise("retention", retention_task)
+
     summary_task = None
     if LOG_CHANNEL_ID:
         from src.watcher.summary import run_daily_summary
@@ -491,7 +527,7 @@ async def main():
         except Exception as e:
             logger.warning(f"updater.stop() failed: {e}")
 
-        tasks = [keepalive_task]
+        tasks = [keepalive_task, retention_task]
         if summary_task:
             tasks.append(summary_task)
         if pyro_client:
