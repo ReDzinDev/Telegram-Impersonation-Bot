@@ -458,6 +458,7 @@ PostgreSQL, accessed via psycopg v3 with `dict_row` row factory. All tables are 
 | `false_positives` | 30-day grace windows | `(group_id, user_id) PK`, `cleared_by`, `cleared_at`, `expires_at` |
 | `sweep_runs` | Per-sweep results | `id PK`, `group_id`, `iterated`, `checked`, `flagged`, `errors`, `trigger`, `created_at` |
 | `known_bad_actors` | Cross-group blocklist | `user_id PK`, `username`, `full_name`, `reason`, `ban_count`, `confirmed_by`, `source_group_id`, `first_seen_at`, `last_seen_at` |
+| `schema_migrations` | Ledger of applied one-time DATA migrations | `name PK`, `applied_at` |
 
 #### Notes on two columns that surprise people
 
@@ -472,9 +473,20 @@ checked or a group listed in `BLOCKLIST_TRUSTED_GROUPS`. Anything else is
 advisory: it raises an alert but never bans on its own. Contribution is
 restricted to trusted groups for the same reason.
 
-`logs.similarity_score` holds a 0-100 confidence for name and username matches,
-but a **Hamming distance** (lower is better) for photo matches — the two are not
-comparable in a single query.
+`logs.similarity_score` is a 0-100 confidence for **every** match type. Photo
+matches used to store the raw phash Hamming distance here instead — 0-64, where
+lower means closer — so a byte-identical photo was recorded and displayed as
+`Score: 0`, and any aggregate over the column mixed two opposite scales. The raw
+distance now lives on `DetectionResult.pfp_distance` and is shown alongside the
+confidence in the alert ("Score: 84 (photo distance 10/64)"). A one-time
+migration converts historical rows.
+
+`schema_migrations` exists because *data* migrations are not idempotent the way
+`ADD COLUMN IF NOT EXISTS` is. The cautionary tale is the `is_bot` backfill,
+which ran unguarded on every boot: `/import_admins` would correctly mark a human
+whose handle ends in "bot" (@talbot, @abbot) as human, and the next redeploy
+flipped them back — permanently, in a loop. One-time data migrations now go
+through `_run_once`.
 
 ### `user_type` values
 

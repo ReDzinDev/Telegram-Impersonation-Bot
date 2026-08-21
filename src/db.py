@@ -44,6 +44,32 @@ def _stale_or_raise(cache: dict, key, what: str):
     raise DatabaseUnavailable(f"{what} unavailable for {key} and nothing cached")
 
 
+def _run_once(cur, name: str, statements) -> bool:
+    """
+    Apply a one-time DATA migration, at most once per database.
+
+    Schema changes are safely idempotent (`ADD COLUMN IF NOT EXISTS`), but data
+    migrations are not, and this codebase had no way to say so. The is_bot
+    backfill is the cautionary tale: an unguarded
+    `UPDATE ... WHERE lower(username) LIKE '%bot'` that re-ran on EVERY boot, so
+    /import_admins would correctly mark a human named @talbot as human and the
+    next redeploy flipped them back to a bot — permanently, in a loop.
+
+    Returns True if the migration ran this time.
+    """
+    cur.execute("SELECT 1 FROM schema_migrations WHERE name = %s", (name,))
+    if cur.fetchone():
+        return False
+    for sql in ([statements] if isinstance(statements, str) else statements):
+        cur.execute(sql)
+    cur.execute(
+        "INSERT INTO schema_migrations (name) VALUES (%s) ON CONFLICT DO NOTHING",
+        (name,),
+    )
+    logger.info(f"Applied one-time data migration: {name}")
+    return True
+
+
 # ── Connection pool ──────────────────────────────────────────────────────────
 # Previously every DB call opened a fresh psycopg connection; a 1,000-member
 # sweep meant 2,000+ TCP+TLS handshakes. A process-wide pool reuses a handful
@@ -205,6 +231,15 @@ def init_db():
 
     try:
         with conn.cursor() as cur:
+            # Ledger of applied one-time DATA migrations. Must exist before any
+            # _run_once call below.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    name       TEXT PRIMARY KEY,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS groups (
                     group_id    BIGINT PRIMARY KEY,
@@ -269,7 +304,11 @@ def init_db():
                 ALTER TABLE whitelisted_users
                     ADD COLUMN IF NOT EXISTS is_bot BOOLEAN NOT NULL DEFAULT FALSE;
             """)
-            cur.execute("""
+            # Guarded: this used to run on every boot, so a human whose handle
+            # ends in "bot" (@talbot, @abbot, @robot) was permanently
+            # reclassified after each redeploy no matter how often
+            # /import_admins corrected them.
+            _run_once(cur, "backfill_is_bot_from_username", """
                 UPDATE whitelisted_users
                    SET is_bot = TRUE
                  WHERE is_bot = FALSE
@@ -388,6 +427,20 @@ def init_db():
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_logs_created ON logs(created_at);"
             )
+
+            # One-time: historical `pfp` / `group_pfp` rows stored the raw phash
+            # Hamming DISTANCE (0-64, lower = closer) in similarity_score, while
+            # every other row stored a 0-100 confidence. Same column, opposite
+            # scales — so a byte-identical photo read as "0" and any average over
+            # the column was meaningless. Convert with the same formula
+            # checker.pfp_confidence now uses.
+            _run_once(cur, "convert_pfp_distance_to_confidence", """
+                UPDATE logs
+                   SET similarity_score = ROUND(100 * (1 - similarity_score / 64.0))
+                 WHERE detection_type IN ('pfp', 'group_pfp')
+                   AND similarity_score IS NOT NULL
+                   AND similarity_score <= 64;
+            """)
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_sweep_created ON sweep_runs(created_at);"
             )

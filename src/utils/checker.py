@@ -51,6 +51,25 @@ class UserSnapshot:
     bio: Optional[str] = None           # Telegram bio / about text (Pyrogram only)
 
 
+# A phash is 64 bits, so the Hamming distance between two of them runs 0-64.
+_PHASH_BITS = 64
+
+
+def pfp_confidence(distance: int) -> int:
+    """
+    Convert a phash Hamming distance into a 0-100 confidence.
+
+    DetectionResult.score used to carry the raw distance for photo matches —
+    0-64, where LOWER means more similar — while every other match type carried
+    a 0-100 similarity where HIGHER means more similar. Both went into the same
+    logs.similarity_score column and the same alert template, so a byte-identical
+    photo displayed as "Score: 0" to the admin deciding whether to keep the ban,
+    and any query over that column averaged two opposite scales together.
+    """
+    clamped = max(0, min(_PHASH_BITS, int(distance)))
+    return round(100 * (1 - clamped / _PHASH_BITS))
+
+
 @dataclass
 class DetectionResult:
     flagged: bool
@@ -65,6 +84,10 @@ class DetectionResult:
     # that came from outside this group's authority (see the cross-group
     # blocklist), which must not be able to execute a ban on its own.
     advisory: bool = False
+    # Raw phash Hamming distance (0-64) for photo-based matches, kept beside the
+    # confidence rather than inside `score`. Useful to a reviewing admin — "how
+    # close was it?" — without overloading a field that means something else.
+    pfp_distance: Optional[int] = None
 
 
 async def check_user(
@@ -238,8 +261,11 @@ def _check_user_sync(
                     if pfp_match:
                         target = _find_by_pfp(others, pfp_matched_val)
                         return DetectionResult(
-                            flagged=True, match_type="pfp", matched_val=pfp_matched_val,
-                            score=pfp_dist, **_target_fields(target)
+                            flagged=True, match_type="pfp",
+                            matched_val=pfp_matched_val,
+                            score=pfp_confidence(pfp_dist),
+                            pfp_distance=int(pfp_dist),
+                            **_target_fields(target)
                         )
 
     # 5 — Group identity: catch users impersonating the group itself.
@@ -277,7 +303,9 @@ def _check_user_sync(
                     if g_pfp_match:
                         return DetectionResult(
                             flagged=True, match_type="group_pfp",
-                            matched_val=group_title, score=g_pfp_dist,
+                            matched_val=group_title,
+                            score=pfp_confidence(g_pfp_dist),
+                            pfp_distance=int(g_pfp_dist),
                             target_name=f"[Group] {group_title}",
                         )
 
@@ -430,6 +458,14 @@ async def ban_and_log(
             else f"<b>Match:</b> <code>{html.escape(str(result.matched_val))}</code>\n"
         )
 
+        # For a photo match, show how close it actually was. The confidence
+        # alone hides the thing an admin wants when reviewing: "was this the
+        # same image, or merely a similar one?"
+        score_detail = (
+            f" <i>(photo distance {result.pfp_distance}/{_PHASH_BITS})</i>"
+            if result.pfp_distance is not None else ""
+        )
+
         log_msg = (
             f"🚨 <b>Impersonation Detected</b>\n\n"
             f"<b>Group ID:</b> <code>{group_id}</code>\n"
@@ -437,7 +473,7 @@ async def ban_and_log(
             f"<b>{reason_label}:</b> {reason_value}\n"
             f"<b>Method:</b> {result.match_type}\n"
             f"{match_line}"
-            f"<b>Score:</b> <code>{result.score}</code>\n"
+            f"<b>Score:</b> <code>{result.score}</code>{score_detail}\n"
             f"<b>Trigger:</b> {trigger}\n"
             f"<b>Invite link:</b> {invite_link or 'N/A'}\n"
             f"<b>Action:</b> {action}"
