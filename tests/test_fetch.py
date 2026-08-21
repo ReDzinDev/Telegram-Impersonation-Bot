@@ -146,22 +146,39 @@ def test_max_wait_bounds_every_granted_caller():
 
 
 def test_granted_calls_are_still_spaced_by_the_interval():
-    """The ceiling fix must not turn the pacer into a free-for-all."""
+    """
+    The ceiling fix must not turn the pacer into a free-for-all.
+
+    Asserts the total SPAN rather than each individual gap. Per-gap wall-clock
+    is flaky on a loaded machine: if the event loop is starved, several callers
+    wake late and land almost together, compressing an individual gap even
+    though the pacer allotted them correctly. The span is safe in this direction
+    because scheduling delay can only ever push a call later than its reserved
+    slot, never earlier — so a span at least (n-1) * interval proves the slots
+    really were spaced.
+    """
+    interval = 0.15
+    callers = 4
+
     async def run():
-        p = _Pacer("t", 0.15)
+        p = _Pacer("t", interval)
         stamps = []
 
         async def caller():
             if await p.acquire(max_wait=5):
                 stamps.append(time.monotonic())
 
-        await asyncio.gather(*(caller() for _ in range(4)))
+        await asyncio.gather(*(caller() for _ in range(callers)))
         return sorted(stamps)
 
     stamps = asyncio.run(run())
-    assert len(stamps) == 4
-    gaps = [b - a for a, b in zip(stamps, stamps[1:], strict=False)]
-    assert all(g >= 0.12 for g in gaps), f"calls bunched up: {gaps}"
+    assert len(stamps) == callers
+    span = stamps[-1] - stamps[0]
+    expected = (callers - 1) * interval
+    assert span >= expected * 0.8, (
+        f"calls bunched up: {span:.3f}s span across {callers} callers, "
+        f"expected at least {expected:.3f}s"
+    )
 
 
 def test_a_flood_recorded_while_waiting_is_respected():

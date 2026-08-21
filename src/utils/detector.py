@@ -1,9 +1,12 @@
 
+import logging
 import re
 import unicodedata
 from rapidfuzz import fuzz, process
 from typing import List, Tuple, Optional
 from confusable_homoglyphs import confusables
+
+logger = logging.getLogger(__name__)
 
 _ASCII_ALNUM = frozenset("abcdefghijklmnopqrstuvwxyz"
                          "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
