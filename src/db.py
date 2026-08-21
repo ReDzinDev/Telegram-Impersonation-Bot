@@ -507,6 +507,24 @@ def init_db():
                 "CREATE INDEX IF NOT EXISTS idx_sweep_group ON sweep_runs(group_id, created_at DESC);"
             )
 
+            # A sweep that stopped early, or skipped bio/photo screening for
+            # some members, is not the same as a complete one. record_sweep_run
+            # used to drop these, so /stats and the daily digest counted a
+            # 12%-coverage run as a full pass — throwing the honest reporting
+            # away exactly where it becomes the long-term record.
+            cur.execute("""
+                ALTER TABLE sweep_runs
+                    ADD COLUMN IF NOT EXISTS partial BOOLEAN NOT NULL DEFAULT FALSE;
+            """)
+            cur.execute("""
+                ALTER TABLE sweep_runs
+                    ADD COLUMN IF NOT EXISTS bios_skipped INTEGER NOT NULL DEFAULT 0;
+            """)
+            cur.execute("""
+                ALTER TABLE sweep_runs
+                    ADD COLUMN IF NOT EXISTS pfps_skipped INTEGER NOT NULL DEFAULT 0;
+            """)
+
             # Cross-group blocklist: confirmed bad actors shared across every
             # group the bot manages. Populated only by HUMAN-confirmed bans
             # (manual /ban, alert-escalation ban). A group with
@@ -1145,19 +1163,32 @@ def get_recent_activity(group_id: int, hours: int = 24) -> dict:
 
 def record_sweep_run(
     group_id: int, iterated: int, checked: int, flagged: int, errors: int,
-    trigger: str = "auto",
+    trigger: str = "auto", partial: bool = False,
+    bios_skipped: int = 0, pfps_skipped: int = 0,
 ) -> None:
-    """Persist the result of one sweep_group() call so we can show
-    'sweeps in the last 24h / 30d' and a per-run summary."""
+    """
+    Persist the result of one sweep_group() call so we can show
+    'sweeps in the last 24h / 30d' and a per-run summary.
+
+    partial / bios_skipped / pfps_skipped are the caveats. They used to be
+    dropped here, so a run that covered 12% of a group before hitting the time
+    cap was recorded — and counted by /stats and the daily digest — as an
+    ordinary complete sweep. The honest reporting existed in the immediate reply
+    and was thrown away at exactly the point where it becomes the record an
+    operator later trusts.
+    """
     conn = get_connection()
     if not conn:
         return
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO sweep_runs (group_id, iterated, checked, flagged, errors, trigger)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (group_id, iterated, checked, flagged, errors, trigger))
+                INSERT INTO sweep_runs
+                    (group_id, iterated, checked, flagged, errors, trigger,
+                     partial, bios_skipped, pfps_skipped)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (group_id, iterated, checked, flagged, errors, trigger,
+                  bool(partial), int(bios_skipped), int(pfps_skipped)))
         conn.commit()
     except Exception as e:
         logger.error(f"record_sweep_run error: {e}")

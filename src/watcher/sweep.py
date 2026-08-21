@@ -12,6 +12,7 @@ Called from:
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import time
 from typing import Optional
@@ -67,6 +68,7 @@ async def sweep_group(
         iterated = 0   # every member the loop touches (including admins, bots, whitelisted)
         partial  = False  # True if the sweep stopped before covering all members
         bios_skipped = 0  # members whose bio could NOT be keyword-screened (rate limit)
+        pfps_skipped = 0  # members whose photo tiebreak could NOT be resolved
 
         try:
             # Resolve the peer first — required for new sessions where the entity
@@ -86,7 +88,10 @@ async def sweep_group(
         # for groups with no reserved keywords — bio is only consulted by the
         # keyword detection stage. Resolve once and skip the call otherwise.
         has_keywords = bool(await run_db(get_reserved_keywords, group_id))
-        from src.watcher.fetch import bio_cooldown_remaining, fetch_bio as _fetch_bio
+        from src.watcher.fetch import (
+            bio_cooldown_remaining, pfp_cooldown_remaining,
+            fetch_bio as _fetch_bio,
+        )
 
         # Notify immediately so the admin knows the loop has started
         if progress_cb:
@@ -182,6 +187,12 @@ async def sweep_group(
                     result = await check_user(snapshot, group_id)
 
                     # Lazy PFP: only fetch when there's a weak name match that needs confirmation
+                    # True once every check this member needed has actually
+                    # run. mark_seen is a PERMANENT skip as far as messages.py
+                    # is concerned, so claiming it for a member the pacer never
+                    # screened hides them from every future check.
+                    fully_screened = True
+
                     if result.needs_pfp:
                         pfp_bytes = await _fetch_pfp(pyro, user.id, wait=True)
                         if pfp_bytes:
@@ -193,6 +204,13 @@ async def sweep_group(
                                 pfp_bytes=pfp_bytes,
                             )
                             result = await check_user(snapshot, group_id)
+                        elif pfp_cooldown_remaining() > 0:
+                            # The download was SKIPPED, which is not the same as
+                            # "this user has no avatar" — and the verdict for a
+                            # weak name match depends on it. Previously both
+                            # cases fell through as clean.
+                            pfps_skipped += 1
+                            fully_screened = False
 
                     # Lazy bio: name/username were clean, but the group has reserved
                     # keywords — a scammer's banned word might be hiding in their bio
@@ -205,8 +223,10 @@ async def sweep_group(
                         if bio is None and bio_cooldown_remaining() > 0:
                             # The fetch was skipped (or itself flooded) — this
                             # member's bio was NOT screened. Count it so the
-                            # summary stays honest instead of overstating coverage.
+                            # summary stays honest, and do not claim the member
+                            # as permanently checked.
                             bios_skipped += 1
+                            fully_screened = False
                         if bio:
                             snapshot.bio = bio
                             result = await check_user(snapshot, group_id)
@@ -232,8 +252,11 @@ async def sweep_group(
                             unban_func=unban_func,
                             log_channel_notify=log_notify,
                         )
-                    else:
+                    elif fully_screened:
                         await run_db(mark_seen, group_id, user.id)
+                    # else: unflagged but incompletely screened — deliberately
+                    # NOT marked seen, so the next sweep (or their first message)
+                    # gets another chance at them.
 
                     # Progress update every 50 members iterated (not just checked)
                     # so the admin sees movement even when everyone is whitelisted/admin.
@@ -272,8 +295,13 @@ async def sweep_group(
             await asyncio.sleep(min(e.value, 300))
             await run_db(set_group_sweep_offset, group_id, position)
             result = {"iterated": iterated, "checked": checked, "flagged": flagged,
-                      "errors": errors, "partial": True, "bios_skipped": bios_skipped}
-            await run_db(record_sweep_run, group_id, iterated, checked, flagged, errors, trigger)
+                      "errors": errors, "partial": True,
+                      "bios_skipped": bios_skipped, "pfps_skipped": pfps_skipped}
+            await run_db(
+                record_sweep_run, group_id, iterated, checked, flagged, errors,
+                trigger, partial=True, bios_skipped=bios_skipped,
+                pfps_skipped=pfps_skipped,
+            )
             return result
         except (ChatAdminRequired, UserNotParticipant) as e:
             logger.error(f"Sweep permission error for group {group_id}: {e}")
@@ -304,9 +332,15 @@ async def sweep_group(
             await refresh_whitelist_pfps(pyro, group_id)
 
         result = {"iterated": iterated, "checked": checked, "flagged": flagged,
-                  "errors": errors, "partial": partial, "bios_skipped": bios_skipped}
-        # Persist this run so /stats and the daily summary can count it
-        await run_db(record_sweep_run, group_id, iterated, checked, flagged, errors, trigger)
+                  "errors": errors, "partial": partial,
+                  "bios_skipped": bios_skipped, "pfps_skipped": pfps_skipped}
+        # Persist this run — WITH its caveats — so /stats and the daily summary
+        # can tell a complete pass from a truncated one.
+        await run_db(
+            record_sweep_run, group_id, iterated, checked, flagged, errors,
+            trigger, partial=partial, bios_skipped=bios_skipped,
+            pfps_skipped=pfps_skipped,
+        )
         return result
 
 
@@ -409,7 +443,9 @@ async def _post_sweep_summary(
     if not channel:
         return
 
-    title = (group and group.get("title")) or str(group_id)
+    # Escaped: send_log_message sends HTML and the title is attacker-
+    # controlled (upsert_group stores chat.title verbatim).
+    title = html.escape((group and group.get("title")) or str(group_id))
     text = (
         f"🧹 <b>Auto-sweep complete</b>\n"
         f"<b>Group:</b> {title} (<code>{group_id}</code>)\n"

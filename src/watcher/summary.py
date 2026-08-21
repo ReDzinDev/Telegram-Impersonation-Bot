@@ -9,6 +9,7 @@ admins use /stats for the windowed breakdown when they want totals.
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 from datetime import datetime, timedelta, UTC
 
@@ -67,7 +68,9 @@ async def run_daily_summary(bot: Bot, log_channel_id: int):
                     continue
 
                 group = get_group(gid)
-                title = (group and group.get("title")) or str(gid)
+                # Escaped: this goes out as HTML and chat.title is
+                # whatever the group owner set it to.
+                title = html.escape((group and group.get("title")) or str(gid))
 
                 # Route to this group's own log channel; fall back to the global one.
                 channel = (group and group.get("log_channel_id")) or log_channel_id

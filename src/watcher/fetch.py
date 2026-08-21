@@ -179,6 +179,19 @@ def bio_cooldown_remaining() -> float:
     return _bio_pacer.cooldown_remaining()
 
 
+def pfp_cooldown_remaining() -> float:
+    """
+    Seconds until profile-photo downloads may resume (0 when not cooling down).
+
+    The counterpart to bio_cooldown_remaining, which existed while this did not
+    — so the sweep could not tell a photo fetch the pacer SKIPPED from a user who
+    simply has no avatar. It counted the second case, so a weak name match that
+    specifically needed photo confirmation was resolved as clean whenever the
+    pacer was cooling down.
+    """
+    return _pfp_pacer.cooldown_remaining()
+
+
 async def fetch_pfp_bytes(pyro: Client, user_id: int, *, wait: bool = False) -> Optional[bytes]:
     """
     Download a user's current profile photo as raw bytes, or None.

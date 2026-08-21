@@ -155,3 +155,56 @@ def test_purge_predicates_are_indexed(index_on):
         f"{table}({column}) drives a purge DELETE but has no index — each pass "
         "is a sequential scan"
     )
+
+
+# ── record_sweep_run must actually write the caveats ──────────────────────────
+
+class _ParamCursor:
+    def __init__(self, calls):
+        self.rowcount = 1
+        self._calls = calls
+
+    def execute(self, sql, params=None):
+        self._calls.append((" ".join(sql.split()), params))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _ParamConn:
+    def __init__(self):
+        self.calls = []
+
+    def cursor(self):
+        return _ParamCursor(self.calls)
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+
+def test_sweep_run_parameters_include_the_caveats(monkeypatch):
+    """
+    Guards the SQL itself, not just the call site. A test that only checks what
+    sweep_group PASSES cannot notice the writer dropping the values on the floor
+    between the signature and the INSERT.
+    """
+    conn = _ParamConn()
+    monkeypatch.setattr(db, "get_connection", lambda *a, **k: conn)
+    monkeypatch.setattr(db, "put_connection", lambda c: None)
+
+    db.record_sweep_run(
+        -100, iterated=50, checked=40, flagged=2, errors=1, trigger="auto",
+        partial=True, bios_skipped=7, pfps_skipped=3,
+    )
+    assert conn.calls, "nothing was executed"
+    sql, params = conn.calls[-1]
+    assert "partial" in sql and "bios_skipped" in sql and "pfps_skipped" in sql
+    assert True in params, "partial=True never reached the statement"
+    assert 7 in params, "bios_skipped never reached the statement"
+    assert 3 in params, "pfps_skipped never reached the statement"

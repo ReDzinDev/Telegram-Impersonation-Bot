@@ -148,3 +148,134 @@ def test_an_exception_mid_iteration_marks_the_run_partial(sweep_env):
     assert result["partial"] is True, (
         "an interrupted sweep was recorded as a clean, complete pass"
     )
+
+
+# ── honest coverage accounting (B-5) ──────────────────────────────────────────
+#
+# mark_seen fired for every unflagged member, including ones the pacer never
+# actually screened. messages.py treats is_seen as a PERMANENT skip, so a
+# rate-limited sweep told the message scanner "already handled" about members
+# whose bio or photo was never fetched. A scammer whose bio reads "Support Admin
+# — DM me", encountered during a bio FloodWait, became invisible to every future
+# check: the next sweep re-scans and skips them as whitelist-clean, and only a
+# profile change (which calls unmark_seen) would ever re-open them.
+#
+# The photo side had no accounting at all — _fetch_pfp returning None was
+# indistinguishable from "this user has no avatar", so a weak name match that
+# specifically needed photo confirmation was silently resolved as clean.
+
+from src.watcher import fetch as fetch_mod
+
+
+def _with_keywords(monkeypatch):
+    monkeypatch.setattr(sweep_mod, "get_reserved_keywords",
+                        lambda gid: [{"pattern": "support", "is_regex": False}])
+
+
+def test_a_bio_skipped_member_is_not_recorded_as_screened(sweep_env, monkeypatch):
+    _with_keywords(monkeypatch)
+
+    async def flooded_bio(pyro, uid, wait=False):
+        return None
+    monkeypatch.setattr(sweep_mod, "_fetch_bio", flooded_bio, raising=False)
+    monkeypatch.setattr(fetch_mod, "fetch_bio", flooded_bio)
+    monkeypatch.setattr(fetch_mod, "bio_cooldown_remaining", lambda: 42.0)
+
+    result = _run(_FakePyro(4))
+    assert result["bios_skipped"] == 4
+    assert sweep_env["seen"] == [], (
+        "members whose bio was never fetched were marked permanently screened"
+    )
+
+
+def test_a_fully_screened_member_is_recorded(sweep_env, monkeypatch):
+    _with_keywords(monkeypatch)
+
+    async def good_bio(pyro, uid, wait=False):
+        return "an ordinary bio"
+    monkeypatch.setattr(sweep_mod, "_fetch_bio", good_bio, raising=False)
+    monkeypatch.setattr(fetch_mod, "fetch_bio", good_bio)
+    monkeypatch.setattr(fetch_mod, "bio_cooldown_remaining", lambda: 0.0)
+
+    result = _run(_FakePyro(3))
+    assert result["bios_skipped"] == 0
+    assert len(sweep_env["seen"]) == 3
+
+
+def test_a_photo_skipped_member_is_counted_and_not_recorded(sweep_env, monkeypatch):
+    """
+    needs_pfp means the verdict depends on a photo. If the pacer skipped the
+    download, the member was NOT screened — that is not the same as clean.
+    """
+    async def needs_photo(snapshot, group_id):
+        return DetectionResult(flagged=False, needs_pfp=True)
+    monkeypatch.setattr(sweep_mod, "check_user", needs_photo)
+
+    async def flooded_pfp(pyro, uid, wait=False):
+        return None
+    monkeypatch.setattr(sweep_mod, "_fetch_pfp", flooded_pfp)
+    monkeypatch.setattr(fetch_mod, "pfp_cooldown_remaining", lambda: 30.0,
+                        raising=False)
+
+    result = _run(_FakePyro(5))
+    assert result["pfps_skipped"] == 5, (
+        "photo fetches skipped by the pacer are not counted"
+    )
+    assert sweep_env["seen"] == []
+
+
+def test_a_member_with_genuinely_no_photo_is_still_screened(sweep_env, monkeypatch):
+    """
+    Absent avatar and rate-limited download must not be conflated. With no
+    cooldown active, a None fetch means the user simply has no photo — the check
+    IS complete.
+    """
+    async def needs_photo(snapshot, group_id):
+        return DetectionResult(flagged=False, needs_pfp=True)
+    monkeypatch.setattr(sweep_mod, "check_user", needs_photo)
+
+    async def no_photo(pyro, uid, wait=False):
+        return None
+    monkeypatch.setattr(sweep_mod, "_fetch_pfp", no_photo)
+    monkeypatch.setattr(fetch_mod, "pfp_cooldown_remaining", lambda: 0.0,
+                        raising=False)
+
+    result = _run(_FakePyro(3))
+    assert result["pfps_skipped"] == 0
+    assert len(sweep_env["seen"]) == 3
+
+
+def test_the_pacer_exposes_a_photo_cooldown():
+    """The bio side had this accessor; the photo side did not, which is why it
+    could not tell a skip from an absence."""
+    assert hasattr(fetch_mod, "pfp_cooldown_remaining")
+    assert isinstance(fetch_mod.pfp_cooldown_remaining(), float)
+
+
+# ── the record has to keep the caveats ────────────────────────────────────────
+
+def test_partial_and_skip_counts_are_persisted(sweep_env, monkeypatch):
+    """
+    record_sweep_run dropped partial and bios_skipped, so /stats and the daily
+    digest counted a truncated run as a complete one — the honest reporting was
+    thrown away exactly where it becomes the long-term record.
+    """
+    monkeypatch.setattr(sweep_mod, "SWEEP_HARD_CAP_SECONDS", 0)
+    _run(_FakePyro(20))
+    assert sweep_env["sweep_runs"], "no sweep run recorded"
+    args, kwargs = sweep_env["sweep_runs"][-1]
+    recorded = {**kwargs}
+    assert "partial" in recorded, "partial is not persisted"
+    assert recorded["partial"] is True
+
+
+def test_sweep_runs_has_columns_for_them():
+    import re
+    from pathlib import Path
+
+    ddl = (Path(__file__).resolve().parent.parent / "src" / "db.py").read_text(
+        encoding="utf-8")
+    for column in ("partial", "bios_skipped", "pfps_skipped"):
+        assert re.search(rf"ADD COLUMN IF NOT EXISTS {column}\b", ddl), (
+            f"sweep_runs has no {column} column"
+        )
