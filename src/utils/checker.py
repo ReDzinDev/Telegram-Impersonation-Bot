@@ -162,73 +162,85 @@ def _check_user_sync(
                 matched_val=matched_kw, score=100.0,
             )
 
-    if not whitelist:
-        return DetectionResult(flagged=False)
-
     # Exclude the user's own whitelist entry so they can never match themselves
     others = [w for w in whitelist if w["user_id"] != snapshot.user_id]
-    if not others:
-        return DetectionResult(flagged=False)
 
+    # Stages 1-4 compare against the whitelist, so they need entries to compare
+    # against — but they must NOT gate stage 5. Group identity is a property of
+    # the group, not of its whitelist: a group with nobody whitelisted yet (or
+    # whose only entry is this very user) still needs protecting from people
+    # taking its name and logo. This used to `return` here, so /import_admins not
+    # having been run meant no group-impersonation protection at all.
     usernames  = [w["username"] for w in others if w["username"]]
     names      = [f"{w['first_name']} {w['last_name'] or ''}".strip() for w in others]
     pfp_hashes = [w["pfp_hash"] for w in others if w["pfp_hash"]]
 
-    # 1 — Username similarity (username vs whitelist usernames only)
-    if snapshot.username and usernames:
-        match, matched_val, score = check_username_similarity(
-            snapshot.username, usernames, username_threshold
-        )
-        if match:
-            target = _find_by_username(others, matched_val)
+    # Set when a stage wanted a profile photo and the snapshot had none. Carried
+    # to the END rather than returned immediately: returning aborted the pipeline
+    # before stage 5, so a user with no avatar skipped the group-identity check
+    # entirely — and only sweep.py honours the signal and re-runs, so for the
+    # join/message/profile-change paths the check was simply lost.
+    needs_pfp = False
+
+    if others:
+
+        # 1 — Username similarity (username vs whitelist usernames only)
+        if snapshot.username and usernames:
+            match, matched_val, score = check_username_similarity(
+                snapshot.username, usernames, username_threshold
+            )
+            if match:
+                target = _find_by_username(others, matched_val)
+                return DetectionResult(
+                    flagged=True, match_type="username", matched_val=matched_val,
+                    score=score, **_target_fields(target)
+                )
+
+        # (A separate homoglyph-username stage used to sit here, but it re-ran the
+        # exact same check_username_similarity call as stage 1 — which had already
+        # returned on a match — so it could never fire. check_username_similarity
+        # folds lookalike characters internally; homoglyph handles are caught above.)
+
+        # 2 — Homoglyph name: only flag if it also fuzzy-matches a whitelisted display name
+        if check_homoglyph_danger(full_name):
+            match, matched_val, score = check_name_similarity(full_name, names, name_threshold)
+            if match and not (len(full_name.split()) <= 1 or len(matched_val.split()) <= 1):
+                target = _find_by_name(others, matched_val)
+                return DetectionResult(
+                    flagged=True, match_type="homoglyph_name",
+                    matched_val=matched_val, score=score, **_target_fields(target)
+                )
+
+        # 3 — Display name similarity (name vs whitelist names only)
+        match, matched_val, score = check_name_similarity(full_name, names, name_threshold)
+        is_weak = match and (len(full_name.split()) <= 1 or len(matched_val.split()) <= 1)
+
+        if match and not is_weak:
+            target = _find_by_name(others, matched_val)
             return DetectionResult(
-                flagged=True, match_type="username", matched_val=matched_val,
+                flagged=True, match_type="name", matched_val=matched_val,
                 score=score, **_target_fields(target)
             )
 
-    # (A separate homoglyph-username stage used to sit here, but it re-ran the
-    # exact same check_username_similarity call as stage 1 — which had already
-    # returned on a match — so it could never fire. check_username_similarity
-    # folds lookalike characters internally; homoglyph handles are caught above.)
-
-    # 2 — Homoglyph name: only flag if it also fuzzy-matches a whitelisted display name
-    if check_homoglyph_danger(full_name):
-        match, matched_val, score = check_name_similarity(full_name, names, name_threshold)
-        if match and not (len(full_name.split()) <= 1 or len(matched_val.split()) <= 1):
-            target = _find_by_name(others, matched_val)
-            return DetectionResult(
-                flagged=True, match_type="homoglyph_name",
-                matched_val=matched_val, score=score, **_target_fields(target)
-            )
-
-    # 3 — Display name similarity (name vs whitelist names only)
-    match, matched_val, score = check_name_similarity(full_name, names, name_threshold)
-    is_weak = match and (len(full_name.split()) <= 1 or len(matched_val.split()) <= 1)
-
-    if match and not is_weak:
-        target = _find_by_name(others, matched_val)
-        return DetectionResult(
-            flagged=True, match_type="name", matched_val=matched_val,
-            score=score, **_target_fields(target)
-        )
-
-    # 4 — PFP hash (tiebreaker for weak name matches only)
-    # A standalone photo match without any name/username similarity is too noisy.
-    if is_weak and pfp_hashes:
-        if not snapshot.pfp_bytes:
-            # Signal the caller to fetch the PFP and re-run (lazy loading for sweep)
-            return DetectionResult(flagged=False, needs_pfp=True)
-        target_hashes = compute_pfp_hash_variants_bytes(snapshot.pfp_bytes)
-        if target_hashes:
-            pfp_match, pfp_matched_val, pfp_dist = check_pfp_similarity(
-                target_hashes, pfp_hashes, PFP_HASH_THRESHOLD
-            )
-            if pfp_match:
-                target = _find_by_pfp(others, pfp_matched_val)
-                return DetectionResult(
-                    flagged=True, match_type="pfp", matched_val=pfp_matched_val,
-                    score=pfp_dist, **_target_fields(target)
-                )
+        # 4 — PFP hash (tiebreaker for weak name matches only)
+        # A standalone photo match without any name/username similarity is too noisy.
+        if is_weak and pfp_hashes:
+            if not snapshot.pfp_bytes:
+                # Note that a photo would settle this, but do NOT return —
+                # stage 5 needs no photo and must still get to run.
+                needs_pfp = True
+            else:
+                target_hashes = compute_pfp_hash_variants_bytes(snapshot.pfp_bytes)
+                if target_hashes:
+                    pfp_match, pfp_matched_val, pfp_dist = check_pfp_similarity(
+                        target_hashes, pfp_hashes, PFP_HASH_THRESHOLD
+                    )
+                    if pfp_match:
+                        target = _find_by_pfp(others, pfp_matched_val)
+                        return DetectionResult(
+                            flagged=True, match_type="pfp", matched_val=pfp_matched_val,
+                            score=pfp_dist, **_target_fields(target)
+                        )
 
     # 5 — Group identity: catch users impersonating the group itself.
     #     Checks user name similarity to the group title, and (for weak matches)
@@ -254,8 +266,10 @@ def _check_user_sync(
             # Weak group-name match: use the group logo as tiebreaker
             if g_is_weak and group_pfp_hash:
                 if not snapshot.pfp_bytes:
-                    return DetectionResult(flagged=False, needs_pfp=True)
-                g_user_hashes = compute_pfp_hash_variants_bytes(snapshot.pfp_bytes)
+                    needs_pfp = True
+                    g_user_hashes = []
+                else:
+                    g_user_hashes = compute_pfp_hash_variants_bytes(snapshot.pfp_bytes)
                 if g_user_hashes:
                     g_pfp_match, _, g_pfp_dist = check_pfp_similarity(
                         g_user_hashes, [group_pfp_hash], PFP_HASH_THRESHOLD
@@ -267,7 +281,7 @@ def _check_user_sync(
                             target_name=f"[Group] {group_title}",
                         )
 
-    return DetectionResult(flagged=False)
+    return DetectionResult(flagged=False, needs_pfp=needs_pfp)
 
 
 async def ban_and_log(
