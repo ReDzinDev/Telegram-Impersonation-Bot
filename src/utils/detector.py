@@ -1,5 +1,6 @@
 
 import logging
+import math
 import re
 import time
 import unicodedata
@@ -249,23 +250,43 @@ def check_name_similarity(
     """
     Fuzzy-match a display name against stored whitelist names.
 
-    Scores each candidate on BOTH the raw string (token_sort_ratio, preserves
-    the original conservative behaviour) and a fold_text() skeleton
-    (token_sort/token_set) that neutralizes case, fullwidth/stylized unicode,
-    zero-width/RTL chars, and whole-script Cyrillic/Greek confusables. Keeps
-    the higher score, so "JOHN SMITH", "Ｊｏｈｎ Ｓｍｉｔｈ", and all-Cyrillic
-    "Јоhn Ѕmіth" now match "John Smith" instead of scoring ~0.
+    Scores each candidate three ways and keeps the best:
+
+      1. the raw string (token_sort_ratio, preserving the original conservative
+         behaviour)
+      2. a fold_text() skeleton, which neutralizes case, fullwidth/stylized
+         unicode, zero-width/RTL characters and whole-script confusables — so
+         "JOHN SMITH", "Ｊｏｈｎ Ｓｍｉｔｈ" and all-Cyrillic "Јоhn Ѕmіth" all
+         match "John Smith" instead of scoring ~0
+      3. the folded skeleton with leetspeak substitutions applied
+
+    Pass 3 exists because _LEET_MAP was previously used only for USERNAMES,
+    even though display names are the primary impersonation vector. "J0hn Sm1th"
+    scored 80 against "John Smith" and slipped under the default 85 threshold;
+    "J0hn 5m1th" scored 30. Both now match.
+
+    Leet folding is a substitution rather than a deletion, so unlike separator
+    tolerance it creates no new adjacencies and cannot make two unrelated names
+    look alike — it only ever undoes a digit-for-letter swap.
     """
     if not target or not stored:
         return False, None, 0
 
     t_fold = fold_text(target)
+    t_leet = _leet_fold(t_fold)
     best_val: Optional[str] = None
     best_score = 0
     for original in stored:
+        o_fold = fold_text(original)
         raw = fuzz.token_sort_ratio(target, original)
-        fold = _name_score(t_fold, fold_text(original)) if t_fold else 0
-        score = max(raw, fold)
+        fold = _name_score(t_fold, o_fold) if t_fold else 0
+        # Only worth computing when leet folding actually changed something.
+        leet = (
+            _name_score(t_leet, _leet_fold(o_fold))
+            if t_leet != t_fold or o_fold != _leet_fold(o_fold)
+            else 0
+        )
+        score = max(raw, fold, leet)
         if score > best_score:
             best_score = int(score)
             best_val = original
@@ -279,6 +300,65 @@ def check_homoglyph_danger(text: str) -> bool:
     if not text:
         return False
     return confusables.is_dangerous(text)
+
+
+# ── Separator-padded keyword evasion ─────────────────────────────────────────
+#
+# "a d m i n" and "a.d.m.i.n" both defeated the keyword "admin", which was the
+# cheapest evasion in the bot given a keyword hit goes straight to the ban band.
+#
+# Tolerating gaps naively is worse than the disease, though, because a bare
+# keyword is a SUBSTRING match. Measured against real-looking names:
+#
+#   "mod"     matched "Mo Diaz"        "ceo"     matched "Ce Oliveira"
+#   "admin"   matched "Ad Minister"    "support" matched "Sup Porter"
+#
+# A minimum keyword length does not rescue this — "support" is seven characters.
+# What separates the cases is the SHAPE. An evasion puts a separator between
+# nearly every character (4 gaps of 4 available); an innocent name has exactly
+# one, at a word boundary (1 of 6). So the requirement is proportional: a gapped
+# match only counts when most of the available positions are actually gapped.
+# Defensive rather than load-bearing: the `max(2, ...)` floor below already makes
+# a 1-2 character core unmatchable (it cannot supply two gaps). Kept so the
+# intent is explicit and so we never build a regex for a single character.
+_MIN_GAP_KEYWORD_LEN = 3
+_MAX_GAP_RUN = 2              # separator characters allowed between two letters
+_MIN_GAP_FRACTION = 0.6       # of the inter-character positions
+_MAX_GAP_CORE = 64            # don't build enormous regexes for long keywords
+
+
+def _leet_fold(s: str) -> str:
+    """Map leetspeak digits/symbols onto letters (adm1n -> admin, 4dmin -> admin)."""
+    return s.translate(_LEET_MAP)
+
+
+@lru_cache(maxsize=512)
+def _gap_pattern(core: str):
+    """
+    Compile `core` with a bounded separator group between each character.
+
+    Each gap is its own capturing group so the caller can count how many were
+    actually used. Bounded and non-nested, so it cannot backtrack badly.
+    """
+    gap = f"([^0-9a-z]{{0,{_MAX_GAP_RUN}}})"
+    return re.compile(gap.join(re.escape(ch) for ch in core))
+
+
+def _gap_tolerant_hit(core: str, text: str) -> bool:
+    """
+    Whether `core` appears in `text` with separators inserted between most of
+    its characters — the signature of deliberate padding, not of a name that
+    happens to contain a word boundary.
+    """
+    if not (_MIN_GAP_KEYWORD_LEN <= len(core) <= _MAX_GAP_CORE):
+        return False
+    required = max(2, math.ceil(_MIN_GAP_FRACTION * (len(core) - 1)))
+    # finditer, not search: an early occurrence may be under-gapped while a
+    # later one qualifies.
+    for match in _gap_pattern(core).finditer(text):
+        if sum(1 for gap in match.groups() if gap) >= required:
+            return True
+    return False
 
 
 def _match_wildcard_pattern(pattern: str, text: str) -> bool:
@@ -307,13 +387,35 @@ def _match_wildcard_pattern(pattern: str, text: str) -> bool:
     if not core:
         return False  # pattern was just "*" / "**" — ignore
 
-    if starts_wild and ends_wild:
-        return core in t
-    if ends_wild:
-        return t.startswith(core)
-    if starts_wild:
-        return t.endswith(core)
-    return core in t  # bare keyword = substring (unchanged behavior)
+    # Compare the leet-folded forms as well as the plain ones, so "adm1n" and
+    # "4dmin" match the keyword "admin". Substitution (unlike gap tolerance)
+    # creates no new adjacencies, so it carries no over-matching risk. Both
+    # sides are folded so a keyword written as "adm1n" behaves the same way.
+    cores = {core, _leet_fold(core)}
+    texts = {t, _leet_fold(t)}
+
+    for c in cores:
+        for tx in texts:
+            if starts_wild and ends_wild:
+                hit = c in tx
+            elif ends_wild:
+                hit = tx.startswith(c)
+            elif starts_wild:
+                hit = tx.endswith(c)
+            else:
+                hit = c in tx        # bare keyword = substring (unchanged)
+            if hit:
+                return True
+
+    # Separator-padded evasion. Only for the substring forms: a prefix/suffix
+    # anchor already pins the match to one end, and stretching it across
+    # separators there would change what the admin asked for.
+    if starts_wild == ends_wild:
+        for c in cores:
+            for tx in texts:
+                if _gap_tolerant_hit(c, tx):
+                    return True
+    return False
 
 
 # ── Admin-supplied regex safety ───────────────────────────────────────────────
