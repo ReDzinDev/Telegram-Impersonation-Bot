@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+filterwarnings = [
+    # pyrogram 2.0.x calls asyncio.get_event_loop() at import time.
+    "ignore:There is no current event loop:DeprecationWarning",
+]
