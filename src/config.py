@@ -23,6 +23,22 @@ def _optional(name: str, default: Optional[str] = None) -> Optional[str]:
     return os.getenv(name, default)
 
 
+def _parse_group_ids(raw: Optional[str]) -> frozenset[int]:
+    """Parse a comma-separated list of group IDs, ignoring junk entries."""
+    if not raw:
+        return frozenset()
+    out = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            logging.warning(f"Ignoring non-numeric group id in config: {part!r}")
+    return frozenset(out)
+
+
 BOT_TOKEN = _require("BOT_TOKEN")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -70,6 +86,24 @@ PFP_HASH_THRESHOLD = int(_optional("PFP_HASH_THRESHOLD", "10"))
 # always treated as ban-band (see checker.ban_and_log). Overridable per-group.
 DEFAULT_BAN_SCORE   = int(_optional("DEFAULT_BAN_SCORE", "90"))
 DEFAULT_ALERT_SCORE = int(_optional("DEFAULT_ALERT_SCORE", "78"))
+
+# ── Cross-group blocklist trust ─────────────────────────────────────────────
+# known_bad_actors is a GLOBAL table consulted for every non-whitelisted user,
+# but any admin of any enrolled group can write to it via /ban — and the bot
+# auto-registers any group it is added to. Without a trust boundary, a stranger
+# could enroll their own group and use it to ban arbitrary users out of every
+# other group.
+#
+# Only bans originating from a group listed here (or from the group being
+# checked itself) carry ban authority. Everything else is ADVISORY: still
+# surfaced as an alert for a human, but it cannot execute a ban on its own.
+#
+# Operator-level on purpose — env only, so no group admin can grant themselves
+# this. Empty (the default) means no group's bans propagate as actionable,
+# which is the safe posture for a multi-tenant deployment.
+BLOCKLIST_TRUSTED_GROUPS: frozenset[int] = _parse_group_ids(
+    _optional("BLOCKLIST_TRUSTED_GROUPS")
+)
 
 # ── Background-task cadence (formerly magic numbers scattered across modules) ──
 SWEEP_INTERVAL_HOURS           = int(_optional("SWEEP_INTERVAL_HOURS", "24"))

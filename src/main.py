@@ -13,6 +13,7 @@ from telegram.ext import (
 from src.config import (
     BOT_TOKEN, LOG_CHANNEL_ID,
     PYROGRAM_API_ID, PYROGRAM_API_HASH, PYROGRAM_SESSION, PYROGRAM_ENABLED,
+    BLOCKLIST_TRUSTED_GROUPS,
 )
 from src.db import init_db, get_connection, put_connection
 from src.handlers.commands import (
@@ -209,6 +210,25 @@ def build_ptb_app(pyro_client=None):
 
 async def main():
     init_db()
+
+    # The cross-group blocklist only propagates bans from groups the operator
+    # has explicitly trusted, because any admin of any enrolled group can write
+    # to it via /ban and the bot enrols any group it is added to. Empty is the
+    # safe default but it does turn propagation off, so say so once, loudly,
+    # rather than letting an operator assume the feature is working.
+    if BLOCKLIST_TRUSTED_GROUPS:
+        logger.info(
+            "Cross-group blocklist: bans propagate from "
+            f"{len(BLOCKLIST_TRUSTED_GROUPS)} trusted group(s)."
+        )
+    else:
+        logger.warning(
+            "Cross-group blocklist propagation is DISABLED — no groups are "
+            "listed in BLOCKLIST_TRUSTED_GROUPS. Manual bans still work per "
+            "group, and pre-existing blocklist entries are treated as advisory "
+            "(alert, never auto-ban). Set BLOCKLIST_TRUSTED_GROUPS to a "
+            "comma-separated list of your own group IDs to enable propagation."
+        )
 
     pyro_client = None
 

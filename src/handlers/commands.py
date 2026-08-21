@@ -1519,8 +1519,15 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
             )
             return
 
-        # Clear from cross-group blocklist — false-positive reversal
-        remove_known_bad_actor(user_id)
+        # Clear from cross-group blocklist — only if this group has authority
+        # over the entry. A group admin's reversal is authoritative for THEIR
+        # group (handled by the whitelist / false-positive record above), but
+        # clearing the shared entry another group created is not theirs to do.
+        if not remove_known_bad_actor(user_id, acting_group_id=group_id):
+            logger.info(
+                f"Global blocklist entry for {user_id} left in place — group "
+                f"{group_id} has no authority over it (reversal is group-scoped)."
+            )
 
         # Audit-log the action so /logs reflects who reversed what
         log_admin_action(
@@ -1569,8 +1576,15 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
                 show_alert=True,
             )
             return
-        # Clear from cross-group blocklist — false-positive reversal
-        remove_known_bad_actor(user_id)
+        # Clear from cross-group blocklist — only if this group has authority
+        # over the entry. A group admin's reversal is authoritative for THEIR
+        # group (handled by the whitelist / false-positive record above), but
+        # clearing the shared entry another group created is not theirs to do.
+        if not remove_known_bad_actor(user_id, acting_group_id=group_id):
+            logger.info(
+                f"Global blocklist entry for {user_id} left in place — group "
+                f"{group_id} has no authority over it (reversal is group-scoped)."
+            )
         log_admin_action(
             group_id=group_id,
             admin_id=query.from_user.id,

@@ -4,7 +4,7 @@ import logging
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
-from src.config import DATABASE_URL
+from src.config import DATABASE_URL, BLOCKLIST_TRUSTED_GROUPS
 
 logger = logging.getLogger(__name__)
 
@@ -1450,7 +1450,23 @@ def add_known_bad_actor(
     On a repeat confirmation we bump ban_count and refresh last_seen_at so the
     list doubles as a "how widespread is this scammer" signal.
     Only HUMAN-confirmed bans should call this.
+
+    Contribution is operator-scoped: only groups listed in
+    BLOCKLIST_TRUSTED_GROUPS write here. Any admin of any enrolled group can
+    reach this via /ban, and the bot enrols any group it is added to, so
+    unrestricted writes would let a stranger push arbitrary user ids into shared
+    state and raise an alert about them in every other group. An untrusted
+    group's /ban still bans locally through Telegram — it just doesn't
+    propagate. Returns False when the write was declined.
     """
+    if source_group_id not in BLOCKLIST_TRUSTED_GROUPS:
+        logger.info(
+            f"Not recording {user_id} in the cross-group blocklist: group "
+            f"{source_group_id} is not in BLOCKLIST_TRUSTED_GROUPS. The local "
+            "ban is unaffected."
+        )
+        return False
+
     conn = get_connection()
     if not conn:
         return False
@@ -1502,7 +1518,50 @@ def get_known_bad_actor(user_id: int) -> dict | None:
         put_connection(conn)
 
 
-def remove_known_bad_actor(user_id: int) -> bool:
+def blocklist_entry_is_authoritative(entry: dict | None, group_id: int) -> bool:
+    """
+    Whether `group_id` has authority over a cross-group blocklist entry.
+
+    known_bad_actors is global but writable by any admin of any enrolled group,
+    and the bot enrols any group it is added to. Authority therefore comes from
+    provenance, not from being an admin somewhere: the entry must have been
+    created by this same group, or by a group the operator explicitly listed in
+    BLOCKLIST_TRUSTED_GROUPS. Entries with no recorded source (legacy rows) are
+    never authoritative.
+
+    Single source of truth for this rule — used both to decide whether a
+    detection may act (see checker._check_user) and whether a group may clear
+    the shared entry.
+    """
+    if not entry:
+        return False
+    source_group = entry.get("source_group_id")
+    if source_group is None:
+        return False
+    return source_group == group_id or source_group in BLOCKLIST_TRUSTED_GROUPS
+
+
+def remove_known_bad_actor(user_id: int, *, acting_group_id: int) -> bool:
+    """
+    Delete a user's global blocklist entry.
+
+    acting_group_id is required, not optional: this is a shared-state mutation
+    reachable from per-group alert buttons, and an unscoped global delete let a
+    blocklisted user enroll their own group, press Unban there, and regain
+    automatic entry everywhere. Refuses unless that group has authority over
+    the entry — the group-scoped reversals (whitelist, false-positive record)
+    remain available to any admin and are the correct scope for them.
+    """
+    if not blocklist_entry_is_authoritative(get_known_bad_actor(user_id), acting_group_id):
+        logger.warning(
+            f"Refusing to clear global blocklist entry for {user_id}: group "
+            f"{acting_group_id} has no authority over it."
+        )
+        return False
+    return _delete_known_bad_actor(user_id)
+
+
+def _delete_known_bad_actor(user_id: int) -> bool:
     """Remove a user from the blocklist (used when a ban is reversed as a
     false positive, so they're not re-banned cross-group)."""
     conn = get_connection()

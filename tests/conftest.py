@@ -51,3 +51,5 @@ os.environ["USERNAME_SIMILARITY_THRESHOLD"] = "88"
 os.environ["PFP_HASH_THRESHOLD"] = "10"
 os.environ["DEFAULT_BAN_SCORE"] = "90"
 os.environ["DEFAULT_ALERT_SCORE"] = "78"
+# No group is trusted to propagate bans in tests unless one opts in.
+os.environ["BLOCKLIST_TRUSTED_GROUPS"] = ""

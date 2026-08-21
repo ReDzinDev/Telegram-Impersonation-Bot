@@ -26,7 +26,7 @@ from src.utils.image import (
 )
 from src.config import (
     NAME_SIMILARITY_THRESHOLD, USERNAME_SIMILARITY_THRESHOLD, PFP_HASH_THRESHOLD,
-    DEFAULT_BAN_SCORE, DEFAULT_ALERT_SCORE,
+    DEFAULT_BAN_SCORE, DEFAULT_ALERT_SCORE, BLOCKLIST_TRUSTED_GROUPS,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,6 +61,10 @@ class DetectionResult:
     target_user_id: Optional[int] = None
     target_name: Optional[str] = None
     target_username: Optional[str] = None  # @handle of the impersonated user, when known
+    # True = report this, but never act on it automatically. Used for evidence
+    # that came from outside this group's authority (see the cross-group
+    # blocklist), which must not be able to execute a ban on its own.
+    advisory: bool = False
 
 
 async def check_user(
@@ -101,16 +105,32 @@ async def _check_user(
 
     group_cfg = get_group(group_id)
 
-    # Cross-group blocklist: a user confirmed-banned in any managed group is
-    # flagged here at full confidence (score 100 → ban-band) unless this group
-    # opted out. Checked after whitelist/false-positive so trusted users win.
+    # Cross-group blocklist: a user confirmed-banned in another managed group.
+    # Checked after whitelist/false-positive so trusted users win.
+    #
+    # Any admin of any enrolled group can write this table, and the bot enrolls
+    # any group it is added to — so provenance decides whether the entry can
+    # ACT or merely report. A ban is authoritative when it came from this same
+    # group, or from a group the operator listed in BLOCKLIST_TRUSTED_GROUPS.
+    # Anything else (including legacy rows with no recorded source) is advisory:
+    # still flagged for a human, but ban_and_log will only alert.
     if (group_cfg is None) or group_cfg.get("use_global_blocklist", True):
         bad = get_known_bad_actor(snapshot.user_id)
         if bad:
+            source_group = bad.get("source_group_id")
+            authoritative = source_group is not None and (
+                source_group == group_id or source_group in BLOCKLIST_TRUSTED_GROUPS
+            )
+            if not authoritative:
+                logger.info(
+                    f"Blocklist hit for {snapshot.user_id} in {group_id} is advisory "
+                    f"(source group {source_group} is not trusted) — alert only."
+                )
             return DetectionResult(
                 flagged=True, match_type="known_bad_actor",
                 matched_val=bad.get("reason") or "known bad actor",
                 score=100.0,
+                advisory=not authoritative,
             )
 
     # Per-match-type thresholds. Each falls back: per-type override →
@@ -303,8 +323,9 @@ async def ban_and_log(
         )
         return
 
-    # Mid band, or the group is alert-only → notify but don't remove.
-    if action_mode == "alert" or effective_score < ban_score:
+    # Mid band, alert-only group, or evidence from outside this group's
+    # authority → notify but don't remove.
+    if result.advisory or action_mode == "alert" or effective_score < ban_score:
         effective_action_mode = "alert"
     else:
         effective_action_mode = action_mode  # ban or kick
