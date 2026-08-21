@@ -3,6 +3,7 @@ import asyncio
 import html
 import logging
 import signal
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 # Configure logging BEFORE importing anything under src, so the import-time
@@ -99,6 +100,97 @@ async def _db_keepalive(interval: int = 270) -> None:
         except Exception as e:
             logger.exception(f"DB keep-alive loop body crashed: {e}")
             await asyncio.sleep(30)
+
+
+# Restart pacing for a background task that dies. Starts gentle so a transient
+# fault recovers quickly, backs off so a persistently broken task does not spin,
+# and resets after a healthy stretch so a task that ran for hours before failing
+# is not punished for its predecessor.
+_SUPERVISOR_BASE_DELAY = 30.0      # seconds before the first restart
+_SUPERVISOR_MAX_DELAY = 600.0      # ceiling on the backoff
+_SUPERVISOR_HEALTHY_AFTER = 300.0  # a run this long resets the backoff
+
+
+async def _supervised(name: str, factory, notify=None) -> None:
+    """
+    Run `factory()` forever, restarting it when it dies.
+
+    The previous supervisor attached a done-callback that logged at ERROR and
+    posted to the log channel — useful, but it never restarted anything. If
+    run_periodic_sweeps died, scheduled sweeps stopped FOREVER while the bot
+    carried on serving commands as though healthy, and recovery depended on a
+    human noticing one Telegram message.
+
+    `factory` is a zero-argument callable returning a fresh coroutine, not a
+    coroutine: a coroutine can only be awaited once, so restarting requires the
+    ability to build a new one.
+
+    Returning cleanly counts as dying. Every task here is a `while True` loop, so
+    a normal return means something is wrong, not that the work is finished.
+
+    CancelledError propagates untouched — shutdown must not have to fight the
+    restart loop.
+    """
+    delay = _SUPERVISOR_BASE_DELAY
+    while True:
+        started = time.monotonic()
+        exc: BaseException | None = None
+        try:
+            await factory()
+            reason = "returned cleanly, but its loop should never exit"
+        except asyncio.CancelledError:
+            logger.info(f"Background task '{name}' cancelled (shutdown).")
+            raise
+        except Exception as e:                     # noqa: BLE001 - last resort
+            exc = e
+            reason = f"{type(e).__name__}: {e}"
+
+        ran_for = time.monotonic() - started
+        if ran_for >= _SUPERVISOR_HEALTHY_AFTER:
+            # It was healthy for a long time; treat this as a fresh incident.
+            delay = _SUPERVISOR_BASE_DELAY
+
+        logger.error(
+            f"Background task '{name}' died after {ran_for:.0f}s ({reason}); "
+            f"restarting in {delay:.0f}s.",
+            exc_info=exc,
+            extra={"task": name, "ran_for_s": round(ran_for), "restart_in_s": delay},
+        )
+        if notify is not None:
+            try:
+                await notify(name, exc)
+            except Exception:
+                logger.warning(f"Could not report death of '{name}' to the operator.")
+
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, _SUPERVISOR_MAX_DELAY)
+
+
+async def _loop_lag_watchdog(threshold: float = 5.0, interval: float = 1.0) -> None:
+    """
+    Report an event loop that is alive but not running.
+
+    This is the only cheap detector for a blocking call finding its way back into
+    an async path. A process frozen inside time.sleep — or inside a catastrophic
+    regex, since CPython's `re` holds the GIL — looks perfectly healthy from the
+    outside: the container is up, the process is running, nothing has crashed. It
+    simply stops answering Telegram.
+
+    Sleeping for `interval` and measuring how much longer it actually took is
+    enough to see it.
+    """
+    loop = asyncio.get_running_loop()
+    while True:
+        before = loop.time()
+        await asyncio.sleep(interval)
+        lag = loop.time() - before - interval
+        if lag > threshold:
+            logger.error(
+                f"Event loop stalled for {lag:.1f}s (threshold {threshold:.0f}s). "
+                "Something blocking is running on the loop — check for a db call "
+                "outside run_db, or a slow regex.",
+                extra={"lag_s": round(lag, 2)},
+            )
 
 
 async def _retention_loop(interval_hours: int = 24) -> None:
@@ -440,79 +532,67 @@ async def main():
 
     logger.info("Bot is running.")
 
-    def _supervise(name: str, task: asyncio.Task) -> None:
+    async def _report_death(name: str, exc: BaseException | None) -> None:
         """
-        Attach a done-callback that screams loudly if a background task
-        exits unexpectedly. The per-task while loops already catch most
-        exceptions internally — this is the last line of defence for
-        anything that escapes them (e.g. a programmer error in the
-        try/except itself, or an unhandled CancelledError race).
+        Tell the operator a background task died and is being restarted.
 
-        Posts to the global LOG_CHANNEL_ID if configured, so the operator
-        sees task death without tailing Railway logs.
+        Best-effort: a failure here must not stop the restart, which is the part
+        that actually recovers the bot.
         """
-        def _on_done(t: asyncio.Task) -> None:
-            if t.cancelled():
-                logger.info(f"Background task '{name}' cancelled (shutdown).")
-                return
-            exc = t.exception()
-            if exc is None:
-                # A `while True` exiting without exception is itself a bug
-                logger.error(
-                    f"Background task '{name}' exited cleanly — this should never happen."
-                )
-                return
-            logger.error(
-                f"Background task '{name}' died with an unhandled exception",
-                exc_info=exc,
-            )
-            if LOG_CHANNEL_ID:
-                async def _notify(_exc=exc, _name=name):
-                    try:
-                        await ptb_app.bot.send_message(
-                            chat_id=LOG_CHANNEL_ID,
-                            text=(
-                                f"💀 <b>Background task died:</b> <code>{_name}</code>\n"
-                                f"<code>{type(_exc).__name__}: {str(_exc)[:300]}</code>\n"
-                                "Restart the bot to recover. Check logs for the full traceback."
-                            ),
-                            parse_mode="HTML",
-                        )
-                    except Exception:
-                        logger.warning(
-                            f"Could not report death of '{_name}' to the log channel."
-                        )
-                notify_task = asyncio.create_task(_notify())
-                # Hold a strong reference until it completes, then let go.
-                _background_notifications.add(notify_task)
-                notify_task.add_done_callback(_background_notifications.discard)
-        task.add_done_callback(_on_done)
+        if not LOG_CHANNEL_ID:
+            return
+        detail = (
+            f"{type(exc).__name__}: {str(exc)[:300]}" if exc
+            else "exited cleanly, which should never happen"
+        )
+        await ptb_app.bot.send_message(
+            chat_id=LOG_CHANNEL_ID,
+            text=(
+                f"⚠️ <b>Background task died:</b> <code>{html.escape(name)}</code>\n"
+                f"<code>{html.escape(detail)}</code>\n"
+                "It is being restarted automatically — no action needed unless "
+                "this repeats. Check the logs for the traceback."
+            ),
+            parse_mode="HTML",
+        )
+
 
     if pyro_client:
-        sweep_task = asyncio.create_task(
-            run_periodic_sweeps(pyro_client, ptb_app.bot, LOG_CHANNEL_ID)
-        )
-        _supervise("periodic_sweep", sweep_task)
-        health_task = asyncio.create_task(
-            run_health_check(pyro_client, ptb_app.bot, LOG_CHANNEL_ID)
-        )
-        _supervise("health_check", health_task)
+        sweep_task = asyncio.create_task(_supervised(
+            "periodic_sweep",
+            lambda: run_periodic_sweeps(pyro_client, ptb_app.bot, LOG_CHANNEL_ID),
+            notify=_report_death,
+        ))
+        health_task = asyncio.create_task(_supervised(
+            "health_check",
+            lambda: run_health_check(pyro_client, ptb_app.bot, LOG_CHANNEL_ID),
+            notify=_report_death,
+        ))
 
     # DB keep-alive — prevents Railway Hobby Postgres from sleeping
-    keepalive_task = asyncio.create_task(_db_keepalive())
-    _supervise("db_keepalive", keepalive_task)
+    keepalive_task = asyncio.create_task(_supervised(
+        "db_keepalive", _db_keepalive, notify=_report_death,
+    ))
 
     # Retention — unconditional, unlike the daily summary it used to hide in.
-    retention_task = asyncio.create_task(_retention_loop())
-    _supervise("retention", retention_task)
+    retention_task = asyncio.create_task(_supervised(
+        "retention", _retention_loop, notify=_report_death,
+    ))
+
+    # Detects a loop that is alive but not running — the signature of a blocking
+    # call finding its way back onto it. Nothing else in the process can see that.
+    watchdog_task = asyncio.create_task(_supervised(
+        "loop_watchdog", _loop_lag_watchdog,
+    ))
 
     summary_task = None
     if LOG_CHANNEL_ID:
         from src.watcher.summary import run_daily_summary
-        summary_task = asyncio.create_task(
-            run_daily_summary(ptb_app.bot, LOG_CHANNEL_ID)
-        )
-        _supervise("daily_summary", summary_task)
+        summary_task = asyncio.create_task(_supervised(
+            "daily_summary",
+            lambda: run_daily_summary(ptb_app.bot, LOG_CHANNEL_ID),
+            notify=_report_death,
+        ))
 
     try:
         await stop_event.wait()  # run until a shutdown signal arrives
@@ -527,7 +607,7 @@ async def main():
         except Exception as e:
             logger.warning(f"updater.stop() failed: {e}")
 
-        tasks = [keepalive_task, retention_task]
+        tasks = [keepalive_task, retention_task, watchdog_task]
         if summary_task:
             tasks.append(summary_task)
         if pyro_client:
