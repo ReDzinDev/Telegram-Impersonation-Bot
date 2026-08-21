@@ -221,6 +221,15 @@ def init_db():
                     ADD COLUMN IF NOT EXISTS action_mode TEXT NOT NULL DEFAULT 'ban';
             """)
 
+            # Resume point for a capped sweep. Without it, a sweep that hit
+            # SWEEP_HARD_CAP_SECONDS restarted from the first member every run,
+            # so the same prefix was re-scanned forever and the tail was never
+            # scanned at all.
+            cur.execute("""
+                ALTER TABLE groups
+                    ADD COLUMN IF NOT EXISTS sweep_offset INTEGER NOT NULL DEFAULT 0;
+            """)
+
             # Migration: drop the legacy check_mode column. We only support
             # the equivalent of RELAXED now (real-time Pyrogram watcher +
             # 6h auto-sweep cover what STRICT used to add).
@@ -563,6 +572,45 @@ def set_group_log_channel(group_id: int, log_channel_id: int | None) -> bool:
         return updated > 0
     except Exception as e:
         logger.error(f"set_group_log_channel error: {e}")
+        conn.rollback()
+        return False
+    finally:
+        put_connection(conn)
+
+
+def get_group_sweep_offset(group_id: int) -> int:
+    """
+    How many members the last capped sweep of this group got through.
+
+    0 means "start from the beginning". Reads through get_group so it shares
+    that function's cache and its fail-closed contract; an unreadable config
+    just restarts the pass, which is safe if wasteful.
+    """
+    try:
+        group = get_group(group_id)
+    except DatabaseUnavailable:
+        return 0
+    return int((group or {}).get("sweep_offset") or 0)
+
+
+def set_group_sweep_offset(group_id: int, offset: int) -> bool:
+    """Persist the resume point (0 clears it after a complete pass)."""
+    conn = get_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE groups SET sweep_offset = %s, updated_at = NOW() "
+                "WHERE group_id = %s",
+                (max(0, int(offset)), group_id),
+            )
+            updated = cur.rowcount
+        conn.commit()
+        _invalidate_group_cache(group_id)
+        return updated > 0
+    except Exception as e:
+        logger.error(f"set_group_sweep_offset error: {e}")
         conn.rollback()
         return False
     finally:

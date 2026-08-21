@@ -1,5 +1,6 @@
 
 import asyncio
+import html
 import logging
 import signal
 from concurrent.futures import ThreadPoolExecutor
@@ -134,6 +135,71 @@ BOT_COMMANDS = [
 ]
 
 
+async def _start_watcher(pyro_client, bot=None, log_channel_id=None):
+    """
+    Start the MTProto watcher, or return None so the bot runs Bot-API-only.
+
+    This used to be a bare `await pyro_client.start()` sitting outside the
+    try/finally and after polling had begun, so a revoked session, a malformed
+    session string, or a non-integer api_id escaped main() with the getUpdates
+    long-poll still open and nothing calling updater.stop(). That produced the
+    `Conflict: terminated by other getUpdates request` churn the SIGTERM
+    handling exists to prevent, then a 10x crash-loop and a dead service —
+    even though group moderation is entirely Bot API and would have kept
+    working.
+
+    Degrading is the right outcome: bans, joins and message scans continue,
+    only profile-change events and full sweeps are lost. health.py already has
+    the matching terminal-session semantics.
+    """
+    if not pyro_client:
+        return None
+
+    try:
+        await pyro_client.start()
+    except Exception as e:
+        logger.error(
+            "Pyrogram watcher could not start — continuing WITHOUT it. "
+            "Profile-change monitoring and full sweeps are unavailable; "
+            "bans, joins and message scans are unaffected. "
+            f"Regenerate PYROGRAM_SESSION if this persists. ({type(e).__name__}: {e})",
+            exc_info=e,
+        )
+        if bot and log_channel_id:
+            try:
+                await bot.send_message(
+                    chat_id=log_channel_id,
+                    text=(
+                        "⚠️ <b>Pyrogram watcher failed to start</b>\n"
+                        f"<code>{html.escape(type(e).__name__)}: "
+                        f"{html.escape(str(e)[:200])}</code>\n\n"
+                        "Running in Bot-API-only mode: profile-change detection "
+                        "and /sweep are DOWN. Joins and message scans still work. "
+                        "Regenerate <code>PYROGRAM_SESSION</code> and redeploy."
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                logger.warning("Could not report watcher failure to the log channel.")
+        return None
+
+    logger.info("Pyrogram client started.")
+
+    # Warm up entity cache — without this, get_chat_members fails with
+    # PEER_ID_INVALID for groups the session has never interacted with.
+    # Best-effort: a cold cache costs a PEER_ID_INVALID on first sweep, which
+    # is recoverable, so a warm-up failure must not cost us the watcher.
+    logger.info("Warming up Pyrogram entity cache (iterating dialogs)…")
+    try:
+        async for _ in pyro_client.get_dialogs():
+            pass
+        logger.info("Entity cache ready.")
+    except Exception as e:
+        logger.warning(f"Could not warm up entity cache: {e}")
+
+    return pyro_client
+
+
 def build_ptb_app(pyro_client=None):
     persistence = PicklePersistence(filepath="bot_persistence")
     app = (
@@ -221,6 +287,23 @@ async def main():
         )
     )
 
+    # Install the SIGTERM/SIGINT handler FIRST. Railway sends SIGTERM on
+    # redeploy, and its default disposition kills the process instantly — the
+    # finally block never runs and the old container's getUpdates long-poll
+    # stays open, which is exactly what makes the new container log
+    # "Conflict: terminated by other getUpdates request". Installed before any
+    # slow startup work (init_db against a sleeping database, the entity-cache
+    # warm-up) so a redeploy arriving mid-boot is still handled.
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            # add_signal_handler isn't supported on Windows' default loop;
+            # KeyboardInterrupt still covers SIGINT there.
+            pass
+
     init_db()
 
     # The cross-group blocklist only propagates bans from groups the operator
@@ -278,12 +361,25 @@ async def main():
     # Register commands for both private chats and groups
     await ptb_app.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllPrivateChats())
     await ptb_app.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllGroupChats())
+
+    # Start the watcher BEFORE polling. Previously polling began first and the
+    # client was only started ~60s later, after a full get_dialogs walk — so any
+    # update arriving in that window reached handlers that call get_client() and
+    # got a client that wasn't connected yet. Those failures are swallowed at
+    # debug level in fetch.py, so a member who joined during startup was checked
+    # with no bio and no photo and nobody was told. Starting it first also means
+    # a failure here happens before the getUpdates long-poll is open.
+    pyro_client = await _start_watcher(pyro_client, ptb_app.bot, LOG_CHANNEL_ID)
+
     await ptb_app.start()
     await ptb_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
     if LOG_CHANNEL_ID:
         try:
-            pyro_status = "✅ Pyrogram watcher active" if PYROGRAM_ENABLED else "⚠️ Pyrogram watcher disabled"
+            pyro_status = (
+                "✅ Pyrogram watcher active" if pyro_client
+                else "⚠️ Pyrogram watcher disabled"
+            )
             await ptb_app.bot.send_message(
                 chat_id=LOG_CHANNEL_ID,
                 text=f"🟢 <b>Anti-Impersonator Bot started</b>\n{pyro_status}",
@@ -338,19 +434,6 @@ async def main():
         task.add_done_callback(_on_done)
 
     if pyro_client:
-        await pyro_client.start()
-        logger.info("Pyrogram client started.")
-
-        # Warm up entity cache — without this, get_chat_members fails with
-        # PEER_ID_INVALID for groups the session has never interacted with.
-        logger.info("Warming up Pyrogram entity cache (iterating dialogs)…")
-        try:
-            async for _ in pyro_client.get_dialogs():
-                pass
-            logger.info("Entity cache ready.")
-        except Exception as e:
-            logger.warning(f"Could not warm up entity cache: {e}")
-
         sweep_task = asyncio.create_task(
             run_periodic_sweeps(pyro_client, ptb_app.bot, LOG_CHANNEL_ID)
         )
@@ -371,21 +454,6 @@ async def main():
             run_daily_summary(ptb_app.bot, LOG_CHANNEL_ID)
         )
         _supervise("daily_summary", summary_task)
-
-    # Install a SIGTERM/SIGINT handler so Railway redeploys (which send SIGTERM)
-    # trigger a *graceful* shutdown. Without this, SIGTERM's default disposition
-    # kills the process instantly, the finally block never runs, and the old
-    # container's long-poll getUpdates stays open — which is exactly what makes
-    # the new container log "Conflict: terminated by other getUpdates request".
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(sig, stop_event.set)
-        except NotImplementedError:
-            # add_signal_handler isn't supported on Windows' default loop;
-            # KeyboardInterrupt still covers SIGINT there.
-            pass
 
     try:
         await stop_event.wait()  # run until a shutdown signal arrives

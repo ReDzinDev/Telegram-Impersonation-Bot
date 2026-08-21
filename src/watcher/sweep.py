@@ -26,7 +26,7 @@ from src.config import SWEEP_INTERVAL_HOURS, SWEEP_HARD_CAP_SECONDS
 from src.db import (
     get_all_group_ids, get_group, get_reserved_keywords, get_whitelist,
     is_whitelisted, mark_seen, record_sweep_run, upsert_whitelisted_user,
-    DatabaseUnavailable, run_db,
+    DatabaseUnavailable, run_db, get_group_sweep_offset, set_group_sweep_offset,
 )
 from src.utils.checker import UserSnapshot, check_user, ban_and_log
 from src.utils.image import compute_pfp_hash_bytes
@@ -93,127 +93,166 @@ async def sweep_group(
         if progress_cb:
             await progress_cb(iterated, checked, flagged)
 
+        # Where the last capped run stopped. Participant ordering is stable, so
+        # without this the same prefix was re-scanned every run and the tail was
+        # never reached — while /sweep told the admin "re-run to continue".
+        #
+        # We skip client-side rather than seeking server-side: get_chat_members
+        # manages its own internal offset and exposes no parameter for it, and
+        # driving raw channels.GetParticipants would be a far bigger, more
+        # layer-sensitive change. Skipping still costs a few cheap enumeration
+        # requests (200 members each), but the budget is spent almost entirely on
+        # the paced per-member GetFullUser/photo calls, so the run now advances
+        # into genuinely unscanned members instead of redoing the prefix.
+        start_offset = await run_db(get_group_sweep_offset, group_id)
+        if start_offset:
+            logger.info(
+                f"Resuming sweep of {group_id} after member {start_offset} "
+                "(previous run hit the cap)."
+            )
+        position = 0        # members seen from the iterator, including skipped
+
         try:
             async for member in pyro.get_chat_members(group_id):
+                position += 1
+                if position <= start_offset:
+                    continue          # already covered by an earlier run
+
                 if time.monotonic() > sweep_deadline:
                     partial = True
                     logger.warning(
                         f"Sweep hard-cap reached for group {group_id}; stopping early "
-                        f"after {iterated} members iterated — the remainder of the "
-                        f"member list was NOT scanned this run."
+                        f"after {iterated} members scanned this run (position "
+                        f"{position - 1} overall) — the remainder will be picked up "
+                        "next run."
                     )
                     break
 
-                iterated += 1
-                user = member.user
-                if not user or user.is_deleted:
-                    continue
-
-                # Skip whitelisted users immediately
-                if await run_db(is_whitelisted, group_id, user.id):
-                    continue
-
-                # Auto-whitelist current admins that /import_admins may have missed.
-                # Include admin bots (Rose, Combot, etc.) but skip the bot itself.
-                if member.status in (PyroChatMemberStatus.ADMINISTRATOR, PyroChatMemberStatus.OWNER):
-                    if user.id == bot.id:
+                # Per-member isolation. Without this, ANY exception from
+                # check_user, a hash, a fetch or a write fell through to the
+                # generic handler below and terminated the whole group's sweep —
+                # after three members, say — and it was then reported as a clean
+                # run. One pathological avatar must cost one member, not the rest
+                # of the group. (imagehash.phash is called outside image.py's own
+                # try block, so this is a real path, not a hypothetical.)
+                try:
+                    iterated += 1
+                    user = member.user
+                    if not user or user.is_deleted:
                         continue
-                    # Bots don't usually have meaningful PFPs; skip the CDN download for them
-                    pfp_bytes_admin = None if user.is_bot else await _fetch_pfp(pyro, user.id, wait=True)
-                    await run_db(
-                        upsert_whitelisted_user,
-                        group_id=group_id,
-                        user_id=user.id,
-                        username=user.username,
-                        first_name=user.first_name or "",
-                        last_name=user.last_name,
-                        pfp_hash=compute_pfp_hash_bytes(pfp_bytes_admin) if pfp_bytes_admin else None,
-                        whitelisted_by=bot.id,
-                        user_type="admin",
-                        is_bot=bool(user.is_bot),
-                    )
-                    await run_db(mark_seen, group_id, user.id)
-                    continue
 
-                # Non-admin bots can't impersonate anyone — skip them
-                if user.is_bot:
-                    continue
+                    # Skip whitelisted users immediately
+                    if await run_db(is_whitelisted, group_id, user.id):
+                        continue
 
-                # Fast path: username + name checks only — no PFP download
-                snapshot = UserSnapshot(
-                    user_id=user.id,
-                    username=user.username,
-                    first_name=user.first_name or "",
-                    last_name=user.last_name,
-                    pfp_bytes=None,
-                )
-
-                result = await check_user(snapshot, group_id)
-
-                # Lazy PFP: only fetch when there's a weak name match that needs confirmation
-                if result.needs_pfp:
-                    pfp_bytes = await _fetch_pfp(pyro, user.id, wait=True)
-                    if pfp_bytes:
-                        snapshot = UserSnapshot(
+                    # Auto-whitelist current admins that /import_admins may have missed.
+                    # Include admin bots (Rose, Combot, etc.) but skip the bot itself.
+                    if member.status in (PyroChatMemberStatus.ADMINISTRATOR, PyroChatMemberStatus.OWNER):
+                        if user.id == bot.id:
+                            continue
+                        # Bots don't usually have meaningful PFPs; skip the CDN download for them
+                        pfp_bytes_admin = None if user.is_bot else await _fetch_pfp(pyro, user.id, wait=True)
+                        await run_db(
+                            upsert_whitelisted_user,
+                            group_id=group_id,
                             user_id=user.id,
                             username=user.username,
                             first_name=user.first_name or "",
                             last_name=user.last_name,
-                            pfp_bytes=pfp_bytes,
+                            pfp_hash=compute_pfp_hash_bytes(pfp_bytes_admin) if pfp_bytes_admin else None,
+                            whitelisted_by=bot.id,
+                            user_type="admin",
+                            is_bot=bool(user.is_bot),
                         )
-                        result = await check_user(snapshot, group_id)
+                        await run_db(mark_seen, group_id, user.id)
+                        continue
 
-                # Lazy bio: name/username were clean, but the group has reserved
-                # keywords — a scammer's banned word might be hiding in their bio
-                # (which Bot API can't see and `get_chat_members` doesn't return).
-                # One extra MTProto call per still-unflagged non-bot member.
-                # wait=True rides out flood cooldowns instead of silently
-                # skipping; the pacer in src.watcher.fetch does the throttling.
-                if not result.flagged and has_keywords:
-                    bio = await _fetch_bio(pyro, user.id, wait=True)
-                    if bio is None and bio_cooldown_remaining() > 0:
-                        # The fetch was skipped (or itself flooded) — this
-                        # member's bio was NOT screened. Count it so the
-                        # summary stays honest instead of overstating coverage.
-                        bios_skipped += 1
-                    if bio:
-                        snapshot.bio = bio
-                        result = await check_user(snapshot, group_id)
+                    # Non-admin bots can't impersonate anyone — skip them
+                    if user.is_bot:
+                        continue
 
-                checked += 1
-
-                if result.flagged:
-                    flagged += 1
-
-                    # Per-group log channel, same as every foreground path.
-                    # The summary below already resolved it correctly; the
-                    # detections themselves did not.
-                    from src.utils.checker import make_action_funcs, resolve_log_channel
-                    channel = resolve_log_channel(group_id, log_channel_id)
-                    ban_func, unban_func, log_notify = make_action_funcs(bot, channel)
-
-                    await ban_and_log(
-                        result=result,
-                        snapshot=snapshot,
-                        group_id=group_id,
-                        trigger="sweep",
-                        ban_func=ban_func,
-                        unban_func=unban_func,
-                        log_channel_notify=log_notify,
+                    # Fast path: username + name checks only — no PFP download
+                    snapshot = UserSnapshot(
+                        user_id=user.id,
+                        username=user.username,
+                        first_name=user.first_name or "",
+                        last_name=user.last_name,
+                        pfp_bytes=None,
                     )
-                else:
-                    await run_db(mark_seen, group_id, user.id)
 
-                # Progress update every 50 members iterated (not just checked)
-                # so the admin sees movement even when everyone is whitelisted/admin.
-                if progress_cb and iterated % 50 == 0:
-                    await progress_cb(iterated, checked, flagged)
+                    result = await check_user(snapshot, group_id)
 
-                # Yield control to the event loop so concurrent PTB handlers
-                # (e.g. commands run during a sweep) can process their HTTP
-                # responses without timing out. Network-call pacing happens
-                # inside src.watcher.fetch, shared with every other caller.
-                await asyncio.sleep(0)
+                    # Lazy PFP: only fetch when there's a weak name match that needs confirmation
+                    if result.needs_pfp:
+                        pfp_bytes = await _fetch_pfp(pyro, user.id, wait=True)
+                        if pfp_bytes:
+                            snapshot = UserSnapshot(
+                                user_id=user.id,
+                                username=user.username,
+                                first_name=user.first_name or "",
+                                last_name=user.last_name,
+                                pfp_bytes=pfp_bytes,
+                            )
+                            result = await check_user(snapshot, group_id)
+
+                    # Lazy bio: name/username were clean, but the group has reserved
+                    # keywords — a scammer's banned word might be hiding in their bio
+                    # (which Bot API can't see and `get_chat_members` doesn't return).
+                    # One extra MTProto call per still-unflagged non-bot member.
+                    # wait=True rides out flood cooldowns instead of silently
+                    # skipping; the pacer in src.watcher.fetch does the throttling.
+                    if not result.flagged and has_keywords:
+                        bio = await _fetch_bio(pyro, user.id, wait=True)
+                        if bio is None and bio_cooldown_remaining() > 0:
+                            # The fetch was skipped (or itself flooded) — this
+                            # member's bio was NOT screened. Count it so the
+                            # summary stays honest instead of overstating coverage.
+                            bios_skipped += 1
+                        if bio:
+                            snapshot.bio = bio
+                            result = await check_user(snapshot, group_id)
+
+                    checked += 1
+
+                    if result.flagged:
+                        flagged += 1
+
+                        # Per-group log channel, same as every foreground path.
+                        # The summary below already resolved it correctly; the
+                        # detections themselves did not.
+                        from src.utils.checker import make_action_funcs, resolve_log_channel
+                        channel = resolve_log_channel(group_id, log_channel_id)
+                        ban_func, unban_func, log_notify = make_action_funcs(bot, channel)
+
+                        await ban_and_log(
+                            result=result,
+                            snapshot=snapshot,
+                            group_id=group_id,
+                            trigger="sweep",
+                            ban_func=ban_func,
+                            unban_func=unban_func,
+                            log_channel_notify=log_notify,
+                        )
+                    else:
+                        await run_db(mark_seen, group_id, user.id)
+
+                    # Progress update every 50 members iterated (not just checked)
+                    # so the admin sees movement even when everyone is whitelisted/admin.
+                    if progress_cb and iterated % 50 == 0:
+                        await progress_cb(iterated, checked, flagged)
+
+                    # Yield control to the event loop so concurrent PTB handlers
+                    # (e.g. commands run during a sweep) can process their HTTP
+                    # responses without timing out. Network-call pacing happens
+                    # inside src.watcher.fetch, shared with every other caller.
+                    await asyncio.sleep(0)
+                except Exception as e:
+                    errors += 1
+                    logger.warning(
+                        f"Skipping member {getattr(member.user, 'id', '?')} in "
+                        f"{group_id} after an error: {e}"
+                    )
+                    continue
 
         except FloodWait as e:
             # The member enumeration itself got rate-limited; we can't cheaply
@@ -224,7 +263,15 @@ async def sweep_group(
             logger.warning(
                 f"Sweep flood wait {e.value}s for group {group_id} — ending run as partial."
             )
-            await asyncio.sleep(e.value)
+            # Tell the fetch pacers too: this is an account-wide limit, and they
+            # would otherwise keep calling into the same flooded DC.
+            from src.watcher.fetch import report_flood
+            report_flood(e.value)
+            # Cap the sleep. get_chat_members floods on a limited account run to
+            # tens of minutes, and we hold the group's sweep lock throughout —
+            # blocking /sweep and stalling the remaining groups.
+            await asyncio.sleep(min(e.value, 300))
+            await run_db(set_group_sweep_offset, group_id, position)
             result = {"iterated": iterated, "checked": checked, "flagged": flagged,
                       "errors": errors, "partial": True, "bios_skipped": bios_skipped}
             await run_db(record_sweep_run, group_id, iterated, checked, flagged, errors, trigger)
@@ -232,12 +279,30 @@ async def sweep_group(
         except (ChatAdminRequired, UserNotParticipant) as e:
             logger.error(f"Sweep permission error for group {group_id}: {e}")
             errors += 1
+            partial = True
         except Exception as e:
-            logger.error(f"Sweep error for group {group_id}: {e}")
+            # An exception mid-iteration always means incomplete coverage. This
+            # used to leave partial=False, so the run was reported and recorded
+            # as a clean sweep having covered only part of the group.
+            logger.error(f"Sweep error for group {group_id}: {e}", exc_info=e)
             errors += 1
+            partial = True
 
-        # Refresh stored PFP hashes for all whitelisted users after each sweep
-        await refresh_whitelist_pfps(pyro, group_id)
+        # Persist (or clear) the resume point. A completed pass resets to 0 so
+        # the next run starts from the top again.
+        await run_db(set_group_sweep_offset, group_id, position if partial else 0)
+
+        # Refresh stored PFP hashes for whitelisted users — but not when the run
+        # was already cut short. This is unbounded work outside the deadline, and
+        # the two cases where we get here partial are exactly the ones where the
+        # budget is spent (the FloodWait path already returns early for the same
+        # reason).
+        if partial:
+            logger.info(
+                f"Skipping whitelist PFP refresh for {group_id}: run was partial."
+            )
+        else:
+            await refresh_whitelist_pfps(pyro, group_id)
 
         result = {"iterated": iterated, "checked": checked, "flagged": flagged,
                   "errors": errors, "partial": partial, "bios_skipped": bios_skipped}

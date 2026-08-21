@@ -72,30 +72,66 @@ class _Pacer:
         return max(self._flood_until - now, self._next_slot - now, 0.0)
 
     def _maybe_forgive(self) -> None:
-        if self._last_flood and time.monotonic() - self._last_flood > _FORGIVE_AFTER:
+        """
+        Reset pacing after a genuinely quiet stretch.
+
+        Quiet is measured from when the cooldown ENDS, not from when the flood
+        was recorded. on_flood honours arbitrarily long mandated waits, so
+        measuring from _last_flood meant any FloodWait longer than
+        _FORGIVE_AFTER forgot everything while still cooling down — the sweep
+        then resumed at full base speed with a virgin escalation ladder, in
+        exactly the severe case the ratchet exists for.
+        """
+        if not self._last_flood:
+            return
+        quiet_since = max(self._last_flood, self._flood_until)
+        if time.monotonic() - quiet_since > _FORGIVE_AFTER:
             self.interval = self.base_interval
             self._flood_streak = 0
             self._last_flood = 0.0
 
     async def acquire(self, max_wait: float) -> bool:
         """
-        Wait for a call slot; True means "go ahead". Returns False — caller
-        should skip the fetch — when the pending wait exceeds max_wait.
-        Concurrent callers queue on the lock, so a burst of events cannot
-        stampede past the interval.
+        Wait for a call slot; True means "go ahead". Returns False — the caller
+        should skip the fetch — when the slot lies beyond max_wait.
+
+        The slot is RESERVED under the lock and waited for outside it. Sleeping
+        while holding the lock made max_wait a lie: _pending_wait() only ever
+        saw _next_slot, never how many callers were already queued, so with N
+        callers the Nth slept (N-1) * interval while the ceiling check believed
+        the wait was one interval. Measured at 6 concurrent callers with a 2s
+        ceiling, waits reached 5s. It also serialised every caller behind one
+        sleeper — which on Pyrogram's handler workers meant the update queue
+        backed up and the watcher went deaf.
+
+        After waking we re-check the cooldown, because the RPC itself happens
+        outside the lock: another caller's in-flight call can record a flood
+        while we wait, and firing into it earns a fresh FloodWait and another
+        rung on the escalation ladder.
         """
         self._maybe_forgive()
-        if self._pending_wait() > max_wait:
-            return False
+        deadline = time.monotonic() + max_wait
+
         async with self._lock:
-            # Re-check under the lock: a FloodWait may have landed while queued.
-            wait = self._pending_wait()
-            if wait > max_wait:
+            now = time.monotonic()
+            slot = max(now, self._next_slot, self._flood_until)
+            if slot > deadline:
                 return False
-            if wait > 0:
-                await asyncio.sleep(wait)
-            self._next_slot = time.monotonic() + self.interval
-            return True
+            # Reserve before releasing, so queued callers compute their own slot
+            # from an already-advanced _next_slot instead of all picking this one.
+            self._next_slot = slot + self.interval
+
+        while True:
+            now = time.monotonic()
+            target = max(slot, self._flood_until)
+            if target <= now:
+                return True
+            if target > deadline:
+                # A cooldown landed while we waited and pushed us past the
+                # ceiling. The reserved slot is left consumed, which paces the
+                # next caller slightly more conservatively — the safe direction.
+                return False
+            await asyncio.sleep(target - now)
 
     def on_flood(self, mandated_seconds: float) -> float:
         """Record a FloodWait; returns the total cooldown being applied."""
@@ -112,6 +148,30 @@ class _Pacer:
 # download) hit different server-side budgets, so they pace independently.
 _bio_pacer = _Pacer("bio", BIO_FETCH_MIN_INTERVAL)
 _pfp_pacer = _Pacer("pfp", PFP_FETCH_MIN_INTERVAL)
+
+
+def report_flood(seconds: float, *, kind: str = "all") -> None:
+    """
+    Record a FloodWait observed OUTSIDE the paced fetch helpers.
+
+    Rate limits are per-account, not per-call-site, so a flood learned by the
+    sweep's member enumeration or the health probe is information the bio and
+    photo pacers need too. Without this they kept issuing calls into a DC that
+    had just pushed back, and each one earned its own FloodWait — ratcheting the
+    escalation ladder from what was really a single event.
+
+    kind selects a specific pacer ("bio" / "pfp"); the default backs off both,
+    which is right for a whole-account signal like PEER_FLOOD.
+    """
+    targets = {"bio": (_bio_pacer,), "pfp": (_pfp_pacer,)}.get(
+        kind, (_bio_pacer, _pfp_pacer)
+    )
+    for pacer in targets:
+        total = pacer.on_flood(seconds)
+        logger.warning(
+            f"[{pacer.name}] external flood reported ({seconds:.0f}s mandated) — "
+            f"cooling down {total:.0f}s, interval now {pacer.interval:.1f}s."
+        )
 
 
 def bio_cooldown_remaining() -> float:

@@ -71,6 +71,10 @@ async def run_health_check(pyro: Client, bot: Bot, log_channel_id: Optional[str]
                 continue
             except FloodWait as e:
                 logger.warning(f"Health-check get_me() flood wait {e.value}s.")
+                # get_me() is essentially unlimited, so a flood here means the
+                # account itself is being throttled — the fetch pacers need it.
+                from src.watcher.fetch import report_flood
+                report_flood(e.value)
                 await asyncio.sleep(min(e.value, 300))
                 continue
             except (asyncio.TimeoutError, RPCError, OSError, ConnectionError) as e:
