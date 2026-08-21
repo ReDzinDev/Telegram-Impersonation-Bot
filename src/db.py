@@ -8,6 +8,40 @@ from src.config import DATABASE_URL
 
 logger = logging.getLogger(__name__)
 
+
+class DatabaseUnavailable(Exception):
+    """
+    Raised by the security-critical readers when they cannot establish an
+    answer, so "I don't know" is never returned as an empty result.
+
+    This bot bans people on the strength of these reads. get_whitelist()
+    returning [] on a failed connection meant a database blip stripped every
+    admin's immunity, and get_group() returning None meant an alert-only group
+    silently reverted to banning. Callers that make an enforcement decision
+    must treat this as "take no action"; callers that merely display data may
+    let it propagate to the operator.
+    """
+
+
+def _stale_or_raise(cache: dict, key, what: str):
+    """
+    Fall back to an expired cache entry when a live read fails, or raise.
+
+    Serving stale data is the right trade here: a whitelist that is five
+    minutes out of date still protects the people it lists, whereas no
+    whitelist at all actively authorises bans.
+    """
+    cached = cache.get(key)
+    if cached is not None:
+        age = time.time() - cached[0]
+        logger.warning(
+            f"{what} read failed for {key}; serving cached copy "
+            f"({age:.0f}s old) rather than reporting none."
+        )
+        return cached[1]
+    raise DatabaseUnavailable(f"{what} unavailable for {key} and nothing cached")
+
+
 # ── Connection pool ──────────────────────────────────────────────────────────
 # Previously every DB call opened a fresh psycopg connection; a 1,000-member
 # sweep meant 2,000+ TCP+TLS handshakes. A process-wide pool reuses a handful
@@ -397,13 +431,20 @@ def upsert_group(group_id: int, title: str = None,
 
 
 def get_group(group_id: int) -> dict | None:
+    """
+    The group's configuration row, or None if the group isn't registered.
+
+    Raises DatabaseUnavailable if the configuration cannot be established at
+    all. None means "no such group" and nothing else — callers make ban/alert
+    decisions from this, so "I don't know" must not look like "nothing is set".
+    """
     cached = _group_cache.get(group_id)
     if cached and time.time() - cached[0] < _GROUP_CACHE_TTL:
         return cached[1]
 
     conn = get_connection()
     if not conn:
-        return None
+        return _stale_or_raise(_group_cache, group_id, "group config")
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM groups WHERE group_id = %s", (group_id,))
@@ -412,7 +453,7 @@ def get_group(group_id: int) -> dict | None:
         return row
     except Exception as e:
         logger.error(f"get_group error: {e}")
-        return None
+        return _stale_or_raise(_group_cache, group_id, "group config")
     finally:
         put_connection(conn)
 
@@ -485,13 +526,22 @@ def _invalidate_whitelist_cache(group_id: int):
 
 
 def get_whitelist(group_id: int) -> list[dict]:
+    """
+    The group's protected users. An empty list means the group genuinely has
+    none; it never means "the read failed".
+
+    Raises DatabaseUnavailable when the whitelist cannot be established, so an
+    outage can't be mistaken for "this user isn't protected". A stale cached
+    copy is always preferred to raising — protection going briefly out of date
+    is far better than protection disappearing.
+    """
     cached = _whitelist_cache.get(group_id)
     if cached and time.time() - cached[0] < _WHITELIST_CACHE_TTL:
         return cached[1]
 
     conn = get_connection()
     if not conn:
-        return []
+        return _stale_or_raise(_whitelist_cache, group_id, "whitelist")
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM whitelisted_users WHERE group_id = %s", (group_id,))
@@ -500,13 +550,19 @@ def get_whitelist(group_id: int) -> list[dict]:
         return rows
     except Exception as e:
         logger.error(f"get_whitelist error: {e}")
-        return []
+        return _stale_or_raise(_whitelist_cache, group_id, "whitelist")
     finally:
         put_connection(conn)
 
 
 def is_whitelisted(group_id: int, user_id: int) -> bool:
-    # Use the cache rather than a separate DB query
+    """
+    Whether the user is protected in this group.
+
+    Propagates DatabaseUnavailable rather than answering False on failure — a
+    False here is what authorises a ban, so it must mean "definitely not
+    protected", never "couldn't check".
+    """
     return any(r["user_id"] == user_id for r in get_whitelist(group_id))
 
 

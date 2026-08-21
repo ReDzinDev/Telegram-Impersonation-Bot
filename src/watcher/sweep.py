@@ -26,6 +26,7 @@ from src.config import SWEEP_INTERVAL_HOURS, SWEEP_HARD_CAP_SECONDS
 from src.db import (
     get_all_group_ids, get_group, get_reserved_keywords, get_whitelist,
     is_whitelisted, mark_seen, record_sweep_run, upsert_whitelisted_user,
+    DatabaseUnavailable,
 )
 from src.utils.checker import UserSnapshot, check_user, ban_and_log
 from src.utils.image import compute_pfp_hash_bytes
@@ -290,8 +291,20 @@ async def run_periodic_sweeps(pyro: Client, bot: Bot, log_channel_id: Optional[s
             await asyncio.sleep(SWEEP_INTERVAL_HOURS * 3600)
             all_ids = get_all_group_ids()
             # Only sweep groups that have at least one whitelisted user — others
-            # have nothing to check against
-            group_ids = [gid for gid in all_ids if get_whitelist(gid)]
+            # have nothing to check against.
+            #
+            # Per-group try: get_whitelist raises DatabaseUnavailable when a
+            # group's protection state can't be established, and a comprehension
+            # would let one such group abort the entire cycle. Skip that group
+            # instead — sweeping it with an unknown whitelist is exactly the
+            # fail-open behaviour we removed.
+            group_ids = []
+            for gid in all_ids:
+                try:
+                    if get_whitelist(gid):
+                        group_ids.append(gid)
+                except DatabaseUnavailable as e:
+                    logger.warning(f"Skipping sweep of {gid}: {e}")
             logger.info(
                 f"Starting scheduled sweep of {len(group_ids)}/{len(all_ids)} "
                 "group(s) (skipping unconfigured)."

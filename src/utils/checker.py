@@ -15,6 +15,7 @@ from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from src.db import (
     get_whitelist, is_whitelisted, insert_log, get_group, get_reserved_keywords,
     is_false_positive, mark_false_positive, get_known_bad_actor,
+    DatabaseUnavailable,
 )
 from src.utils.detector import (
     check_username_similarity, check_name_similarity,
@@ -69,7 +70,25 @@ async def check_user(
     """
     Run all impersonation checks for a user against the group's whitelist.
     Returns a DetectionResult — does NOT ban; callers decide what to do.
+
+    Fails CLOSED: if the group's protection state can't be established (see
+    db.DatabaseUnavailable) we return unflagged rather than proceeding on
+    partial data. Missing a detection during an outage is recoverable; banning
+    a group's own admins because their whitelist read failed is not.
     """
+    try:
+        return await _check_user(snapshot, group_id)
+    except DatabaseUnavailable as e:
+        logger.warning(
+            f"Skipping impersonation check for {snapshot.user_id} in {group_id}: {e}"
+        )
+        return DetectionResult(flagged=False)
+
+
+async def _check_user(
+    snapshot: UserSnapshot,
+    group_id: int,
+) -> DetectionResult:
     if snapshot.user_id in _SKIP_USER_IDS:
         return DetectionResult(flagged=False)
 
@@ -249,9 +268,20 @@ async def ban_and_log(
     full_name = f"{snapshot.first_name} {snapshot.last_name or ''}".strip()
     target_display = result.target_name or "Unknown"
 
-    # Determine configured action for this group
-    group = get_group(group_id)
-    action_mode = (group.get("action_mode", "ban") if group else None) or "ban"
+    # Determine configured action for this group.
+    #
+    # When the group's configuration is unknown — unregistered, or a read that
+    # couldn't be established — the fallback is "alert", NOT "ban". get_group()
+    # returns None for an unregistered group and raises DatabaseUnavailable on
+    # a failed read, but either way we must not escalate to an irreversible
+    # action on the strength of configuration we never saw. A group deliberately
+    # set to alert-only used to start banning during any database blip.
+    try:
+        group = get_group(group_id)
+    except DatabaseUnavailable as e:
+        logger.warning(f"Group config unavailable for {group_id} ({e}); alerting only.")
+        group = None
+    action_mode = (group.get("action_mode") if group else None) or "alert"
 
     # ── Severity score bands ──────────────────────────────────────────────────
     # Similarity matches carry a 0-100 confidence score. Keyword / pfp /
