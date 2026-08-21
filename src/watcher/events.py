@@ -201,8 +201,12 @@ async def _check_and_act(
         if not result.flagged:
             continue
 
-        from src.utils.checker import make_action_funcs
-        ban_func, unban_func, log_notify = make_action_funcs(bot, log_channel_id)
+        # Resolve the group's OWN log channel first — passing the global one
+        # straight through meant a per-group-channel deployment banned people
+        # with no alert and no undo button.
+        from src.utils.checker import make_action_funcs, resolve_log_channel
+        channel = resolve_log_channel(group_id, log_channel_id)
+        ban_func, unban_func, log_notify = make_action_funcs(bot, channel)
 
         await ban_and_log(
             result=result,

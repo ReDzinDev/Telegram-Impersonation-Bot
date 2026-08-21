@@ -184,8 +184,12 @@ async def sweep_group(
                 if result.flagged:
                     flagged += 1
 
-                    from src.utils.checker import make_action_funcs
-                    ban_func, unban_func, log_notify = make_action_funcs(bot, log_channel_id)
+                    # Per-group log channel, same as every foreground path.
+                    # The summary below already resolved it correctly; the
+                    # detections themselves did not.
+                    from src.utils.checker import make_action_funcs, resolve_log_channel
+                    channel = resolve_log_channel(group_id, log_channel_id)
+                    ban_func, unban_func, log_notify = make_action_funcs(bot, channel)
 
                     await ban_and_log(
                         result=result,

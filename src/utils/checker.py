@@ -457,6 +457,29 @@ async def ban_and_log(
             logger.error(f"Failed to send log channel notification: {e}")
 
 
+def resolve_log_channel(group_id: int, fallback: str | int | None) -> str | int | None:
+    """
+    The group's own log channel if it has one, else the global fallback.
+
+    The background paths (sweep, profile-change watcher) used to pass the global
+    LOG_CHANNEL_ID straight through, unlike every foreground path. Because
+    make_action_funcs yields log_notify=None for a falsy channel, a deployment
+    using only per-group channels banned people with no alert and no undo
+    button. Detections must be reportable wherever the group's admins look.
+
+    Falls back rather than raising when the config can't be read: losing the
+    alert routing shouldn't also lose the alert.
+    """
+    try:
+        group = get_group(group_id)
+    except DatabaseUnavailable as e:
+        logger.warning(
+            f"Could not resolve log channel for {group_id} ({e}); using global fallback."
+        )
+        return fallback
+    return (group.get("log_channel_id") if group else None) or fallback
+
+
 def make_action_funcs(bot, log_channel_id):
     """
     Build the (ban_func, unban_func, log_notify) trio that ban_and_log needs,
