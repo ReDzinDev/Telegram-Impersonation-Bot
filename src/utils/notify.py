@@ -18,6 +18,7 @@ Why centralize this rather than rely on per-call try/except?
 """
 from __future__ import annotations
 
+import html
 import logging
 from typing import Optional
 
@@ -121,7 +122,12 @@ async def _alert_operator(bot: Bot, channel_id: int, last_exc: Exception) -> Non
         for gid in get_all_group_ids():
             grp = get_group(gid)
             if grp and grp.get("log_channel_id") == channel_id:
-                title = grp.get("title") or str(gid)
+                # Group titles are attacker-controlled — upsert_group stores
+                # chat.title verbatim. Unescaped, a tenant could spoof this
+                # operator alert, or break the send with a bare '<' and thereby
+                # permanently suppress the only log-channel outage signal
+                # there is (the send failure below is swallowed by design).
+                title = html.escape(grp.get("title") or str(gid))
                 affected.append(f"• {title} (<code>{gid}</code>)")
     except Exception as e:
         logger.warning(f"Could not enumerate affected groups for {channel_id}: {e}")
@@ -135,7 +141,8 @@ async def _alert_operator(bot: Bot, channel_id: int, last_exc: Exception) -> Non
         f"📡 <b>Log channel unreachable</b>\n"
         f"Channel <code>{channel_id}</code> has failed "
         f"{_FAILURE_THRESHOLD} sends in a row.\n"
-        f"<b>Last error:</b> <code>{type(last_exc).__name__}: {str(last_exc)[:200]}</code>\n\n"
+        f"<b>Last error:</b> <code>{html.escape(type(last_exc).__name__)}: "
+        f"{html.escape(str(last_exc)[:200])}</code>\n\n"
         f"<b>Affected groups:</b>\n{affected_block}\n\n"
         "<i>Most common cause: the bot was kicked or lost admin rights in the channel. "
         "Re-add it as an admin or run /setlogchannel to point somewhere else.</i>"

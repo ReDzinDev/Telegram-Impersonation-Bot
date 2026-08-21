@@ -41,8 +41,60 @@ _clearwhitelist_undo: dict[int, list[dict]] = {}
 # ── Private-chat group context helpers ────────────────────────────────────────
 
 # 5-minute admin status cache: (user_id, group_id) → (expires_monotonic, is_admin)
-_admin_cache: dict[tuple[int, int], tuple[float, bool]] = {}
+# (user_id, group_id) -> (expires_at, is_admin, can_moderate)
+_admin_cache: dict[tuple[int, int], tuple[float, bool, bool]] = {}
 _ADMIN_CACHE_TTL = 300  # seconds
+# Bound the dict: it previously grew one entry per (user, group) pair ever seen,
+# with nothing ever evicting it.
+_ADMIN_CACHE_MAX = 4096
+
+
+def _member_rights(member) -> tuple[bool, bool]:
+    """
+    Derive (is_admin, can_moderate) from a ChatMember.
+
+    Being *listed* as an admin is not the same as being trusted to remove
+    people. A decorative admin — promoted with no rights, or only something
+    like can_pin_messages — used to be able to drive the BOT's ban rights via
+    /ban, /clearwhitelist and the alert buttons, bypassing whatever delegation
+    the group actually intended.
+
+    So configuration still needs only admin status, while anything that removes
+    a user requires can_restrict_members. Owners always have both. Fails closed
+    when the rights field is absent from the payload.
+    """
+    status = getattr(member, "status", None)
+    if status == ChatMemberStatus.OWNER:
+        return True, True
+    if status == ChatMemberStatus.ADMINISTRATOR:
+        return True, bool(getattr(member, "can_restrict_members", False))
+    return False, False
+
+
+def invalidate_admin_cache(user_id: int, group_id: int) -> None:
+    """
+    Drop a cached privilege decision.
+
+    Called when a CHAT_MEMBER update says this user's status in this group
+    changed. Without it, a demoted admin (or one who left) kept full authority
+    for the remainder of the TTL.
+    """
+    if _admin_cache.pop((user_id, group_id), None) is not None:
+        logger.info(
+            f"Admin cache evicted for user {user_id} in {group_id} "
+            "(membership changed)."
+        )
+
+
+def _cache_admin_result(user_id: int, group_id: int,
+                        is_admin: bool, can_moderate: bool) -> None:
+    """Cache a positive result, evicting the oldest entries if the dict is full."""
+    if len(_admin_cache) >= _ADMIN_CACHE_MAX:
+        for stale_key in sorted(_admin_cache, key=lambda k: _admin_cache[k][0])[:512]:
+            _admin_cache.pop(stale_key, None)
+    _admin_cache[(user_id, group_id)] = (
+        _time.monotonic() + _ADMIN_CACHE_TTL, is_admin, can_moderate,
+    )
 
 
 async def _get_active_group(
@@ -85,6 +137,7 @@ async def _is_admin(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     group_id: int | None = None,
+    require_moderation: bool = False,
 ) -> bool:
     """
     Check if the command sender is an admin of the relevant group.
@@ -105,9 +158,9 @@ async def _is_admin(
     cache_key = (user_id, gid)
     now = _time.monotonic()
     if cache_key in _admin_cache:
-        expires_at, cached = _admin_cache[cache_key]
+        expires_at, is_admin, can_moderate = _admin_cache[cache_key]
         if now < expires_at:
-            return cached
+            return can_moderate if require_moderation else is_admin
 
     # Live API call
     try:
@@ -115,21 +168,22 @@ async def _is_admin(
             member = await update.effective_chat.get_member(user_id)
         else:
             member = await context.bot.get_chat_member(gid, user_id)
-        result = member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
+        is_admin, can_moderate = _member_rights(member)
     except Exception as e:
         logger.warning(f"Admin check failed for user {user_id} in group {gid}: {e}")
-        result = False
+        return False
 
-    if result:
+    if is_admin:
         # Only cache positive results. Caching a transient get_chat_member
         # failure (network blip) as False would lock a real admin out of every
         # command for the full TTL.
-        _admin_cache[cache_key] = (now + _ADMIN_CACHE_TTL, result)
-    return result
+        _cache_admin_result(user_id, gid, is_admin, can_moderate)
+    return can_moderate if require_moderation else is_admin
 
 
 async def _is_admin_of_group(
-    context: ContextTypes.DEFAULT_TYPE, group_id: int, user_id: int
+    context: ContextTypes.DEFAULT_TYPE, group_id: int, user_id: int,
+    require_moderation: bool = False,
 ) -> bool:
     """
     Verify a user is an admin/owner of a specific group by user_id + group_id.
@@ -143,22 +197,23 @@ async def _is_admin_of_group(
     cache_key = (user_id, group_id)
     now = _time.monotonic()
     if cache_key in _admin_cache:
-        expires_at, cached = _admin_cache[cache_key]
+        expires_at, is_admin, can_moderate = _admin_cache[cache_key]
         if now < expires_at:
-            return cached
+            return can_moderate if require_moderation else is_admin
     try:
         member = await context.bot.get_chat_member(group_id, user_id)
-        result = member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
+        is_admin, can_moderate = _member_rights(member)
     except Exception as e:
         logger.warning(f"Admin check failed for user {user_id} in group {group_id}: {e}")
         return False  # don't cache transient failures
-    if result:
-        _admin_cache[cache_key] = (now + _ADMIN_CACHE_TTL, result)
-    return result
+    if is_admin:
+        _cache_admin_result(user_id, group_id, is_admin, can_moderate)
+    return can_moderate if require_moderation else is_admin
 
 
 async def _get_admin_group(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+    require_moderation: bool = False,
 ) -> tuple[int, str] | None:
     """
     Combined helper: resolve the active group then verify the caller is an admin.
@@ -181,11 +236,23 @@ async def _get_admin_group(
         return None  # _get_active_group already sent the group picker
 
     group_id, group_title = ctx
-    if not await _is_admin(update, context, group_id=group_id):
-        await update.message.reply_text(
-            "Only admins of the selected group can use this. "
-            "Use /start to pick a group you administer."
-        )
+    if not await _is_admin(
+        update, context, group_id=group_id, require_moderation=require_moderation
+    ):
+        if require_moderation:
+            # Distinguish "not an admin" from "admin without the right", or the
+            # admin has no idea why a command they can see is refused.
+            await update.message.reply_text(
+                "This action removes users, so it needs the <b>Ban users</b> "
+                "permission in that group. Ask an owner to grant it, or have "
+                "someone who has it run this.",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(
+                "Only admins of the selected group can use this. "
+                "Use /start to pick a group you administer."
+            )
         return None
 
     return group_id, group_title
@@ -225,6 +292,60 @@ async def _fetch_group_pfp_hash(bot, chat) -> str | None:
     except Exception as e:
         logger.warning(f"Could not fetch group PFP for {chat.id}: {e}")
     return None
+
+
+async def _verify_log_channel_target(
+    context: ContextTypes.DEFAULT_TYPE, channel_id: int, user_id: int
+) -> tuple[bool, str | None]:
+    """
+    Check the caller may bind `channel_id` as a log channel.
+
+    Returns (ok, error_message_for_the_admin).
+
+    Previously the only gate was "the bot can post there", so an admin of any
+    throwaway group could point that group's log channel at any other chat the
+    bot happened to be in — receiving its detection alerts (with live
+    moderation buttons) and, via /clearwhitelist, a CSV of every protected
+    user's id, username and name. Rights on the target are what authorise the
+    binding, so we check them on the target, not on the group.
+
+    Fails closed: if the chat or the membership can't be read, refuse. The
+    chat_is_channel flag on a chat_shared payload is a client-side hint and is
+    not trusted, so the type is verified server-side here.
+    """
+    try:
+        chat = await context.bot.get_chat(channel_id)
+    except Exception as e:
+        logger.warning(f"Log-channel target {channel_id} unreadable: {e}")
+        return False, (
+            f"❌ Could not read <code>{channel_id}</code>. Add the bot to that "
+            "channel as an admin first."
+        )
+
+    if getattr(chat, "type", None) != ChatType.CHANNEL:
+        return False, (
+            "❌ That isn't a channel. A log channel must be a Telegram channel — "
+            "pick one, or create one and add the bot as an admin."
+        )
+
+    try:
+        member = await context.bot.get_chat_member(channel_id, user_id)
+    except Exception as e:
+        logger.warning(
+            f"Could not verify {user_id}'s rights in log-channel target {channel_id}: {e}"
+        )
+        return False, (
+            "❌ Could not verify your rights in that channel. You must be an "
+            "admin there to send this group's alerts to it."
+        )
+
+    if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+        return False, (
+            "❌ You must be an admin of that channel to point this group's "
+            "alerts at it."
+        )
+
+    return True, None
 
 
 def _resolve_log_channel(group_id: int, context: ContextTypes.DEFAULT_TYPE) -> int | None:
@@ -376,6 +497,17 @@ async def handle_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
 
+        # The shared chat is attacker-supplied too: verify the caller actually
+        # has rights in it, and that it really is a channel.
+        ok, err = await _verify_log_channel_target(
+            context, chat_id, update.effective_user.id
+        )
+        if not ok:
+            await update.message.reply_text(
+                err, parse_mode="HTML", reply_markup=ReplyKeyboardRemove()
+            )
+            return
+
         # Verify the bot can post to the channel
         try:
             channel_chat  = await context.bot.get_chat(chat_id)
@@ -439,7 +571,7 @@ async def _import_admins_logic(
         chat   = await context.bot.get_chat(chat_id)
         admins = await chat.get_administrators()
     except Exception as e:
-        return False, f"❌ Could not access the group. Is the bot an admin there? (<code>{e}</code>)"
+        return False, f"❌ Could not access the group. Is the bot an admin there? (<code>{html.escape(str(e))}</code>)"
 
     # Store the group's own PFP so the bot can detect impersonators of the group itself
     group_pfp_hash = await _fetch_group_pfp_hash(context.bot, chat)
@@ -621,7 +753,7 @@ async def whitelist_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pyro_user = await pyro.get_users(target_id)
             except Exception as e:
                 await update.message.reply_text(
-                    f"❌ Could not resolve user <code>{target_id}</code>: <code>{e}</code>",
+                    f"❌ Could not resolve user <code>{target_id}</code>: <code>{html.escape(str(e))}</code>",
                     parse_mode="HTML",
                 )
                 return
@@ -736,7 +868,7 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     On success, posts a short notice to the group's log channel so the
     action shows up alongside automatic detections in the audit trail.
     """
-    ctx = await _get_admin_group(update, context)
+    ctx = await _get_admin_group(update, context, require_moderation=True)
     if not ctx:
         return
     group_id, _ = ctx
@@ -775,7 +907,7 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 })()
             except Exception as e:
                 await update.message.reply_text(
-                    f"❌ Could not resolve <code>{html.escape(arg)}</code>: <code>{e}</code>",
+                    f"❌ Could not resolve <code>{html.escape(arg)}</code>: <code>{html.escape(str(e))}</code>",
                     parse_mode="HTML",
                 )
                 return
@@ -846,7 +978,7 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<b>By:</b> <a href='tg://user?id={admin.id}'>{html.escape(admin.full_name)}</a>"
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to ban: <code>{e}</code>", parse_mode="HTML")
+        await update.message.reply_text(f"❌ Failed to ban: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
 
 
 # ── /unban ─────────────────────────────────────────────────────────────────────
@@ -886,7 +1018,7 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<b>By:</b> <a href='tg://user?id={admin.id}'>{html.escape(admin.full_name)}</a>"
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to unban: <code>{e}</code>", parse_mode="HTML")
+        await update.message.reply_text(f"❌ Failed to unban: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
 
 
 # ── /sweep ─────────────────────────────────────────────────────────────────────
@@ -932,7 +1064,7 @@ async def sweep(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.error(f"Sweep command error for {group_id}: {e}")
-        await status_msg.edit_text(f"❌ Sweep failed: <code>{e}</code>", parse_mode="HTML")
+        await status_msg.edit_text(f"❌ Sweep failed: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
         return
 
     if result.get("status") == "already_running":
@@ -1198,6 +1330,15 @@ async def set_log_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Rights on the TARGET authorise the binding — being an admin of this group
+    # does not entitle you to redirect its alerts into someone else's channel.
+    ok, err = await _verify_log_channel_target(
+        context, channel_id, update.effective_user.id
+    )
+    if not ok:
+        await update.message.reply_text(err, parse_mode="HTML")
+        return
+
     try:
         await context.bot.send_message(
             chat_id=channel_id,
@@ -1206,7 +1347,7 @@ async def set_log_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         await update.message.reply_text(
-            f"❌ Could not post to <code>{channel_id}</code>: <code>{e}</code>\n\n"
+            f"❌ Could not post to <code>{channel_id}</code>: <code>{html.escape(str(e))}</code>\n\n"
             "Make sure the bot is an admin in that channel.",
             parse_mode="HTML",
         )
@@ -1405,7 +1546,13 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
     # blocklist. They live in a log channel that may contain non-admins, and
     # group_id comes from the (forgeable) payload — so we MUST confirm the
     # presser is actually an admin of *that* group before doing anything.
-    if not await _is_admin_of_group(context, group_id, query.from_user.id):
+    # ban_now / kick_now remove a user, so they need the Ban users right;
+    # the reversal and dismiss actions only need admin status.
+    needs_moderation = action in ("ban_now", "kick_now")
+    if not await _is_admin_of_group(
+        context, group_id, query.from_user.id,
+        require_moderation=needs_moderation,
+    ):
         await query.answer("Only admins of that group can do this.", show_alert=True)
         return
 
@@ -1834,7 +1981,10 @@ def _build_logs_view(group_id: int, limit: int = 50) -> tuple[str, list[str]]:
             tgt_display = _logs_user_link(
                 r["target_user_id"], r["target_name"], r.get("target_username")
             )
-        lines.append(f"🚨 <b>{dt}</b> — {imp_link} → {tgt_display} | <i>{dtype}</i> | {action}")
+        lines.append(
+            f"🚨 <b>{dt}</b> — {imp_link} → {tgt_display} | "
+            f"<i>{html.escape(str(dtype))}</i> | {html.escape(str(action))}"
+        )
 
     for r in actions:
         dt = r["created_at"].strftime("%m-%d %H:%M") if r["created_at"] else "?"
@@ -2016,7 +2166,7 @@ async def import_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw_bytes = await file.download_as_bytearray()
         text = raw_bytes.decode("utf-8", errors="replace")
     except Exception as e:
-        await update.message.reply_text(f"❌ Could not download file: <code>{e}</code>", parse_mode="HTML")
+        await update.message.reply_text(f"❌ Could not download file: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
         return
 
     header = set(csv.DictReader(io.StringIO(text)).fieldnames or [])
@@ -2551,7 +2701,7 @@ async def clear_whitelist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     /importwhitelist on that file. Mirrors the format /listwhitelist
     emits so the round-trip works without translation.
     """
-    ctx = await _get_admin_group(update, context)
+    ctx = await _get_admin_group(update, context, require_moderation=True)
     if not ctx:
         return
     group_id, group_title = ctx

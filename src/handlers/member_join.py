@@ -8,6 +8,7 @@ from telegram.constants import ChatMemberStatus, ChatType
 from src.db import upsert_group, is_whitelisted, get_group, get_reserved_keywords, upsert_whitelisted_user, mark_seen
 from src.utils.checker import UserSnapshot, check_user, ban_and_log
 from src.utils.image import compute_pfp_hash_bytes
+from src.handlers.commands import invalidate_admin_cache
 from src.watcher.fetch import fetch_bio as _fetch_bio
 from src.config import LOG_CHANNEL_ID
 
@@ -71,6 +72,12 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
     old_member = result.old_chat_member
     user = new_member.user
     group_id = update.effective_chat.id
+
+    # This user's standing in this group just changed, so any cached privilege
+    # decision about them is stale. Without this, a demoted admin — or one who
+    # left — kept /ban and /clearwhitelist for the rest of the 5-minute TTL.
+    if new_member.status != old_member.status:
+        invalidate_admin_cache(user.id, group_id)
 
     # Auto-whitelist when a member is promoted to admin (handles ongoing admin changes
     # that /import_admins would miss since it's a one-time snapshot).
