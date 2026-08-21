@@ -103,6 +103,35 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
     logger.error("Unhandled PTB exception", exc_info=err)
 
 
+# The advertised command menu. Module-level so a test can assert it matches the
+# handlers actually registered below — /importwhitelist was documented and named
+# in the bot's own recovery message for months while never being registered.
+BOT_COMMANDS = [
+    BotCommand("import_admins",   "Whitelist all current group admins"),
+    BotCommand("whitelist",       "Whitelist a user (reply or ID)"),
+    BotCommand("unwhitelist",     "Remove from whitelist (reply or ID)"),
+    BotCommand("listwhitelist",   "Show whitelist + download CSV"),
+    BotCommand("importwhitelist", "Restore a whitelist from a CSV (reply to the file)"),
+    BotCommand("ban",             "Manually ban a user (reply or ID)"),
+    BotCommand("unban",           "Unban a user by ID"),
+    BotCommand("sweep",           "Run a full member scan"),
+    BotCommand("setaction",       "Set detection action: ban, kick, or alert"),
+    BotCommand("setlogchannel",   "Set per-group log channel"),
+    BotCommand("stats",           "Show stats: all-time / 30d / 7d"),
+    BotCommand("addkeyword",      "Add keyword(s) — supports *wildcards*, commas, r:regex"),
+    BotCommand("removekeyword",   "Remove a reserved keyword"),
+    BotCommand("listkeywords",    "List all reserved keywords"),
+    BotCommand("setthreshold",    "Set fuzzy-match sensitivity (default 85)"),
+    BotCommand("setthresholds",   "Per-type thresholds (username=88 name=85)"),
+    BotCommand("setbands",        "Set severity bands (e.g. /setbands 90 78)"),
+    BotCommand("blocklist",       "Toggle cross-group blocklist (on/off)"),
+    BotCommand("protect",         "Protect an external identity by name (+ photo)"),
+    BotCommand("settings",        "Show this group's full configuration"),
+    BotCommand("logs",            "Recent detections + admin actions"),
+    BotCommand("clearwhitelist",  "⚠️ Remove all protected users (requires confirm)"),
+]
+
+
 def build_ptb_app(pyro_client=None):
     persistence = PicklePersistence(filepath="bot_persistence")
     app = (
@@ -138,6 +167,7 @@ def build_ptb_app(pyro_client=None):
     app.add_handler(CommandHandler("settings",        settings))
     app.add_handler(CommandHandler("logs",            logs))
     app.add_handler(CommandHandler("clearwhitelist",  clear_whitelist_cmd))
+    app.add_handler(CommandHandler("importwhitelist", import_whitelist))
     app.add_handler(MessageHandler(
         filters.Document.FileExtension("csv") & filters.ChatType.PRIVATE,
         import_whitelist,
@@ -204,36 +234,18 @@ async def main():
 
     # Start PTB (non-blocking polling)
     await ptb_app.initialize()
-    # Set pyro_client AFTER initialize() so PicklePersistence doesn't overwrite it
-    # (Pyrogram Client is not picklable — persisted bot_data would store None)
-    if pyro_client:
-        ptb_app.bot_data["pyro_client"] = pyro_client
-    commands = [
-        BotCommand("import_admins",   "Whitelist all current group admins"),
-        BotCommand("whitelist",       "Whitelist a user (reply or ID)"),
-        BotCommand("unwhitelist",     "Remove from whitelist (reply or ID)"),
-        BotCommand("listwhitelist",   "Show whitelist + download CSV"),
-        BotCommand("ban",             "Manually ban a user (reply or ID)"),
-        BotCommand("unban",           "Unban a user by ID"),
-        BotCommand("sweep",           "Run a full member scan"),
-        BotCommand("setaction",       "Set detection action: ban, kick, or alert"),
-        BotCommand("setlogchannel",   "Set per-group log channel"),
-        BotCommand("stats",           "Show stats: all-time / 30d / 7d"),
-        BotCommand("addkeyword",      "Add keyword(s) — supports *wildcards*, commas, r:regex"),
-        BotCommand("removekeyword",   "Remove a reserved keyword"),
-        BotCommand("listkeywords",    "List all reserved keywords"),
-        BotCommand("setthreshold",    "Set fuzzy-match sensitivity (default 85)"),
-        BotCommand("setthresholds",   "Per-type thresholds (username=88 name=85)"),
-        BotCommand("setbands",        "Set severity bands (e.g. /setbands 90 78)"),
-        BotCommand("blocklist",       "Toggle cross-group blocklist (on/off)"),
-        BotCommand("protect",         "Protect an external identity by name (+ photo)"),
-        BotCommand("settings",        "Show this group's full configuration"),
-        BotCommand("logs",            "Recent detections + admin actions"),
-        BotCommand("clearwhitelist",  "⚠️ Remove all protected users (requires confirm)"),
-    ]
+
+    # The Pyrogram client deliberately does NOT go into bot_data. PTB snapshots
+    # bot_data with copy.deepcopy on every persistence interval, and a Pyrogram
+    # Client can't be deep-copied — that killed the persistence updater on its
+    # first tick (so nothing was ever persisted) and then made Application.stop()
+    # re-raise the TypeError, skipping shutdown() entirely. Handlers reach the
+    # client through src.watcher.client.get_client(), which needs no pickling.
+    # build_client() already registered it.
+
     # Register commands for both private chats and groups
-    await ptb_app.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
-    await ptb_app.bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
+    await ptb_app.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+    await ptb_app.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllGroupChats())
     await ptb_app.start()
     await ptb_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 

@@ -138,7 +138,8 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Fetch bio via Pyrogram when the group has reserved keywords — the Bot API
     # cannot read bios, so a keyword hiding there would be missed without this.
     bio: str | None = None
-    pyro = context.bot_data.get("pyro_client")
+    from src.watcher.client import get_client
+    pyro = get_client()
     if pyro and get_reserved_keywords(group_id):
         try:
             bio = await _fetch_bio(pyro, user.id)

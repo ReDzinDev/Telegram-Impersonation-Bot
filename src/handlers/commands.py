@@ -191,6 +191,18 @@ async def _get_admin_group(
     return group_id, group_title
 
 
+def _pyro():
+    """
+    The MTProto client, or None when the watcher is disabled.
+
+    Deliberately not read from bot_data: PTB deep-copies bot_data on every
+    persistence interval and a Pyrogram Client is not copyable, which silently
+    killed persistence and shutdown. See src/watcher/client.py.
+    """
+    from src.watcher.client import get_client
+    return get_client()
+
+
 async def _fetch_pfp(user) -> str | None:
     try:
         photos = await user.get_profile_photos(limit=1)
@@ -383,7 +395,11 @@ async def handle_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
 
         upsert_group(g_id, title=g_title)
-        set_group_log_channel(g_id, chat_id)
+        if not set_group_log_channel(g_id, chat_id):
+            await update.message.reply_text(
+                "❌ Could not save that — the database rejected the write (the group may not be registered, or the DB is unavailable). Nothing was changed; try again.", reply_markup=ReplyKeyboardRemove()
+            )
+            return
         await update.message.reply_text(
             f"✅ Log channel set to <b>{html.escape(channel_title)}</b> "
             f"(<code>{chat_id}</code>) for <b>{html.escape(g_title)}</b>.",
@@ -459,7 +475,7 @@ async def _import_admins_logic(
     # admin bots (Rose, Combot, …) never appear in the loop above. Backfill
     # them via MTProto, which does return bot admins. Requires the Pyrogram
     # userbot to be a member of the group (same assumption as /sweep).
-    pyro = context.bot_data.get("pyro_client")
+    pyro = _pyro()
     mtproto_note = ""
     if not pyro:
         mtproto_note = (
@@ -592,7 +608,7 @@ async def whitelist_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             # Fall back to the Pyrogram userbot — required for users
             # who haven't joined the group yet (proactive whitelisting)
-            pyro = context.bot_data.get("pyro_client")
+            pyro = _pyro()
             if not pyro:
                 await update.message.reply_text(
                     f"❌ Could not find user <code>{target_id}</code> in this group.\n"
@@ -634,7 +650,7 @@ async def whitelist_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         last_name  = pyro_user.last_name
         full_name  = f"{first_name} {last_name or ''}".strip()
         is_bot     = bool(getattr(pyro_user, "is_bot", False))
-        pfp_hash   = await _fetch_pfp_pyro(context.bot_data["pyro_client"], user_id)
+        pfp_hash   = await _fetch_pfp_pyro(pyro, user_id)
 
     ok = upsert_whitelisted_user(
         group_id=group_id,
@@ -736,7 +752,7 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         arg = context.args[0].lstrip()
         # @username path — needs Pyrogram (Bot API can't resolve handles)
         if arg.startswith("@"):
-            pyro = context.bot_data.get("pyro_client")
+            pyro = _pyro()
             if not pyro:
                 await update.message.reply_text(
                     "⚠️ Resolving @usernames requires the Pyrogram watcher. "
@@ -881,7 +897,7 @@ async def sweep(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     group_id, _ = ctx
 
-    pyro = context.bot_data.get("pyro_client")
+    pyro = _pyro()
     if not pyro:
         await update.message.reply_text(
             "⚠️ Sweep requires the Pyrogram watcher to be configured.\n"
@@ -983,7 +999,9 @@ async def setaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mode = context.args[0].lower()
     upsert_group(group_id, title=group_title)
-    set_group_action_mode(group_id, mode)
+    if not set_group_action_mode(group_id, mode):
+        await update.message.reply_text("❌ Could not save that — the database rejected the write (the group may not be registered, or the DB is unavailable). Nothing was changed; try again.")
+        return
     log_admin_action(
         group_id=group_id,
         admin_id=update.effective_user.id,
@@ -1166,7 +1184,9 @@ async def set_log_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_group(group_id, title=group_title)
 
     if context.args[0].lower() == "clear":
-        set_group_log_channel(group_id, None)
+        if not set_group_log_channel(group_id, None):
+            await update.message.reply_text("❌ Could not save that — the database rejected the write (the group may not be registered, or the DB is unavailable). Nothing was changed; try again.")
+            return
         await update.message.reply_text("✅ Log channel cleared — falling back to global setting.")
         return
 
@@ -1192,7 +1212,9 @@ async def set_log_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    set_group_log_channel(group_id, channel_id)
+    if not set_group_log_channel(group_id, channel_id):
+        await update.message.reply_text("❌ Could not save that — the database rejected the write (the group may not be registered, or the DB is unavailable). Nothing was changed; try again.")
+        return
     await update.message.reply_text(
         f"✅ Log channel set to <code>{channel_id}</code>.", parse_mode="HTML"
     )
@@ -1472,7 +1494,7 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
         else:
             first_name, last_name, username = "Unknown", None, None
 
-        upsert_whitelisted_user(
+        protected = upsert_whitelisted_user(
             group_id=group_id,
             user_id=user_id,
             username=username,
@@ -1482,6 +1504,20 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
             whitelisted_by=query.from_user.id,
             user_type="manual",
         )
+        if not protected:
+            # The unban already went through, so failing quietly here would
+            # leave the user unbanned but UNPROTECTED — and the next sweep would
+            # re-ban them. Say so instead of showing a checkmark.
+            logger.error(
+                f"Whitelist write failed for {user_id} in {group_id} after unban "
+                "from alert button — user is unbanned but not protected."
+            )
+            await query.answer(
+                "Unbanned, but the whitelist write FAILED — they are not "
+                "protected and may be re-flagged. Retry with /whitelist.",
+                show_alert=True,
+            )
+            return
 
         # Clear from cross-group blocklist — false-positive reversal
         remove_known_bad_actor(user_id)
@@ -1517,7 +1553,22 @@ async def handle_detection_callback(update: Update, context: ContextTypes.DEFAUL
 
         entry = get_latest_log_entry(group_id, user_id)
         was_banned = entry and entry.get("action_taken") in ("banned", "kicked")
-        mark_false_positive(group_id, user_id, cleared_by=query.from_user.id, days=30)
+        if not mark_false_positive(
+            group_id, user_id, cleared_by=query.from_user.id, days=30
+        ):
+            # Same hazard as the whitelist branch: the unban has happened, so a
+            # silent failure here means no grace window and a re-flag on the
+            # next check.
+            logger.error(
+                f"False-positive record failed for {user_id} in {group_id} after "
+                "unban from alert button — no grace window was written."
+            )
+            await query.answer(
+                "Unbanned, but recording the false positive FAILED — they may be "
+                "re-flagged. Retry, or use /whitelist to protect them.",
+                show_alert=True,
+            )
+            return
         # Clear from cross-group blocklist — false-positive reversal
         remove_known_bad_actor(user_id)
         log_admin_action(
@@ -1722,7 +1773,9 @@ async def set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Provide an integer between 50 and 100.")
         return
     upsert_group(group_id, title=group_title)
-    set_group_threshold(group_id, val)
+    if not set_group_threshold(group_id, val):
+        await update.message.reply_text("❌ Could not save that — the database rejected the write (the group may not be registered, or the DB is unavailable). Nothing was changed; try again.")
+        return
     log_admin_action(
         group_id=group_id,
         admin_id=update.effective_user.id,
@@ -1842,11 +1895,82 @@ async def handle_logs_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── /importwhitelist ──────────────────────────────────────────────────────────
 
+# Only these user_types exist in the code (see db.remove_stale_admin_whitelist,
+# which manages and can prune 'admin' rows). Taking user_type straight from the
+# CSV let a hand-edited file forge them.
+_ALLOWED_USER_TYPES = frozenset({"manual", "admin", "protected"})
+
+# A whitelist is admin-scale, not member-scale. The cap bounds both the import's
+# runtime and the blocking writes it issues on the event loop.
+_IMPORT_ROW_LIMIT = 2000
+
+
+def _parse_whitelist_csv(text: str) -> tuple[list[dict], list[str], bool]:
+    """
+    Validate CSV text into whitelist rows.
+
+    Returns (rows, row_errors, truncated). Pure — no DB, no Telegram — so the
+    validation rules are testable on their own.
+
+    Rejects rather than coerces anything that would grant privilege or collide
+    with another id space: user_id must be a positive int (negatives are
+    /protect's synthetic identity space) and user_type must be one the code
+    actually uses.
+    """
+    reader = csv.DictReader(io.StringIO(text))
+    rows: list[dict] = []
+    errors: list[str] = []
+    seen: set[int] = set()
+    truncated = False
+
+    for lineno, row in enumerate(reader, start=2):  # row 1 is the header
+        if len(rows) >= _IMPORT_ROW_LIMIT:
+            truncated = True
+            break
+
+        raw_id = (row.get("user_id") or "").strip()
+        try:
+            uid = int(raw_id)
+        except ValueError:
+            errors.append(f"Row {lineno}: invalid user_id ({raw_id!r})")
+            continue
+        if uid <= 0:
+            errors.append(f"Row {lineno}: user_id must be positive (got {uid})")
+            continue
+        if uid in seen:
+            continue                      # last-write-wins would be arbitrary
+        seen.add(uid)
+
+        user_type = (row.get("user_type") or "manual").strip().lower()
+        if user_type not in _ALLOWED_USER_TYPES:
+            errors.append(
+                f"Row {lineno}: unknown user_type {user_type!r} "
+                f"(allowed: {', '.join(sorted(_ALLOWED_USER_TYPES))})"
+            )
+            seen.discard(uid)
+            continue
+
+        rows.append({
+            "user_id": uid,
+            "username": (row.get("username") or "").strip() or None,
+            "first_name": (row.get("first_name") or "").strip() or "Unknown",
+            "last_name": (row.get("last_name") or "").strip() or None,
+            "user_type": user_type,
+            "is_bot": str(row.get("is_bot", "")).strip().lower() in ("true", "1", "yes"),
+        })
+
+    return rows, errors, truncated
+
+
 async def import_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Upload a CSV file to bulk-add users to the whitelist.
-    Expected columns: user_id, username, first_name, last_name
-    (same format as the CSV emitted by /listwhitelist).
+    Restore a whitelist from a CSV, in the format /listwhitelist emits.
+
+    Reachable as /importwhitelist (replying to the file, which is what
+    /clearwhitelist's recovery message instructs) or by sending the CSV
+    directly. Reports the number of rows that actually persisted — the earlier
+    version counted attempts, so with the database down it claimed success
+    having written nothing.
     """
     ctx = await _get_admin_group(update, context)
     if not ctx:
@@ -1854,10 +1978,15 @@ async def import_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group_id, group_title = ctx
     upsert_group(group_id, title=group_title)
 
+    # Accept the file on the command message itself, or on the message the
+    # command replies to — /clearwhitelist tells admins to reply to the CSV
+    # backup it posts, so that path has to work.
     doc = update.message.document
+    if not doc and update.message.reply_to_message:
+        doc = update.message.reply_to_message.document
     if not doc:
         await update.message.reply_text(
-            "Send a CSV file as a document with this command.\n"
+            "Reply to a CSV file with /importwhitelist, or send the CSV directly.\n"
             "Expected columns: <code>user_id, username, first_name, last_name</code>\n\n"
             "Use /listwhitelist to download the current whitelist as a template.",
             parse_mode="HTML",
@@ -1876,37 +2005,36 @@ async def import_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Could not download file: <code>{e}</code>", parse_mode="HTML")
         return
 
-    reader = csv.DictReader(io.StringIO(text))
-    required = {"user_id", "first_name"}
-    if not required.issubset(set(reader.fieldnames or [])):
+    header = set(csv.DictReader(io.StringIO(text)).fieldnames or [])
+    if not {"user_id", "first_name"}.issubset(header):
         await update.message.reply_text(
-            f"❌ CSV must have at least: <code>user_id, first_name</code>", parse_mode="HTML"
+            "❌ CSV must have at least: <code>user_id, first_name</code>", parse_mode="HTML"
         )
         return
 
-    added        = 0
-    skipped      = 0
-    failed_rows  = []
-    for i, row in enumerate(reader, start=2):  # row 1 is the header
-        try:
-            uid = int(row["user_id"])
-        except (ValueError, KeyError):
-            skipped += 1
-            bad_val = row.get("user_id", "<missing>")
-            failed_rows.append(f"Row {i}: invalid user_id ({bad_val!r})")
-            continue
-        upsert_whitelisted_user(
+    rows, failed_rows, truncated = _parse_whitelist_csv(text)
+    skipped = len(failed_rows)
+
+    added  = 0
+    write_failures = 0
+    for row in rows:
+        ok = upsert_whitelisted_user(
             group_id=group_id,
-            user_id=uid,
-            username=row.get("username") or None,
-            first_name=row.get("first_name") or "Unknown",
-            last_name=row.get("last_name") or None,
+            user_id=row["user_id"],
+            username=row["username"],
+            first_name=row["first_name"],
+            last_name=row["last_name"],
             pfp_hash=None,
             whitelisted_by=update.effective_user.id,
-            user_type=row.get("user_type") or "manual",
-            is_bot=str(row.get("is_bot", "")).strip().lower() in ("true", "1", "yes"),
+            user_type=row["user_type"],
+            is_bot=row["is_bot"],
         )
-        mark_seen(group_id, uid)
+        if not ok:
+            # Don't claim to have protected someone when the write failed —
+            # this is the recovery path for a wiped whitelist.
+            write_failures += 1
+            continue
+        mark_seen(group_id, row["user_id"])
         added += 1
 
     log_admin_action(
@@ -1914,13 +2042,35 @@ async def import_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         admin_id=update.effective_user.id,
         admin_name=update.effective_user.full_name,
         action="importwhitelist",
-        details=f"Imported {added}, skipped {skipped}",
+        details=f"Imported {added}, skipped {skipped}, write failures {write_failures}",
     )
-    await update.message.reply_text(
-        f"✅ Imported <b>{added}</b> user(s) into whitelist for <b>{html.escape(str(group_title))}</b>."
-        + (f"\n⚠️ Skipped {skipped} invalid row(s)." if skipped else ""),
-        parse_mode="HTML",
+
+    if added == 0 and write_failures:
+        await update.message.reply_text(
+            f"❌ Imported <b>nothing</b> — all {write_failures} write(s) failed. "
+            "The database may be unavailable; the whitelist is unchanged. "
+            "Keep this file and retry.",
+            parse_mode="HTML",
+        )
+        return
+
+    msg = (
+        f"✅ Imported <b>{added}</b> user(s) into whitelist for "
+        f"<b>{html.escape(str(group_title))}</b>."
     )
+    if write_failures:
+        msg += (
+            f"\n❌ <b>{write_failures}</b> row(s) failed to save — retry to finish "
+            "restoring them."
+        )
+    if skipped:
+        msg += f"\n⚠️ Skipped {skipped} invalid row(s)."
+    if truncated:
+        msg += (
+            f"\n⚠️ Stopped at the {_IMPORT_ROW_LIMIT}-row limit; later rows were "
+            "not read. Split the file to import the rest."
+        )
+    await update.message.reply_text(msg, parse_mode="HTML")
     if failed_rows:
         # failed_rows embed arbitrary CSV cell values (bad_val!r) — escape.
         detail = "Failed rows:\n" + "\n".join(failed_rows[:20])
@@ -1973,7 +2123,7 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kw_count = len(kw_rows)
 
     # Pyrogram availability
-    pyro_ok = bool(context.bot_data.get("pyro_client"))
+    pyro_ok = bool(_pyro())
     pyro_label = "available" if pyro_ok else "not configured"
 
     await update.message.reply_text(
@@ -2044,7 +2194,9 @@ async def set_bands(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     upsert_group(group_id, title=group_title)
-    set_group_score_bands(group_id, ban_val, alert_val)
+    if not set_group_score_bands(group_id, ban_val, alert_val):
+        await update.message.reply_text("❌ Could not save that — the database rejected the write (the group may not be registered, or the DB is unavailable). Nothing was changed; try again.")
+        return
     log_admin_action(
         group_id=group_id,
         admin_id=update.effective_user.id,
@@ -2125,11 +2277,13 @@ async def set_type_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     upsert_group(group_id, title=group_title)
-    set_group_thresholds(
+    if not set_group_thresholds(
         group_id,
         username_threshold=username_threshold,
         name_threshold=name_threshold,
-    )
+    ):
+        await update.message.reply_text("❌ Could not save that — the database rejected the write (the group may not be registered, or the DB is unavailable). Nothing was changed; try again.")
+        return
 
     set_parts = []
     if username_threshold is not None:
@@ -2185,7 +2339,9 @@ async def blocklist_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     enabled = context.args[0].lower() in ON_VALS
     upsert_group(group_id, title=group_title)
-    set_group_blocklist(group_id, enabled)
+    if not set_group_blocklist(group_id, enabled):
+        await update.message.reply_text("❌ Could not save that — the database rejected the write (the group may not be registered, or the DB is unavailable). Nothing was changed; try again.")
+        return
     log_admin_action(
         group_id=group_id,
         admin_id=update.effective_user.id,
