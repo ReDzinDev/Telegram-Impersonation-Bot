@@ -66,7 +66,7 @@ The process is deployed on **Railway** with Docker (see `Dockerfile`, `start.sh`
 
 ## 4. Detection Pipeline
 
-Every non-whitelisted user passes through a seven-stage pipeline. The pipeline **short-circuits** at the first hit and dispatches the configured action immediately.
+Every non-whitelisted user passes through a six-stage pipeline. The pipeline **short-circuits** at the first hit and dispatches the configured action immediately.
 
 | # | Stage | What it checks | Notes |
 | --- | --- | --- | --- |
@@ -78,7 +78,14 @@ Every non-whitelisted user passes through a seven-stage pipeline. The pipeline *
 | 5 | **Profile photo hash** | `imagehash` perceptual hash vs. stored PFP hashes | Tiebreaker only — never flags standalone, and only fired after a weak name match |
 | 6 | **Group identity** | Name and PFP vs. the group's own stored title + logo hash | Catches scammers cloning the group itself (e.g. joining "Crypto Group" with the group's logo as PFP) |
 
-The `match_type` recorded in the log can be: `keyword`, `username`, `homoglyph_username`, `homoglyph_name`, `name`, `pfp`, `group_name`, `group_pfp`, or `manual` / `manual_escalation` for human-triggered actions.
+The `match_type` recorded in the log can be: `keyword`, `username`, `homoglyph_name`,
+`name`, `pfp`, `group_name`, `group_pfp`, `known_bad_actor`, or `manual` /
+`manual_escalation` for human-triggered actions.
+
+(`homoglyph_username` no longer exists. It was a separate stage that re-ran the
+identical `check_username_similarity` call as the username stage, which had
+already returned on a match, so it could never fire — homoglyph handles are
+caught by the username stage, which folds lookalikes internally.)
 
 **Group sentinel users** (`GroupAnonymousBot`, the "Channel Bot" linked-channel poster) are hard-skipped — they appear with `is_bot=True` but defensive code in `_SKIP_USER_IDS` in `src/utils/checker.py` guarantees they're never flagged.
 
@@ -97,7 +104,7 @@ The same pipeline runs from four entry points:
 | **Join** | Every time a non-bot user joins (via `ChatMemberHandler`) | No |
 | **First message** | The first time a user posts in the group. After that, a `seen_members` row prevents re-scanning. | No |
 | **Profile change** | Instantly when a tracked group member renames or changes their photo (`UpdateUserName` / `UpdateUserPhoto`) | **Yes** |
-| **Sweep** | Full member scan every 6 hours, plus on-demand `/sweep` | **Yes** |
+| **Sweep** | Full member scan every `SWEEP_INTERVAL_HOURS` (default 24h), plus on-demand `/sweep` | **Yes** |
 
 > **Pyrogram is optional but strongly recommended.** Without it, joins and first-message scans still work, but renames after the first message won't be caught until a manual `/sweep`, and `/sweep` itself is unavailable. To enable, set `PYROGRAM_API_ID`, `PYROGRAM_API_HASH`, and `PYROGRAM_SESSION` (generated once locally — see `README.md`).
 
@@ -106,7 +113,7 @@ The same pipeline runs from four entry points:
 There is no "strict / relaxed" toggle. Each user is checked **once per group**, on their first message, and `seen_members` prevents re-scanning via the message handler. After that, profile changes are caught by:
 
 - The **Pyrogram watcher** (`src/watcher/events.py`) — instantly, via raw MTProto updates. It also calls `unmark_seen()` so the next message re-validates.
-- The **6-hour auto-sweep** (`src/watcher/sweep.py`) — catches anything the watcher missed, refreshes whitelist PFP hashes, and records a row in `sweep_runs` for `/stats` and the daily digest.
+- The **periodic auto-sweep** (`src/watcher/sweep.py`, every `SWEEP_INTERVAL_HOURS`, default 24h) — catches anything the watcher missed, refreshes whitelist PFP hashes, and records a row in `sweep_runs` for `/stats` and the daily digest.
 
 The legacy STRICT mode (re-check every 5 min) was removed once Pyrogram + sweeps proved sufficient.
 
@@ -202,7 +209,7 @@ All background tasks are started in `src/main.py` after the PTB updater is polli
 | --- | --- | --- |
 | **DB keep-alive** | Every 270 s | Runs `SELECT 1` to keep Railway Hobby Postgres awake. Always on. |
 | **Daily summary** | Midnight UTC | Posts a **last-24h** activity digest (detections / bans / kicks / alerts / sweeps) per group and a grand total to the global log channel. Has a startup-grace: if booting less than an hour before midnight, the very next midnight is skipped so a fresh deploy doesn't dump a near-empty digest. |
-| **Full sweep** *(Pyrogram only)* | Every 6 h | Iterates every member of every configured group via MTProto, runs the detection pipeline, and posts a per-run summary to that group's log channel. First sweep is delayed by a full interval — the bot does **not** sweep on startup. |
+| **Full sweep** *(Pyrogram only)* | Every `SWEEP_INTERVAL_HOURS` (default 24h) | Iterates every member of every configured group via MTProto, runs the detection pipeline, and posts a per-run summary to that group's log channel. First sweep is delayed by a full interval — the bot does **not** sweep on startup. |
 | **PFP refresh** *(Pyrogram only)* | After each sweep | Re-downloads and re-hashes the current PFP of every whitelisted user in the swept group. |
 | **Health check** *(Pyrogram only)* | Every 5 min | Pings the Pyrogram session; auto-reconnects if it has dropped. |
 
@@ -270,7 +277,19 @@ Groups with zero activity in the window are omitted to keep the digest tight.
 
 ## 12. Full Command Reference
 
-All commands work both inside a group (apply to that group) and in a private DM with the bot (apply to your **active group** — see [§15 Private-Chat Workflow](#15-private-chat-dm-workflow)). Commands that mutate state require the caller to be a group admin.
+Commands are **DM-only**. The bot deliberately never responds to a command sent
+in a group — for admins or anyone else — so it cannot be used to probe or spam a
+chat. Message the bot directly, pick your **active group** with `/start` (see
+[§15 Private-Chat Workflow](#15-private-chat-dm-workflow)), and manage it from
+there.
+
+Every command requires the caller to be an admin of the selected group. Commands
+that **remove** a user (`/ban`, `/clearwhitelist`, and the Ban/Kick alert
+buttons) additionally require the *Ban users* permission in that group — being
+listed as an admin with no rights is not enough to drive the bot's ban powers.
+
+> If the bot appears to ignore a command in a group, that is by design, not a
+> permissions problem.
 
 ### Whitelist Management
 
@@ -289,7 +308,7 @@ All commands work both inside a group (apply to that group) and in a private DM 
 | --- | --- |
 | `/ban` | Manual ban — reply or `/ban 123456`. Logged to `logs` and `admin_actions`. |
 | `/unban 123456` | Unban a user by ID. |
-| `/sweep` | Run a full member scan immediately. Requires Pyrogram. Shows live progress; auto-sweeps run every 6 h in the background. |
+| `/sweep` | Run a full member scan immediately. Requires Pyrogram. Shows live progress; auto-sweeps run every `SWEEP_INTERVAL_HOURS` (default 24h) in the background. A run that hits `SWEEP_HARD_CAP_SECONDS` records where it stopped and resumes from there next time. |
 
 ### Configuration
 
@@ -413,7 +432,7 @@ The active group is stored in `user_data["active_group_id"]` and persisted acros
 
 8. Done. The bot now runs autonomously:
    → Real-time profile-change monitoring (with Pyrogram)
-   → 6-hour auto-sweeps
+   → periodic auto-sweeps (default every 24h)
    → Daily midnight UTC summary digest
 ```
 
@@ -429,15 +448,33 @@ PostgreSQL, accessed via psycopg v3 with `dict_row` row factory. All tables are 
 
 | Table | Purpose | Key columns |
 | --- | --- | --- |
-| `groups` | Per-group config | `group_id PK`, `title`, `action_mode`, `similarity_threshold`, `log_channel_id`, `pfp_hash` |
+| `groups` | Per-group config | `group_id PK`, `title`, `action_mode`, `similarity_threshold`, `username_threshold`, `name_threshold`, `ban_score`, `alert_score`, `use_global_blocklist`, `sweep_offset`, `log_channel_id`, `pfp_hash` |
 | `whitelisted_users` | Protected identities | `(group_id, user_id) PK`, `username`, `first_name`, `last_name`, `pfp_hash`, `user_type`, `is_bot`, `whitelisted_by` |
 | `seen_members` | Who has been first-message-scanned | `(group_id, user_id) PK`, `first_seen_at`, `last_checked_at` |
-| `logs` | Detection history | `log_id PK`, `group_id`, `user_id`, `username`, `full_name`, `target_user_id`, `target_name`, `detection_type`, `similarity_score`, `action_taken`, `details`, `invite_link`, `trigger`, `created_at` |
+| `logs` | Detection history | `log_id PK`, `group_id`, `user_id`, `username`, `full_name`, `target_user_id`, `target_name`, `detection_type`, `similarity_score`, `action_taken`, `details`, `invite_link`, `trigger`, `bio`, `user_pfp_hash`, `created_at` |
 | `reserved_keywords` | Per-group keyword/regex patterns | `(group_id, pattern) UNIQUE`, `is_regex` |
 | `name_change_log` | Rename velocity tracking | `user_id`, `changed_at` |
 | `admin_actions` | Audit trail | `group_id`, `admin_id`, `admin_name`, `action`, `target_id`, `details`, `created_at` |
 | `false_positives` | 30-day grace windows | `(group_id, user_id) PK`, `cleared_by`, `cleared_at`, `expires_at` |
 | `sweep_runs` | Per-sweep results | `id PK`, `group_id`, `iterated`, `checked`, `flagged`, `errors`, `trigger`, `created_at` |
+| `known_bad_actors` | Cross-group blocklist | `user_id PK`, `username`, `full_name`, `reason`, `ban_count`, `confirmed_by`, `source_group_id`, `first_seen_at`, `last_seen_at` |
+
+#### Notes on two columns that surprise people
+
+`groups.sweep_offset` is the resume point for a sweep that ran out of budget.
+Participant ordering is stable, so without it a capped sweep restarted from the
+first member every time and the tail of a large group was never scanned.
+
+`known_bad_actors.source_group_id` is what decides whether an entry can *act*.
+Any admin of any group the bot has been added to can write to this table via
+`/ban`, so an entry only carries ban authority if its source is the group being
+checked or a group listed in `BLOCKLIST_TRUSTED_GROUPS`. Anything else is
+advisory: it raises an alert but never bans on its own. Contribution is
+restricted to trusted groups for the same reason.
+
+`logs.similarity_score` holds a 0-100 confidence for name and username matches,
+but a **Hamming distance** (lower is better) for photo matches — the two are not
+comparable in a single query.
 
 ### `user_type` values
 
@@ -475,7 +512,16 @@ All caches live in `src/db.py` and are invalidated by their respective writer fu
 | Admin status | 5 min | `(user_id, group_id) → is_admin` from `getChatMember`. Lives in `src/handlers/commands.py`. |
 | Pyrogram entity cache | (Pyrogram-managed) | Warmed up at startup by iterating `get_dialogs()` — without this, `get_chat_members` fails with `PEER_ID_INVALID` for never-touched groups. |
 
-Note: `get_connection()` opens a fresh psycopg connection per call. The keep-alive task ensures the DB stays warm; a connection pool is a noted potential future improvement.
+Note: `get_connection()` borrows from a process-wide `psycopg_pool.ConnectionPool`
+(`DB_POOL_MAX_SIZE`, default 10), built once under a lock and validated on each
+borrow so a connection dropped during a Railway sleep window is replaced
+transparently. Acquisition is bounded — three attempts across roughly 33s, and
+configuration errors such as a bad password are not retried at all.
+
+The helpers themselves are synchronous, so anything reached from async code goes
+through `db.run_db(fn, ...)`, which runs it in a thread pool bounded to the pool
+size. Calling them inline from a coroutine stalls Telegram polling and the
+MTProto keepalive for the duration.
 
 ---
 
@@ -569,6 +615,57 @@ Python 3.11+. Deployed on Railway via Docker; see `Dockerfile`, `start.sh`, `rai
 
 ---
 
+---
+
+## Behaviour changes from the hardening pass
+
+Read this before redeploying over an older version — several defaults changed
+deliberately, and two need action.
+
+### Needs action
+
+**`BLOCKLIST_TRUSTED_GROUPS` defaults to empty, which turns cross-group ban
+propagation off.** Any admin of any group the bot has been added to can reach
+`/ban`, and the bot auto-registers groups on being added — so unrestricted
+propagation let a stranger get arbitrary users banned everywhere. Set this to
+your own group IDs to re-enable it. Existing `known_bad_actors` rows are not
+deleted; they degrade to advisory (alert, never auto-ban). Startup logs a loud
+warning while it is unset.
+
+**Removing a user now requires the *Ban users* permission**, not merely admin
+status. `/ban`, `/clearwhitelist` and the Ban/Kick alert buttons check
+`can_restrict_members`; configuration commands still need only admin. If you
+administer your group with a rights-less "decorative" admin account, grant it
+that permission or use an account that has it.
+
+### Changed defaults
+
+| Behaviour | Before | Now |
+|---|---|---|
+| Unknown group config (unregistered, or an unreadable read) | defaulted to `ban` | defaults to `alert` |
+| Whitelist/config read fails | treated as "no protection", so bans proceeded | serves a stale cached copy, or declines to act |
+| Flat-colour / smooth-gradient avatars | hashed, and collided with every other such avatar at full confidence | not hashed at all; the photo stage is skipped |
+| A name merely *containing* a protected name | scored 100 → ban | scaled by unmatched tokens → typically alert |
+| Sweep that hits the time cap | restarted from the first member next run | resumes from where it stopped |
+| Blocklist entry from an untrusted group | banned at full confidence | advisory (alert only) |
+| Logs | everything on stderr, so Railway showed INFO as red errors | JSON on stdout with real levels; `@level:error` filtering works |
+
+### Notes
+
+Detection now fails *closed*: if the group's protection state cannot be
+established, the check returns unflagged and logs a warning rather than acting on
+partial data. Missing a detection during a database blip is recoverable; banning
+a group's own admins because their whitelist read failed is not.
+
+Database work runs in a thread pool (`db.run_db`) rather than on the event loop.
+If you add a new call site reached from async code, wrap it — calling a `src.db`
+helper inline from a coroutine stalls Telegram polling and the MTProto keepalive.
+
+Names are no longer written to the log stream (Railway retains it); numeric
+`user_id` is logged instead. Names still appear in log-channel alerts, which is
+where an admin actually needs them.
+
+
 ## 24. File Layout
 
 ```
@@ -576,7 +673,7 @@ Python 3.11+. Deployed on Railway via Docker; see `Dockerfile`, `start.sh`, `rai
 ├── DOCUMENTATION.md          ← this file
 ├── OVERVIEW.md               ← short user-facing pitch
 ├── README.md                 ← quick-start setup
-├── INTERNAL_DOCS.md          ← technical notes (kept for historical context)
+├── INTERNAL_DOCS.md          ← older technical notes; THIS file is canonical
 ├── Dockerfile
 ├── docker-compose.yml
 ├── railway.json

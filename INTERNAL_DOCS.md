@@ -1,5 +1,10 @@
 # Anti-Impersonator Bot — Internal Documentation
 
+> **`DOCUMENTATION.md` is the canonical reference.** This file covers much of
+> the same ground and is kept for its internals detail, but where the two
+> disagree, trust `DOCUMENTATION.md` — and the code over both.
+
+
 ---
 
 ## What It Is
@@ -18,7 +23,7 @@ Telegram's built-in tools offer no automated protection against this. The bot fi
 
 ## How Detection Works
 
-Every non-whitelisted user goes through a 7-stage pipeline. It stops at the first hit and takes action immediately.
+Every non-whitelisted user goes through a 6-stage pipeline. It stops at the first hit and takes action immediately.
 
 | Stage | What It Checks | Notes |
 | --- | --- | --- |
@@ -30,7 +35,7 @@ Every non-whitelisted user goes through a 7-stage pipeline. It stops at the firs
 | **5 — Profile photo hash** | Perceptual hash comparison vs. whitelisted user photos | Tiebreaker only for weak name matches — never flags standalone |
 | **6 — Group identity** | Name + photo similarity vs. the group's own stored identity | Catches users impersonating the group itself (cloning logo/name) |
 
-**Match types logged:** `keyword`, `username`, `homoglyph_username`, `homoglyph_name`, `name`, `pfp`, `group_name`, `group_pfp`
+**Match types logged:** `keyword`, `username`, `homoglyph_name`, `name`, `pfp`, `group_name`, `group_pfp`, `known_bad_actor`
 
 A separate **name-change velocity alert** fires if a user renames themselves 3+ times within 60 minutes — a common evasion tactic. It notifies the log channel but does not auto-ban (no specific impersonation target is known at that point).
 
@@ -45,7 +50,7 @@ The bot catches impersonators through four independent paths:
 | **Join** | Every time a non-bot user joins | No |
 | **Message** | On a user's **first message** in the group | No |
 | **Profile change** | Instantly when a group member renames or changes photo | **Yes** |
-| **Sweep** | Full member scan every 6 hours, plus on-demand `/sweep` | **Yes** |
+| **Sweep** | Full member scan every `SWEEP_INTERVAL_HOURS` (default 24h), plus on-demand `/sweep` | **Yes** |
 
 > **Pyrogram** is an optional MTProto user-session client. Without it, the bot still works via join and message triggers, but cannot receive real-time profile-change events or enumerate all group members for sweeps.
 
@@ -56,7 +61,7 @@ The bot catches impersonators through four independent paths:
 There is no "strict / relaxed" toggle anymore. Each user is checked **once per group**, on their first message, then never re-scanned via the message handler. Coverage of profile changes after that point comes from two background paths:
 
 - The **Pyrogram watcher** catches rename / photo-change events instantly.
-- The **6-hour auto-sweep** catches anything the watcher missed (and refreshes whitelist PFP hashes).
+- The **periodic auto-sweep** (default every 24h) catches anything the watcher missed (and refreshes whitelist PFP hashes).
 
 The legacy STRICT mode (re-check every 5 min) was redundant once Pyrogram + sweeps were in place and has been removed.
 
@@ -214,7 +219,7 @@ Examples:
 
 | Command | Description |
 | --- | --- |
-| `/sweep` | Run a full member scan immediately (Pyrogram required). Shows live progress; auto-sweeps also post a summary to the log channel every 6 h. |
+| `/sweep` | Run a full member scan immediately (Pyrogram required). Shows live progress; auto-sweeps also post a summary to the log channel every `SWEEP_INTERVAL_HOURS` (default 24h). |
 | `/ban` | Manually ban a user — reply or `/ban 123456` |
 | `/unban 123456` | Unban a user by ID |
 
@@ -309,7 +314,7 @@ All caches are invalidated immediately on the relevant admin write (e.g. `/setac
 
 | Task | Schedule |
 | --- | --- |
-| **Full sweep** | Every 6 hours (first sweep is delayed — no startup sweep). Each run is recorded in `sweep_runs` and posts a short summary to the group's log channel. |
+| **Full sweep** | Every `SWEEP_INTERVAL_HOURS`, default 24h (first sweep is delayed — no startup sweep). Each run is recorded in `sweep_runs` and posts a short summary to the group's log channel. |
 | **PFP hash refresh** | After every sweep (keeps stored hashes current) |
 | **Health check** | Every 5 minutes; auto-reconnects if the Pyrogram session drops |
 | **Daily summary** | Midnight UTC; posts a **last-24h** activity digest (detections / bans / kicks / alerts / sweeps) to the log channel. Use `/stats` for cumulative + windowed numbers. |

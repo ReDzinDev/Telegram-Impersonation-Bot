@@ -64,7 +64,7 @@ Your team can react directly from that message:
 Once set up, the bot runs itself:
 
 - **Monitors every new member** that joins
-- **Scans all existing members** every 6 hours automatically
+- **Scans all existing members** on a schedule (every 24h by default)
 - **Catches renames and photo changes** the moment they happen
 - **Sends a daily summary** of detections and bans to your log channel
 - **Auto-protects newly promoted admins** the moment they're given admin rights — no manual update needed
