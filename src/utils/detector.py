@@ -5,46 +5,144 @@ from rapidfuzz import fuzz, process
 from typing import List, Tuple, Optional
 from confusable_homoglyphs import confusables
 
-# Confusable (homoglyph) folding: map the most common non-Latin lookalikes to
-# their Latin prototype so a name written entirely in Cyrillic/Greek letters
-# (e.g. "Јоhn Ѕmіth", all-Cyrillic) folds to "john smith" and matches. This
-# closes the whole-script confusable gap that is_dangerous() misses (it only
-# flags *mixed*-script strings), and it works for names AND keywords.
-_CONFUSABLE_MAP = str.maketrans({
-    # Cyrillic → Latin
-    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x",
-    "к": "k", "м": "m", "т": "t", "в": "b", "н": "h", "і": "i", "ј": "j",
-    "ѕ": "s", "ԁ": "d", "ԛ": "q", "ѡ": "w", "ᴦ": "r", "ʏ": "y", "ɡ": "g",
-    "З": "3", "Ч": "4",
-    "А": "a", "Е": "e", "О": "o", "Р": "p", "С": "c", "У": "y", "Х": "x",
-    "К": "k", "М": "m", "Т": "t", "В": "b", "Н": "h", "І": "i", "Ј": "j",
-    # Greek → Latin
-    "α": "a", "ο": "o", "ρ": "p", "ε": "e", "ι": "i", "κ": "k", "ν": "v",
-    "τ": "t", "υ": "u", "χ": "x", "Α": "a", "Β": "b", "Ε": "e", "Ζ": "z",
-    "Η": "h", "Ι": "i", "Κ": "k", "Μ": "m", "Ν": "n", "Ο": "o", "Ρ": "p",
-    "Τ": "t", "Υ": "y", "Χ": "x",
-})
+_ASCII_ALNUM = frozenset("abcdefghijklmnopqrstuvwxyz"
+                         "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+
+# Latin lookalikes whose Unicode NAME states the letter they imitate, e.g.
+# "LATIN LETTER SMALL CAPITAL J" -> j. These have no NFKC/NFKD decomposition, so
+# nothing but an explicit mapping catches them.
+_LATIN_NAME_RE = re.compile(
+    r"^LATIN (?:LETTER SMALL CAPITAL|SMALL LETTER|CAPITAL LETTER|LETTER) ([A-Z])\b"
+)
+
+# Ranges worth scanning by name: Latin Extended-B, IPA Extensions, Spacing
+# Modifiers and Phonetic Extensions — where the small-capital and hooked forms
+# live.
+_NAME_SCAN_RANGES = ((0x0180, 0x0250), (0x0250, 0x02B0), (0x1D00, 0x1D80))
+
+
+def _build_confusable_map() -> dict[int, str]:
+    """
+    Derive a lookalike → ASCII folding table from Unicode's own confusables
+    data, rather than maintaining one by hand.
+
+    The previous 60-entry hand-rolled map left the most common Telegram
+    stylisation completely unfolded: Unicode small-capital and phonetic letters
+    (U+1D00-1D2B, U+0250-02AF) have no NFKC decomposition and only three of them
+    were listed — so "ᴀᴅᴍɪɴ" did not match the keyword "admin", and that stage is
+    hard-wired to the ban band. Cherokee and Latin-hook lookalikes failed the
+    same way.
+
+    Two sources, in order of preference:
+
+    1. The confusables table shipped with confusable_homoglyphs (the Unicode
+       confusables.txt data, ~9.6k entries). It is a confusability *graph*, not a
+       skeleton map, so we walk it in both directions and keep any edge where one
+       end is ASCII. That is what turns Cherokee DU into "s".
+    2. A pass over the Latin-lookalike ranges deriving the target letter from the
+       character's Unicode name, which covers small capitals the graph misses.
+
+    Costs ~20ms once at import. Falls back to ASCII-only folding if the data
+    cannot be read, so a packaging problem degrades detection rather than
+    preventing startup.
+    """
+    mapping: dict[int, str] = {}
+
+    def offer(src: str, dst: str) -> None:
+        if len(src) != 1 or src in _ASCII_ALNUM or dst not in _ASCII_ALNUM:
+            return
+        mapping.setdefault(ord(src), dst.lower())
+        # fold_text casefolds BEFORE translating, so the casefolded form of the
+        # lookalike needs an entry too or capitals slip through (Ѕ U+0405).
+        #
+        # But the casefolded form must itself be non-ASCII. Some non-ASCII
+        # characters casefold straight ONTO an ASCII letter — U+017F LATIN SMALL
+        # LETTER LONG S casefolds to "s" and is confusable with "f" — so without
+        # this guard we would map plain "s" to "f" and silently break every name
+        # comparison in the bot.
+        folded = src.casefold()
+        if len(folded) == 1 and folded not in _ASCII_ALNUM:
+            mapping.setdefault(ord(folded), dst.lower())
+
+    try:
+        import json
+        from pathlib import Path
+
+        import confusable_homoglyphs
+
+        table_path = Path(confusable_homoglyphs.__file__).parent / "confusables.json"
+        table = json.loads(table_path.read_text(encoding="utf-8"))
+        for key, entries in table.items():
+            for entry in entries:
+                other = entry.get("c", "")
+                offer(key, other)
+                offer(other, key)
+    except Exception:  # pragma: no cover - packaging problem, not a logic path
+        logger.warning(
+            "Could not load the Unicode confusables table; homoglyph folding "
+            "will be weaker. Stylized-alphabet impersonation may be missed."
+        )
+
+    for start, stop in _NAME_SCAN_RANGES:
+        for codepoint in range(start, stop):
+            if codepoint in mapping:
+                continue
+            try:
+                name = unicodedata.name(chr(codepoint))
+            except ValueError:
+                continue
+            match = _LATIN_NAME_RE.match(name)
+            if match:
+                mapping[codepoint] = match.group(1).lower()
+
+    # Deliberate extras the confusables data does not assert, kept from the
+    # original hand-rolled map: leet-style digit substitutions seen in the wild.
+    mapping.setdefault(ord("З"), "3")
+    mapping.setdefault(ord("Ч"), "4")
+    return mapping
+
+
+_CONFUSABLE_MAP = _build_confusable_map()
 
 
 def fold_text(s: str) -> str:
     """
     Aggressively normalize a string for comparison:
-      - NFKC (folds fullwidth/math/stylized unicode to plain ASCII forms)
-      - strip combining marks (Mn) and format chars (Cf: zero-width, RTL/LRM)
-      - map common Cyrillic/Greek confusables to Latin
-      - casefold (unicode-aware lowercasing) + collapse whitespace
+      - NFKD (decomposes accents so the marks become separate code points)
+      - strip combining marks (Mn/Mc/Me) and format chars (Cf: zero-width, RTL)
+      - NFKC (recompose, folding fullwidth/math/stylized forms to plain ASCII)
+      - casefold (unicode-aware lowercasing)
+      - map confusables to their Latin prototype
+      - collapse whitespace
 
-    Used so that ALL-CAPS, ｆｕｌｌｗｉｄｔｈ, z̷a̷l̷g̷o̷, zero-width-laced, and
-    whole-script-confusable variants of a name all compare equal to the plain
-    form. Returns "" for falsy input.
+    Used so that ALL-CAPS, ｆｕｌｌｗｉｄｔｈ, z̷a̷l̷g̷o̷, zero-width-laced,
+    small-capital, and whole-script-confusable variants of a name all compare
+    equal to the plain form. Returns "" for falsy input.
+
+    The step ORDER is load-bearing, and two orderings were wrong before:
+
+    NFKD must come first. Normalising to NFKC (composed) and *then* filtering
+    category Mn cannot remove any accent that has a precomposed form — by then
+    "ô" is one code point, not "o" plus a combining circumflex — so "Jôhn Smíth"
+    kept its accents and scored 80 against "John Smith". Categories Mc and Me
+    were never filtered at all.
+
+    casefold must precede the confusable map. Translating first meant the map
+    needed both cases of every entry, and it had the lowercase Cyrillic forms
+    without their capitals — so "Ѕmith" (U+0405) folded to "ѕmith" and matched
+    nothing.
     """
     if not s:
         return ""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(
+        ch for ch in s
+        if unicodedata.category(ch) not in ("Mn", "Mc", "Me", "Cf")
+    )
     s = unicodedata.normalize("NFKC", s)
-    s = "".join(ch for ch in s if unicodedata.category(ch) not in ("Mn", "Cf"))
+    s = s.casefold()
     s = s.translate(_CONFUSABLE_MAP)
-    s = unicodedata.normalize("NFKC", s)
-    return re.sub(r"\s+", " ", s.casefold()).strip()
+    return re.sub(r"\s+", " ", s).strip()
 
 
 # Points deducted per unmatched token when one name's tokens are a strict

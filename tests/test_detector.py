@@ -200,3 +200,79 @@ def test_superset_penalty_never_scores_below_plain_token_sort():
     target = "John Smith a b c d e f g h"
     _, _, score = check_name_similarity(target, WHITELIST_NAME, 0)
     assert score >= int(fuzz.token_sort_ratio(target.casefold(), "john smith"))
+
+
+# ── Unicode folding (E-1, E-5) ────────────────────────────────────────────────
+#
+# fold_text relied on NFKC plus a 60-entry hand-rolled confusable map, which left
+# three documented holes:
+#
+#   E-1  Unicode small-capital and phonetic letters (U+1D00-1D2B, U+0250-02AF)
+#        have NO NFKC decomposition and were almost entirely absent from the map.
+#        This is the most common stylized-name style on Telegram, and it defeated
+#        the reserved-keyword stage — the one hard-wired to the ban band.
+#   E-5  NFKC ran BEFORE the combining-mark strip, so any accent with a
+#        precomposed form was already a single code point by the time the filter
+#        looked, and survived. Categories Mc and Me were never filtered at all.
+#   E-5  The map was applied BEFORE casefold(), so it needed both cases of every
+#        entry — and had the lowercase Cyrillic forms without their capitals.
+
+from src.utils.detector import fold_text
+
+SMALL_CAPS_JOHN_SMITH = "\u1d0a\u1d0f\u029c\u0274 \u0455\u1d0d\u026a\u1d1b\u029c"
+SMALL_CAPS_ADMIN = "\u1d00\u1d05\u1d0d\u026a\u0274"
+
+
+def test_small_capital_letters_fold_to_ascii():
+    assert fold_text(SMALL_CAPS_JOHN_SMITH) == "john smith"
+
+
+def test_stylized_name_matches_the_plain_whitelist_entry():
+    match, matched, score = check_name_similarity(
+        SMALL_CAPS_JOHN_SMITH, ["John Smith"], 85
+    )
+    assert match is True
+    assert score == 100
+
+
+def test_stylized_keyword_is_caught():
+    """A keyword hit is hard-wired to the ban band, so this was the top evasion."""
+    keywords = [{"pattern": "admin", "is_regex": False}]
+    assert check_reserved_keywords(SMALL_CAPS_ADMIN, None, None, keywords) == "admin"
+
+
+def test_phonetic_and_script_variants_fold():
+    assert fold_text("\u0261oogle") == "google"        # LATIN SMALL LETTER SCRIPT G
+    assert fold_text("\u0282mith") == "smith"          # S WITH HOOK
+
+
+def test_precomposed_accents_are_stripped():
+    """NFKC-before-strip meant these survived and scored 80 against the plain name."""
+    assert fold_text("J\u00f4hn Sm\u00edth") == "john smith"
+    assert fold_text("Jo\u0302hn") == "john"           # decomposed input too
+
+
+def test_enclosing_and_spacing_marks_are_stripped():
+    assert fold_text("A\u20dd") == "a"                 # COMBINING ENCLOSING CIRCLE
+
+
+def test_uppercase_cyrillic_confusables_fold():
+    """The map was applied before casefold, so capitals needed their own entries."""
+    assert fold_text("\u0405mith") == "smith"          # CYRILLIC CAPITAL LETTER DZE
+    assert fold_text("\u0410\u0412\u0421") == "abc"    # Cyrillic А В С
+
+
+def test_plain_ascii_is_untouched():
+    assert fold_text("John Smith") == "john smith"
+    assert fold_text("  spaced   out  ") == "spaced out"
+    assert fold_text("") == ""
+
+
+def test_folding_is_idempotent():
+    once = fold_text(SMALL_CAPS_JOHN_SMITH)
+    assert fold_text(once) == once
+
+
+def test_folding_does_not_collapse_distinct_ascii_names():
+    """Over-aggressive folding would create false positives of its own."""
+    assert fold_text("Alice") != fold_text("Bob")
