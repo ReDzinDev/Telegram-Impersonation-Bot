@@ -26,7 +26,7 @@ from src.config import SWEEP_INTERVAL_HOURS, SWEEP_HARD_CAP_SECONDS
 from src.db import (
     get_all_group_ids, get_group, get_reserved_keywords, get_whitelist,
     is_whitelisted, mark_seen, record_sweep_run, upsert_whitelisted_user,
-    DatabaseUnavailable,
+    DatabaseUnavailable, run_db,
 )
 from src.utils.checker import UserSnapshot, check_user, ban_and_log
 from src.utils.image import compute_pfp_hash_bytes
@@ -86,7 +86,7 @@ async def sweep_group(
         # Bios are expensive (one MTProto GetFullUser call each) and irrelevant
         # for groups with no reserved keywords — bio is only consulted by the
         # keyword detection stage. Resolve once and skip the call otherwise.
-        has_keywords = bool(get_reserved_keywords(group_id))
+        has_keywords = bool(await run_db(get_reserved_keywords, group_id))
         from src.watcher.fetch import bio_cooldown_remaining, fetch_bio as _fetch_bio
 
         # Notify immediately so the admin knows the loop has started
@@ -110,7 +110,7 @@ async def sweep_group(
                     continue
 
                 # Skip whitelisted users immediately
-                if is_whitelisted(group_id, user.id):
+                if await run_db(is_whitelisted, group_id, user.id):
                     continue
 
                 # Auto-whitelist current admins that /import_admins may have missed.
@@ -120,7 +120,8 @@ async def sweep_group(
                         continue
                     # Bots don't usually have meaningful PFPs; skip the CDN download for them
                     pfp_bytes_admin = None if user.is_bot else await _fetch_pfp(pyro, user.id, wait=True)
-                    upsert_whitelisted_user(
+                    await run_db(
+                        upsert_whitelisted_user,
                         group_id=group_id,
                         user_id=user.id,
                         username=user.username,
@@ -131,7 +132,7 @@ async def sweep_group(
                         user_type="admin",
                         is_bot=bool(user.is_bot),
                     )
-                    mark_seen(group_id, user.id)
+                    await run_db(mark_seen, group_id, user.id)
                     continue
 
                 # Non-admin bots can't impersonate anyone — skip them
@@ -201,7 +202,7 @@ async def sweep_group(
                         log_channel_notify=log_notify,
                     )
                 else:
-                    mark_seen(group_id, user.id)
+                    await run_db(mark_seen, group_id, user.id)
 
                 # Progress update every 50 members iterated (not just checked)
                 # so the admin sees movement even when everyone is whitelisted/admin.
@@ -226,7 +227,7 @@ async def sweep_group(
             await asyncio.sleep(e.value)
             result = {"iterated": iterated, "checked": checked, "flagged": flagged,
                       "errors": errors, "partial": True, "bios_skipped": bios_skipped}
-            record_sweep_run(group_id, iterated, checked, flagged, errors, trigger)
+            await run_db(record_sweep_run, group_id, iterated, checked, flagged, errors, trigger)
             return result
         except (ChatAdminRequired, UserNotParticipant) as e:
             logger.error(f"Sweep permission error for group {group_id}: {e}")
@@ -241,7 +242,7 @@ async def sweep_group(
         result = {"iterated": iterated, "checked": checked, "flagged": flagged,
                   "errors": errors, "partial": partial, "bios_skipped": bios_skipped}
         # Persist this run so /stats and the daily summary can count it
-        record_sweep_run(group_id, iterated, checked, flagged, errors, trigger)
+        await run_db(record_sweep_run, group_id, iterated, checked, flagged, errors, trigger)
         return result
 
 
@@ -250,7 +251,7 @@ async def refresh_whitelist_pfps(pyro: Client, group_id: int):
     Re-download and re-hash the current profile photo for every whitelisted user.
     Called automatically after each sweep so stored hashes never go stale.
     """
-    whitelist = get_whitelist(group_id)
+    whitelist = await run_db(get_whitelist, group_id)
     refreshed = 0
     for row in whitelist:
         # Pacing happens inside fetch; wait=True rides out flood cooldowns.
@@ -293,7 +294,7 @@ async def run_periodic_sweeps(pyro: Client, bot: Bot, log_channel_id: Optional[s
     while True:
         try:
             await asyncio.sleep(SWEEP_INTERVAL_HOURS * 3600)
-            all_ids = get_all_group_ids()
+            all_ids = await run_db(get_all_group_ids)
             # Only sweep groups that have at least one whitelisted user — others
             # have nothing to check against.
             #
@@ -305,7 +306,7 @@ async def run_periodic_sweeps(pyro: Client, bot: Bot, log_channel_id: Optional[s
             group_ids = []
             for gid in all_ids:
                 try:
-                    if get_whitelist(gid):
+                    if await run_db(get_whitelist, gid):
                         group_ids.append(gid)
                 except DatabaseUnavailable as e:
                     logger.warning(f"Skipping sweep of {gid}: {e}")
@@ -339,7 +340,7 @@ async def _post_sweep_summary(
     (or the global fallback channel). Silently no-ops if no channel is
     configured anywhere.
     """
-    group = get_group(group_id)
+    group = await run_db(get_group, group_id)
     channel = (group and group.get("log_channel_id")) or fallback_channel_id
     if not channel:
         return

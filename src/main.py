@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import signal
+from concurrent.futures import ThreadPoolExecutor
 
 from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, Update
 from telegram.error import TimedOut, NetworkError, Conflict
@@ -15,7 +16,7 @@ from src.config import (
     PYROGRAM_API_ID, PYROGRAM_API_HASH, PYROGRAM_SESSION, PYROGRAM_ENABLED,
     BLOCKLIST_TRUSTED_GROUPS,
 )
-from src.db import init_db, get_connection, put_connection
+from src.db import init_db, get_connection, put_connection, DB_POOL_MAX_SIZE
 from src.handlers.commands import (
     start, handle_chat_shared, import_admins, whitelist_user,
     unwhitelist_user, ban_user, unban_user,
@@ -209,6 +210,17 @@ def build_ptb_app(pyro_client=None):
 
 
 async def main():
+    # Bound the executor that db.run_db offloads onto. asyncio's default is
+    # min(32, cpu+4) workers, which would let threads outnumber pooled
+    # connections and queue up inside getconn — turning a connection shortage
+    # into a pile of threads each waiting out the acquire timeout. One worker
+    # per connection means a thread only ever waits on the query itself.
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(
+            max_workers=DB_POOL_MAX_SIZE, thread_name_prefix="db",
+        )
+    )
+
     init_db()
 
     # The cross-group blocklist only propagates bans from groups the operator

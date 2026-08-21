@@ -30,7 +30,7 @@ from telegram import Bot
 from src.config import NAME_CHANGE_VELOCITY_THRESHOLD, NAME_CHANGE_WINDOW_MINUTES
 from src.db import (
     get_all_group_ids, get_group, get_watched_groups_for_user, unmark_seen,
-    log_name_change, count_recent_name_changes,
+    log_name_change, count_recent_name_changes, run_db, DatabaseUnavailable,
 )
 from src.utils.checker import UserSnapshot, check_user, ban_and_log
 
@@ -38,6 +38,23 @@ if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+def _group_titles(group_ids: list[int]) -> dict[int, str | None]:
+    """
+    Stored titles for these groups, for rendering an alert.
+
+    Runs in a worker thread via run_db. A group whose config can't be read just
+    falls back to its raw ID — a missing label must not cost us the alert.
+    """
+    out: dict[int, str | None] = {}
+    for gid in group_ids:
+        try:
+            group = get_group(gid)
+        except DatabaseUnavailable:
+            group = None
+        out[gid] = (group or {}).get("title")
+    return out
 
 
 def register_event_handlers(pyro: Client, bot: Bot, log_channel_id: str | None):
@@ -71,7 +88,7 @@ async def _handle_name_change(
     user_id = update.user_id
 
     # Resolve which of our groups this user belongs to
-    group_ids = get_watched_groups_for_user(user_id)
+    group_ids = await run_db(get_watched_groups_for_user, user_id)
     if not group_ids:
         return
 
@@ -84,11 +101,13 @@ async def _handle_name_change(
 
     # Invalidate seen cache so RELAXED mode re-checks on next message
     for gid in group_ids:
-        unmark_seen(gid, user_id)
+        await run_db(unmark_seen, gid, user_id)
 
     # Track name-change velocity — rapid renames are a common evasion tactic
-    log_name_change(user_id)
-    change_count = count_recent_name_changes(user_id, window_minutes=NAME_CHANGE_WINDOW_MINUTES)
+    await run_db(log_name_change, user_id)
+    change_count = await run_db(
+        count_recent_name_changes, user_id, window_minutes=NAME_CHANGE_WINDOW_MINUTES
+    )
     if change_count >= NAME_CHANGE_VELOCITY_THRESHOLD:
         logger.warning(
             f"Name-change velocity alert for {user_id}: "
@@ -106,11 +125,12 @@ async def _handle_name_change(
             )
 
             # Replace bare group IDs with stored titles where we have them.
-            def _group_label(gid: int) -> str:
-                g = get_group(gid)
-                title = (g and g.get("title")) or str(gid)
-                return _html.escape(title)
-            groups_label = ", ".join(_group_label(g) for g in group_ids)
+            # Fetched in ONE hop off the loop rather than a blocking read per
+            # group inside the join.
+            titles = await run_db(_group_titles, group_ids)
+            groups_label = ", ".join(
+                _html.escape(titles.get(gid) or str(gid)) for gid in group_ids
+            )
 
             from src.utils.notify import send_log_message
             await send_log_message(
@@ -146,14 +166,14 @@ async def _handle_photo_change(
 ):
     user_id = update.user_id
 
-    group_ids = get_watched_groups_for_user(user_id)
+    group_ids = await run_db(get_watched_groups_for_user, user_id)
     if not group_ids:
         return
 
     logger.info(f"Profile photo change detected for user {user_id}")
 
     for gid in group_ids:
-        unmark_seen(gid, user_id)
+        await run_db(unmark_seen, gid, user_id)
 
     # Resolve full user info to get current name too
     try:

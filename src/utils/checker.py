@@ -15,7 +15,7 @@ from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from src.db import (
     get_whitelist, is_whitelisted, insert_log, get_group, get_reserved_keywords,
     is_false_positive, mark_false_positive, get_known_bad_actor,
-    DatabaseUnavailable,
+    DatabaseUnavailable, run_db,
 )
 from src.utils.detector import (
     check_username_similarity, check_name_similarity,
@@ -81,7 +81,11 @@ async def check_user(
     a group's own admins because their whitelist read failed is not.
     """
     try:
-        return await _check_user(snapshot, group_id)
+        # Off the event loop: the body below is six blocking psycopg reads plus
+        # Pillow decoding and two imagehash passes, with no await anywhere. Run
+        # inline it stalled Telegram polling and the MTProto keepalive for every
+        # single detection.
+        return await run_db(_check_user_sync, snapshot, group_id)
     except DatabaseUnavailable as e:
         logger.warning(
             f"Skipping impersonation check for {snapshot.user_id} in {group_id}: {e}"
@@ -89,7 +93,7 @@ async def check_user(
         return DetectionResult(flagged=False)
 
 
-async def _check_user(
+def _check_user_sync(
     snapshot: UserSnapshot,
     group_id: int,
 ) -> DetectionResult:
@@ -297,7 +301,7 @@ async def ban_and_log(
     # action on the strength of configuration we never saw. A group deliberately
     # set to alert-only used to start banning during any database blip.
     try:
-        group = get_group(group_id)
+        group = await run_db(get_group, group_id)
     except DatabaseUnavailable as e:
         logger.warning(f"Group config unavailable for {group_id} ({e}); alerting only.")
         group = None
@@ -351,7 +355,8 @@ async def ban_and_log(
     # the record stays accurate even after the scammer changes their profile.
     user_pfp_hash = compute_pfp_hash_bytes(snapshot.pfp_bytes) if snapshot.pfp_bytes else None
 
-    insert_log(
+    await run_db(
+        insert_log,
         group_id=group_id,
         user_id=snapshot.user_id,
         username=snapshot.username,

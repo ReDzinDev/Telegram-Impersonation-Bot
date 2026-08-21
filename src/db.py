@@ -1,4 +1,6 @@
 
+import asyncio
+import threading
 import time
 import logging
 import psycopg
@@ -53,11 +55,37 @@ def _stale_or_raise(cache: dict, key, what: str):
 
 DB_POOL_MAX_SIZE = 10
 _pool: ConnectionPool | None = None
+# These helpers now run in a thread pool (see run_db), so pool construction is
+# genuinely concurrent. Unsynchronised, twelve threads built twelve pools in
+# testing: the losers leak their background workers, and putconn hands
+# connections to whichever pool won the assignment, which rejects them.
+_pool_lock = threading.Lock()
+
+# Per-attempt ceiling on waiting for a free/new connection. Lower than the old
+# 30s because get_connection now bounds total wall clock instead of multiplying
+# a long timeout by the retry count.
+_POOL_ACQUIRE_TIMEOUT = 10.0
+
+# Errors that will never succeed on retry — retrying a wrong password just
+# multiplies the delay by the retry count.
+_FATAL_CONNINFO_MARKERS = (
+    "password authentication failed",
+    "no pg_hba.conf entry",
+    "role \"",
+    "database \"",
+    "invalid connection option",
+    "could not translate host name",
+)
+
+
+def _is_fatal_conninfo_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _FATAL_CONNINFO_MARKERS)
 
 
 def _get_pool() -> ConnectionPool:
     """
-    Lazily build the process-wide pool.
+    Lazily build the process-wide pool, exactly once.
 
     min_size=0 → we never eagerly open a connection at construction time
     (Railway Hobby Postgres may be asleep at boot, which would make eager
@@ -66,7 +94,11 @@ def _get_pool() -> ConnectionPool:
     so callers never receive a dead socket.
     """
     global _pool
-    if _pool is None:
+    if _pool is not None:
+        return _pool
+    with _pool_lock:
+        if _pool is not None:      # double-checked: another thread won the race
+            return _pool
         _pool = ConnectionPool(
             conninfo=DATABASE_URL,
             min_size=0,
@@ -85,28 +117,63 @@ def _get_pool() -> ConnectionPool:
     return _pool
 
 
-def get_connection(retries: int = 8, base_delay: float = 2.0):
+def get_connection(retries: int = 3, base_delay: float = 1.0,
+                   backoff_budget: float = 15.0):
     """
-    Borrow a pooled connection, with exponential-backoff retries to ride out
+    Borrow a pooled connection, with bounded exponential backoff to ride out
     Railway Hobby cold starts (the DB can take 15-30 s to wake).
 
-    Returns None after exhausting retries — every caller already handles the
+    Returns None once the budget is spent — every caller already handles the
     None case. ALWAYS return the connection via put_connection() when done.
+
+    Bounded on purpose. The previous defaults (8 retries, 2s base, 30s pool
+    timeout) planned ~120s of time.sleep plus up to 8x30s of pool wait — nearly
+    six minutes per call, and it ran on the event loop, so Telegram polling and
+    the MTProto keepalive stopped for the duration while the process still
+    looked healthy. Three attempts across ~33s covers a cold start; anything
+    longer is an outage the caller should hear about instead of absorbing.
+
+    Configuration errors are not retried at all: a wrong password fails
+    identically every time.
     """
+    started = time.monotonic()
     for attempt in range(retries):
         try:
-            return _get_pool().getconn(timeout=30)
+            return _get_pool().getconn(timeout=_POOL_ACQUIRE_TIMEOUT)
         except Exception as e:
-            if attempt < retries - 1:
-                delay = min(base_delay * (2 ** attempt), 30)
-                logger.warning(
-                    f"DB pool getconn attempt {attempt + 1}/{retries} failed, "
-                    f"retrying in {delay:.0f}s: {e}"
+            if _is_fatal_conninfo_error(e):
+                logger.error(
+                    f"DB connection rejected for a configuration reason, not "
+                    f"retrying: {e}"
                 )
-                time.sleep(delay)
-            else:
-                logger.error(f"DB pool getconn failed after {retries} attempts: {e}")
                 return None
+            remaining = backoff_budget - (time.monotonic() - started)
+            if attempt >= retries - 1 or remaining <= 0:
+                logger.error(
+                    f"DB pool getconn failed after {attempt + 1} attempt(s): {e}"
+                )
+                return None
+            delay = min(base_delay * (2 ** attempt), remaining)
+            logger.warning(
+                f"DB pool getconn attempt {attempt + 1}/{retries} failed, "
+                f"retrying in {delay:.0f}s: {e}"
+            )
+            time.sleep(delay)
+
+
+async def run_db(fn, *args, **kwargs):
+    """
+    Run a synchronous helper from this module off the event loop.
+
+    Everything here is blocking psycopg. Called directly from a coroutine it
+    stops PTB's long-poll and Pyrogram's keepalive for the duration, which on a
+    slow query or a cold start is seconds — and used to be minutes. Use this at
+    any call site reached from async code.
+
+    The default executor is bounded to the pool size in main(), so threads can
+    never outnumber available connections and queue up inside getconn.
+    """
+    return await asyncio.to_thread(fn, *args, **kwargs)
 
 
 def put_connection(conn) -> None:

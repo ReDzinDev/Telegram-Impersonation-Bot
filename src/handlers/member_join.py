@@ -5,7 +5,10 @@ from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ChatMemberStatus, ChatType
 
-from src.db import upsert_group, is_whitelisted, get_group, get_reserved_keywords, upsert_whitelisted_user, mark_seen
+from src.db import (
+    upsert_group, is_whitelisted, get_group, get_reserved_keywords,
+    upsert_whitelisted_user, mark_seen, run_db,
+)
 from src.utils.checker import UserSnapshot, check_user, ban_and_log
 from src.utils.image import compute_pfp_hash_bytes
 from src.handlers.commands import invalidate_admin_cache
@@ -86,7 +89,7 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
         and old_member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
         and not user.is_bot
     ):
-        upsert_group(group_id, title=update.effective_chat.title)
+        await run_db(upsert_group, group_id, title=update.effective_chat.title)
         pfp_hash = None
         try:
             photos = await user.get_profile_photos(limit=1)
@@ -95,7 +98,8 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
                 pfp_hash = compute_pfp_hash_bytes(bytes(await f.download_as_bytearray()))
         except Exception:
             pass
-        upsert_whitelisted_user(
+        await run_db(
+            upsert_whitelisted_user,
             group_id=group_id,
             user_id=user.id,
             username=user.username,
@@ -106,7 +110,7 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
             user_type="admin",
             is_bot=bool(user.is_bot),
         )
-        mark_seen(group_id, user.id)
+        await run_db(mark_seen, group_id, user.id)
         logger.info(f"Auto-whitelisted promoted admin {user.full_name} ({user.id}) in group {group_id}.")
         return
 
@@ -120,9 +124,9 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # Auto-register group if not yet in DB
-    upsert_group(group_id, title=update.effective_chat.title)
+    await run_db(upsert_group, group_id, title=update.effective_chat.title)
 
-    if is_whitelisted(group_id, user.id):
+    if await run_db(is_whitelisted, group_id, user.id):
         return
 
     # Capture the invite link used to join (None for public joins / admin adds)
@@ -147,7 +151,7 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
     bio: str | None = None
     from src.watcher.client import get_client
     pyro = get_client()
-    if pyro and get_reserved_keywords(group_id):
+    if pyro and await run_db(get_reserved_keywords, group_id):
         try:
             bio = await _fetch_bio(pyro, user.id)
         except Exception:
@@ -171,7 +175,8 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         member_info = await context.bot.get_chat_member(group_id, user.id)
         if member_info.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
-            upsert_whitelisted_user(
+            await run_db(
+                upsert_whitelisted_user,
                 group_id=group_id,
                 user_id=user.id,
                 username=user.username,
@@ -182,13 +187,13 @@ async def check_impersonation(update: Update, context: ContextTypes.DEFAULT_TYPE
                 user_type="admin",
                 is_bot=bool(user.is_bot),
             )
-            mark_seen(group_id, user.id)
+            await run_db(mark_seen, group_id, user.id)
             logger.info(f"Auto-whitelisted admin {user.id} after false-positive on join in group {group_id}.")
             return
     except Exception:
         pass
 
-    group = get_group(group_id)
+    group = await run_db(get_group, group_id)
     log_channel = (group["log_channel_id"] if group else None) or context.bot_data.get("log_channel_id") or LOG_CHANNEL_ID
 
     from src.utils.checker import make_action_funcs
