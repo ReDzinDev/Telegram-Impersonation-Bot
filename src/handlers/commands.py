@@ -24,6 +24,7 @@ from src.db import (
     add_known_bad_actor, remove_known_bad_actor,
 )
 from src.utils.image import compute_pfp_hash_bytes
+from src.utils.detector import describe_unsafe_regex
 from src.config import (
     LOG_CHANNEL_ID,
     NAME_SIMILARITY_THRESHOLD,
@@ -257,6 +258,29 @@ async def _get_admin_group(
         return None
 
     return group_id, group_title
+
+
+def _split_keyword_entries(raw: str) -> list[str]:
+    """
+    Split a /addkeyword argument list on commas, leaving `r:` patterns intact.
+
+    A comma is meaningful regex syntax (bounded repeats like a{2,3}), so a naive
+    split corrupted patterns silently: `r:a{2,3}` became `r:a{2` plus `3}`, and
+    because re.compile("a{2") succeeds — treating it as the literal "a{2" — both
+    fragments were accepted and stored as if they worked.
+
+    Everything from an `r:` marker to the end of the argument string is treated
+    as one pattern. That means a regex must be the last entry, which is a
+    reasonable trade for not mangling it, and the usage text says so.
+    """
+    marker = raw.find("r:")
+    if marker == -1:
+        return [e.strip() for e in raw.split(",") if e.strip()]
+    literal_part, regex_part = raw[:marker], raw[marker:].strip()
+    entries = [e.strip() for e in literal_part.split(",") if e.strip()]
+    if regex_part:
+        entries.append(regex_part)
+    return entries
 
 
 def _pyro():
@@ -1792,15 +1816,17 @@ async def add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Split on commas so a single command can register many keywords.
+    # Split on commas so a single command can register many keywords — but NOT
+    # inside an `r:` pattern. A comma is legal regex syntax: splitting first
+    # shredded `r:a{2,3}` into `r:a{2` and `3}`, and `re.compile("a{2")` succeeds
+    # as a literal, so both halves were accepted and stored as working keywords.
     raw = " ".join(context.args)
-    entries = [e.strip() for e in raw.split(",") if e.strip()]
+    entries = _split_keyword_entries(raw)
 
     if not entries:
         await update.message.reply_text("No keywords provided.")
         return
 
-    import re as _re
     added:    list[str] = []
     failed:   list[tuple[str, str]] = []
 
@@ -1809,10 +1835,13 @@ async def add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pattern  = entry[2:].strip() if is_regex else entry
 
         if is_regex:
-            try:
-                _re.compile(pattern)
-            except _re.error as e:
-                failed.append((entry, f"invalid regex: {e}"))
+            # Compiling is not enough: a pattern can compile and still take
+            # minutes on a crafted bio, and `re` holds the GIL while it does,
+            # which stalls the whole bot. Refuse the known-dangerous shapes here
+            # with an explanation; the matcher is time-bounded as a backstop.
+            reason = describe_unsafe_regex(pattern)
+            if reason:
+                failed.append((entry, reason))
                 continue
 
         ok = add_reserved_keyword(group_id, pattern, is_regex, update.effective_user.id)

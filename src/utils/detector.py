@@ -1,7 +1,9 @@
 
 import logging
 import re
+import time
 import unicodedata
+from functools import lru_cache
 from rapidfuzz import fuzz, process
 from typing import List, Tuple, Optional
 from confusable_homoglyphs import confusables
@@ -314,6 +316,153 @@ def _match_wildcard_pattern(pattern: str, text: str) -> bool:
     return core in t  # bare keyword = substring (unchanged behavior)
 
 
+# ── Admin-supplied regex safety ───────────────────────────────────────────────
+#
+# `/addkeyword r:<pattern>` lets a group admin install a regex that then runs
+# against attacker-controlled text (a bio). Validating only that it COMPILES is
+# not enough: catastrophic backtracking turns a 40-character subject into
+# minutes of CPU.
+#
+# The critical detail is that CPython's `re` does not release the GIL, so
+# running the match in a worker thread does NOT help. Measured on this codebase
+# after the thread-pool change: an 8.4s match inside asyncio.to_thread let
+# exactly one event-loop tick through. A single bad keyword stalls the entire
+# process — both Telegram clients, every group.
+#
+# Containment is therefore a real timeout, which needs an engine that supports
+# one. The third-party `regex` module does; stdlib `re` does not. `regex` also
+# optimises away some classic traps ((a+)+$ and (x+x+)+y both run instantly),
+# which shrinks the exposure further, but (a|a)*$ still backtracks — so the
+# timeout is what actually bounds us, not the engine's cleverness.
+#
+# Three layers, in order of how often they should fire:
+#   1. describe_unsafe_regex() rejects obviously dangerous shapes at INSERT, so
+#      the common cases never reach the matcher at all.
+#   2. subjects are truncated — ReDoS cost scales with input length.
+#   3. every match is bounded by REGEX_MATCH_TIMEOUT, and a whole
+#      check_reserved_keywords call by REGEX_MATCH_BUDGET, because per-pattern
+#      timeouts otherwise multiply across patterns x texts.
+try:
+    import regex as _regex_engine
+    _HAS_TIMEOUT_ENGINE = True
+except ImportError:  # pragma: no cover - `regex` is a declared dependency
+    _regex_engine = None
+    _HAS_TIMEOUT_ENGINE = False
+    logger.error(
+        "The `regex` module is unavailable, so admin-supplied regex keywords "
+        "cannot be time-bounded. They will be SKIPPED rather than risk stalling "
+        "the bot. Install `regex` to re-enable them."
+    )
+
+REGEX_MATCH_TIMEOUT = 0.05    # seconds, per pattern per subject
+REGEX_MATCH_BUDGET = 0.25     # seconds, per check_reserved_keywords call
+MAX_REGEX_SUBJECT = 512       # bios are ~140 chars; bound it regardless
+
+# Nested quantifiers are the signature of catastrophic backtracking: a repeated
+# group whose own body is repeatable, e.g. (a+)+ or (a|a)* or (\w+\s?)*.
+_NESTED_QUANTIFIER = re.compile(
+    r"""
+    \(                      # a group
+      (?:\?[:=!P<][^)]*)?   #   optionally non-capturing / named
+      [^()]*                #   body with no nested parens
+      (?: [+*]              #   containing a quantifier ...
+        | \{\d+,\d*\}       #   ... or an open-ended bound
+        | \| )              #   ... or an alternation (the (a|a)* shape)
+      [^()]*
+    \)
+    \s*
+    (?: [+*] | \{\d+,\d*\} )  # and the group itself is repeated
+    """,
+    re.VERBOSE,
+)
+
+MAX_PATTERN_LENGTH = 200
+
+
+def describe_unsafe_regex(pattern: str) -> Optional[str]:
+    """
+    Why this pattern must not be accepted, or None if it looks safe.
+
+    Deliberately conservative and deliberately incomplete: static analysis
+    cannot catch every catastrophic regex, which is why the match-time timeout
+    exists. This exists so the ordinary mistakes are refused with an explanation
+    instead of silently degrading every detection in the group.
+    """
+    if not pattern or not pattern.strip():
+        return "the pattern is empty."
+    if len(pattern) > MAX_PATTERN_LENGTH:
+        return (
+            f"the pattern is {len(pattern)} characters long (limit "
+            f"{MAX_PATTERN_LENGTH}). Very long patterns are hard to reason about "
+            "and slow to run."
+        )
+    try:
+        re.compile(pattern)
+    except re.error as e:
+        return f"it isn't valid regex: {e}"
+    if _NESTED_QUANTIFIER.search(pattern):
+        return (
+            "it contains a nested quantifier (a repeated group whose contents "
+            "are themselves repeatable, like (a+)+ or (a|a)*). These can take "
+            "minutes to run on a crafted name and would stall the bot. Rewrite "
+            "it without the outer repetition."
+        )
+    return None
+
+
+def _subject_for_regex(text: str) -> str:
+    """Fold and truncate a subject before handing it to the regex engine."""
+    return fold_text(text)[:MAX_REGEX_SUBJECT]
+
+
+@lru_cache(maxsize=512)
+def _compiled_regex(pattern: str):
+    """
+    Compile once and reuse.
+
+    Patterns were previously recompiled for every text of every user, so the
+    cost was paid per member per sweep. Returns None for an invalid pattern so
+    the caller can skip it without re-entering the try on every call.
+    """
+    engine = _regex_engine if _HAS_TIMEOUT_ENGINE else re
+    try:
+        return engine.compile(pattern, engine.IGNORECASE)
+    except Exception:
+        return None
+
+
+def _regex_hits(pattern: str, subject: str, deadline: float) -> bool:
+    """
+    Whether `pattern` matches `subject`, bounded in time.
+
+    A timeout is treated as NO match. Refusing to flag is the safe direction:
+    the alternative is either flagging on a pattern we could not evaluate, or
+    letting it run unbounded.
+    """
+    compiled = _compiled_regex(pattern)
+    if compiled is None:
+        return False
+    if not _HAS_TIMEOUT_ENGINE:
+        # No way to bound the match, so don't run it at all.
+        return False
+
+    remaining = min(REGEX_MATCH_TIMEOUT, deadline - time.monotonic())
+    if remaining <= 0:
+        return False
+    try:
+        return compiled.search(subject, timeout=remaining) is not None
+    except TimeoutError:
+        logger.warning(
+            f"Reserved-keyword regex timed out after {remaining:.3f}s and was "
+            f"skipped: {pattern!r}. Rewrite it — it is not protecting this group.",
+            extra={"pattern_length": len(pattern)},
+        )
+        return False
+    except Exception as e:
+        logger.debug(f"Reserved-keyword regex {pattern!r} failed: {e}")
+        return False
+
+
 def check_reserved_keywords(
     full_name: str,
     username: Optional[str],
@@ -326,20 +475,41 @@ def check_reserved_keywords(
 
     Plain patterns support `*` wildcards at the start/end — see
     _match_wildcard_pattern for the rules.
+
+    Regex patterns are matched against the FOLDED subject as well as being
+    time-bounded. Previously they ran against raw text while literal keywords
+    folded, which made the regex form strictly weaker than the identical
+    literal: Cyrillic "аdmin" was caught by the keyword `admin` and missed by
+    the regex `admin`.
     """
     if not keywords:
         return None
-    texts = [t for t in [full_name, username, bio] if t]
+    raw_texts = [t for t in [full_name, username, bio] if t]
+    if not raw_texts:
+        return None
+
+    # One budget for the whole call: per-pattern timeouts multiply across
+    # patterns x subjects, and a group can have dozens of keywords.
+    deadline = time.monotonic() + REGEX_MATCH_BUDGET
+    folded_texts = None
+
     for kw in keywords:
         pattern = kw["pattern"]
-        for text in texts:
-            if kw["is_regex"]:
-                try:
-                    if re.search(pattern, text, re.IGNORECASE):
-                        return pattern
-                except re.error:
-                    pass  # bad regex — skip silently
-            else:
+        if kw["is_regex"]:
+            if folded_texts is None:
+                folded_texts = [_subject_for_regex(t) for t in raw_texts]
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "Regex keyword budget exhausted; remaining patterns were not "
+                    "evaluated for this user.",
+                    extra={"patterns_total": len(keywords)},
+                )
+                return None
+            for subject in folded_texts:
+                if subject and _regex_hits(pattern, subject, deadline):
+                    return pattern
+        else:
+            for text in raw_texts:
                 if _match_wildcard_pattern(pattern, text):
                     return pattern
     return None
