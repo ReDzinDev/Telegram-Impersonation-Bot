@@ -77,10 +77,27 @@ def test_non_admin_of_the_target_is_refused():
     assert "admin" in err.lower()
 
 
-def test_a_group_is_not_a_valid_log_channel():
-    ok, err = _verify(_Bot(chat_type=ChatType.SUPERGROUP))
+def test_a_group_is_a_valid_log_destination():
+    """
+    Deliberately changed. This test used to assert the opposite, pinning a
+    channel-only restriction that came from the audit's belt-and-braces
+    suggestion rather than from any security requirement — and which broke using
+    a private group as the log destination. The rights check above is what makes
+    binding safe, and it applies to a group exactly as it does to a channel.
+    """
+    for chat_type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        ok, err = _verify(_Bot(chat_type=chat_type))
+        assert ok is True, f"{chat_type} rejected: {err}"
+
+
+def test_a_private_chat_is_not_a_valid_log_destination():
+    """
+    The type gate that does survive. A DM has no admins, so the rights check
+    that stops you redirecting alerts elsewhere has nothing to evaluate.
+    """
+    ok, err = _verify(_Bot(chat_type=ChatType.PRIVATE))
     assert ok is False
-    assert "channel" in err.lower()
+    assert err
 
 
 def test_unreadable_membership_is_refused_not_assumed():

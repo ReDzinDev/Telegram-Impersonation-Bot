@@ -319,6 +319,33 @@ async def _fetch_group_pfp_hash(bot, chat) -> str | None:
     return None
 
 
+# Chat types usable as a log destination. Private chats are excluded because
+# they have no admins, so the "are you an admin of the target?" check that stops
+# you redirecting alerts into someone else's chat cannot be applied there.
+_VALID_LOG_TARGET_TYPES = (ChatType.CHANNEL, ChatType.GROUP, ChatType.SUPERGROUP)
+
+
+def log_target_warning(group_id: int, target_id: int) -> str:
+    """
+    A caveat to append to the binding confirmation, or "" if there is nothing to
+    say.
+
+    Allowing a group as a log destination makes the MONITORED group a valid
+    choice too — and then the person being flagged reads their own detection
+    alert, and sees the member list that /clearwhitelist posts as a CSV. That is
+    worth telling the admin about; it is not worth blocking, because an operator
+    may deliberately want alerts visible in-channel.
+    """
+    if group_id == target_id:
+        return (
+            "\n\n⚠️ Alerts will post into the <b>same group</b> being monitored, "
+            "so flagged users will see their own detection alert - and the "
+            "member CSV that /clearwhitelist posts. Use a separate private "
+            "channel or group if you do not want that."
+        )
+    return ""
+
+
 async def _verify_log_channel_target(
     context: ContextTypes.DEFAULT_TYPE, channel_id: int, user_id: int
 ) -> tuple[bool, str | None]:
@@ -334,6 +361,12 @@ async def _verify_log_channel_target(
     user's id, username and name. Rights on the target are what authorise the
     binding, so we check them on the target, not on the group.
 
+    A channel, group or supergroup may all be used. The rights check is what
+    makes this safe and it applies identically to each, so the type only has to
+    be something with admins. An earlier version of this function accepted
+    channels ONLY — belt-and-braces that served no security purpose and broke a
+    perfectly ordinary setup, namely a private group as the log destination.
+
     Fails closed: if the chat or the membership can't be read, refuse. The
     chat_is_channel flag on a chat_shared payload is a client-side hint and is
     not trusted, so the type is verified server-side here.
@@ -341,32 +374,36 @@ async def _verify_log_channel_target(
     try:
         chat = await context.bot.get_chat(channel_id)
     except Exception as e:
-        logger.warning(f"Log-channel target {channel_id} unreadable: {e}")
+        logger.warning(f"Log-target {channel_id} unreadable: {e}")
         return False, (
-            f"❌ Could not read <code>{channel_id}</code>. Add the bot to that "
-            "channel as an admin first."
+            f"❌ Could not read <code>{channel_id}</code>. Add the bot there as "
+            "an admin first."
         )
 
-    if getattr(chat, "type", None) != ChatType.CHANNEL:
+    chat_type = getattr(chat, "type", None)
+    if chat_type not in _VALID_LOG_TARGET_TYPES:
+        # A private chat is excluded because it has no admins, so the rights
+        # check below — the thing that stops you redirecting alerts into someone
+        # else's chat — has nothing to check.
         return False, (
-            "❌ That isn't a channel. A log channel must be a Telegram channel — "
-            "pick one, or create one and add the bot as an admin."
+            "❌ That has to be a channel, group or supergroup. A private chat "
+            "can't be used as a log destination."
         )
 
     try:
         member = await context.bot.get_chat_member(channel_id, user_id)
     except Exception as e:
         logger.warning(
-            f"Could not verify {user_id}'s rights in log-channel target {channel_id}: {e}"
+            f"Could not verify {user_id}'s rights in log-target {channel_id}: {e}"
         )
         return False, (
-            "❌ Could not verify your rights in that channel. You must be an "
-            "admin there to send this group's alerts to it."
+            "❌ Could not verify your rights there. You must be an admin of the "
+            "destination to send this group's alerts to it."
         )
 
     if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
         return False, (
-            "❌ You must be an admin of that channel to point this group's "
+            "❌ You must be an admin of the destination to point this group's "
             "alerts at it."
         )
 
@@ -500,8 +537,10 @@ async def handle_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(msg, parse_mode="HTML")
         return
 
-    # ── request_id=2: log channel picker ─────────────────────────────────────
-    if request_id == 2:
+    # ── request_id 2 (channel) / 3 (group): log destination picker ───────────
+    # Two ids because KeyboardButtonRequestChat's chat_is_channel is a single
+    # bool, so one button cannot mean "either". Both bind identically.
+    if request_id in (2, 3):
         # Resolve the group we're configuring
         g_id    = context.user_data.get("active_group_id")
         g_title = context.user_data.get("active_group_title", str(g_id) if g_id else "?")
@@ -558,8 +597,9 @@ async def handle_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
         await update.message.reply_text(
-            f"✅ Log channel set to <b>{html.escape(channel_title)}</b> "
-            f"(<code>{chat_id}</code>) for <b>{html.escape(g_title)}</b>.",
+            f"✅ Log destination set to <b>{html.escape(channel_title)}</b> "
+            f"(<code>{chat_id}</code>) for <b>{html.escape(g_title)}</b>."
+            + log_target_warning(g_id, chat_id),
             parse_mode="HTML",
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -1312,20 +1352,40 @@ async def set_log_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group_id, group_title = ctx
 
     if not context.args:
-        # In private chat: offer the channel picker button for easy selection
+        # In private chat: offer picker buttons for easy selection.
+        #
+        # Two buttons, not one: KeyboardButtonRequestChat's chat_is_channel is a
+        # single bool, so a button cannot mean "a channel OR a group". Both bind
+        # the same way — see handle_chat_shared, which dispatches ids 2 and 3
+        # through identical logic.
         if update.effective_chat.type == ChatType.PRIVATE:
-            keyboard = [[KeyboardButton(
-                "Select log channel",
-                request_chat=KeyboardButtonRequestChat(
-                    request_id=2,
-                    chat_is_channel=True,
-                    bot_is_member=True,
-                ),
-            )]]
+            keyboard = [
+                [KeyboardButton(
+                    "Select log channel",
+                    request_chat=KeyboardButtonRequestChat(
+                        request_id=2,
+                        chat_is_channel=True,
+                        bot_is_member=True,
+                    ),
+                )],
+                [KeyboardButton(
+                    "Select log group",
+                    request_chat=KeyboardButtonRequestChat(
+                        request_id=3,
+                        chat_is_channel=False,
+                        bot_is_member=True,
+                    ),
+                )],
+            ]
             await update.message.reply_text(
-                "Pick the channel you want to use as the log channel for "
-                f"<b>{html.escape(group_title)}</b>.\n\n"
-                "The bot must already be an admin in that channel.",
+                "Pick where alerts for "
+                f"<b>{html.escape(group_title)}</b> should go — a channel or a "
+                "group, whichever suits you.\n\n"
+                "The bot must already be a member there, and you must be an "
+                "admin of it.\n\n"
+                "<i>Everyone who can see that chat will see the detection "
+                "alerts, so a private destination is usually the right "
+                "choice.</i>",
                 parse_mode="HTML",
                 reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
             )
@@ -1382,7 +1442,9 @@ async def set_log_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Could not save that — the database rejected the write (the group may not be registered, or the DB is unavailable). Nothing was changed; try again.")
         return
     await update.message.reply_text(
-        f"✅ Log channel set to <code>{channel_id}</code>.", parse_mode="HTML"
+        f"✅ Log destination set to <code>{channel_id}</code>."
+        + log_target_warning(group_id, channel_id),
+        parse_mode="HTML",
     )
 
 

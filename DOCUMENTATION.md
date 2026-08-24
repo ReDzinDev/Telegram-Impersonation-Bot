@@ -316,7 +316,7 @@ listed as an admin with no rights is not enough to drive the bot's ban powers.
 | --- | --- |
 | `/setaction ban\|kick\|alert` | What happens when an impersonator is detected. Default `ban`. |
 | `/setthreshold 85` | Fuzzy-match sensitivity, 50–100. Default 85. Lower = more detections (more false positives). |
-| `/setlogchannel` | Pick the per-group log channel. In DM, opens a chat-picker button. In a group, accepts `/setlogchannel -100…` or `/setlogchannel clear` to fall back to the global env. |
+| `/setlogchannel` | Set where this group's alerts go — a **channel, group or supergroup**. In DM you get two picker buttons (one for channels, one for groups) because Telegram's chat-request button can only offer one kind at a time. You must be an admin of the destination, and the bot must be a member of it. `clear` reverts to the global `LOG_CHANNEL_ID`. |
 | `/addkeyword admin, *mod*, r:official.*ceo` | Add one or more keywords. Comma-separated; supports `*` wildcards and `r:` regex. See [§13 Keyword Syntax](#13-keyword-syntax). |
 | `/removekeyword admin` | Remove a single keyword by exact pattern. |
 | `/listkeywords` | List all reserved keywords for the active group. |

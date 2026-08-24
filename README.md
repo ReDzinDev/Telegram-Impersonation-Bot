@@ -72,7 +72,7 @@ When a detection fires, the log channel alert shows inline buttons. After a ban/
 | `/setaction ban\|kick\|alert` | Set detection action |
 | `/setthreshold 85` | Fuzzy sensitivity 50–100 (default 85) |
 | `/addkeyword admin, *mod*, r:official.*ceo` | Add keywords — commas, `*` wildcards, and `r:` regex all supported |
-| `/setlogchannel` | Pick a per-group log channel via the channel picker |
+| `/setlogchannel` | Pick where alerts go — a channel **or** a group. DM the bot for picker buttons, or pass an ID. |
 | `/stats` | Stats with All-time / 30d / 7d breakdown |
 | `/logs` | Recent detections + admin actions in one reply |
 | `/clearwhitelist confirm` | ⚠️ Wipe the entire whitelist (posts a CSV backup first) |
@@ -114,7 +114,7 @@ For real-time profile-change detection and sweeps, set the three Pyrogram env va
 
 | Variable | Default | Notes |
 |---|---|---|
-| `LOG_CHANNEL_ID` | — | Global fallback log channel. Per-group channels set with `/setlogchannel` take precedence. Retention (`purge_old_records`) currently runs from the daily-summary task, which only starts when this is set. |
+| `LOG_CHANNEL_ID` | — | Global fallback log destination (a channel or group). Per-group destinations set with `/setlogchannel` take precedence. Retention (`purge_old_records`) currently runs from the daily-summary task, which only starts when this is set. |
 | `BLOCKLIST_TRUSTED_GROUPS` | *(empty)* | Comma-separated group IDs whose manual bans may propagate to other groups. **Empty means propagation is off** — pre-existing blocklist entries degrade to alert-only. Set this to your own group IDs to enable it. |
 
 **Watcher (MTProto)** — needed for real-time profile-change detection and `/sweep`

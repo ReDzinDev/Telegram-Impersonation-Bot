@@ -261,7 +261,7 @@ BOT_COMMANDS = [
     BotCommand("unban",           "Unban a user by ID"),
     BotCommand("sweep",           "Run a full member scan"),
     BotCommand("setaction",       "Set detection action: ban, kick, or alert"),
-    BotCommand("setlogchannel",   "Set per-group log channel"),
+    BotCommand("setlogchannel",   "Set where alerts go (channel or group)"),
     BotCommand("stats",           "Show stats: all-time / 30d / 7d"),
     BotCommand("addkeyword",      "Add keyword(s) — supports *wildcards*, commas, r:regex"),
     BotCommand("removekeyword",   "Remove a reserved keyword"),
