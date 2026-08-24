@@ -1,0 +1,1 @@
+Catches users impersonating your admins, VIPs or the group itself — by name, @handle or profile photo.
