@@ -4,6 +4,35 @@ Automatically detects and removes users who impersonate admins, VIPs, or the gro
 
 ---
 
+## Capability rundown
+
+*Checked against the code on 2026-10-19 (`main` @ `6e14d81`).*
+
+**What it does**
+
+- **Protects identities.** It flags accounts whose username, display name, profile photo or bio imitates a protected identity: a whitelisted admin or VIP, an external name added with `/protect`, or the group's own name and logo. It also flags reserved keywords such as "Admin" or "Support", including wildcards and regex.
+- **Checks people at four moments.** On join, on their first message, on a profile change (rename or photo swap), and in a full member sweep every 24 h or on demand with `/sweep`.
+- **Acts according to confidence.** Each group picks `ban`, `kick` or `alert`. Severity bands (`/setbands`) then decide whether a given match runs that action, only alerts, or is ignored.
+- **Lets admins reverse a decision.** Every detection posts to a log channel or group with buttons (Unban + Whitelist, Unban with a 30-day grace period, Dismiss, and Ban/Kick when the group is in alert mode). It also posts a daily summary at midnight UTC, but only when `LOG_CHANNEL_ID` is set.
+- **Keeps the whitelist current.** `/import_admins` seeds it, and newly promoted admins are whitelisted automatically.
+- **Can share bans across groups.** A cross-group blocklist lets a manual `/ban` in a *trusted* group (`BLOCKLIST_TRUSTED_GROUPS`) carry over to other protected groups. From any other group, it only raises an alert.
+- **Handles many groups from one instance.** Each group has its own settings, managed from a private DM with the bot.
+
+**What it does NOT do**
+
+- **It doesn't moderate content.** It never inspects or stores message text or captions, and it doesn't filter spam, floods, links or scams in messages.
+- **No CAPTCHA or join gate.** It judges identity, not whether the user is human.
+- **It can't see DMs.** If an impersonator gets through and messages members privately, the bot doesn't know.
+- **Commands don't work in group chat.** They work only in a private DM with the bot.
+- **Some features need the watcher.** Real-time profile-change detection, bio checks and sweeps all require the MTProto watcher account (`PYROGRAM_*`), and that account must be a member of every group it sweeps. Without it, only the join and message checks run.
+- **It doesn't retry a failed ban.** If the bot lacks the Ban Members permission or Telegram rejects the call, the result is logged as `ban_failed` and left there.
+- **It runs as a single instance.** Group-picker state is held in local `PicklePersistence`.
+- **No Discord support.** It's Telegram only.
+
+See [`PRIVACY.md`](PRIVACY.md) for exactly what personal data is stored and for how long.
+
+---
+
 ## What It Catches
 
 | Check | Signal |
@@ -82,6 +111,8 @@ When a detection fires, the log channel alert shows inline buttons. After a ban/
 | `/setbands 90 78` | Severity bands: ban at/above 90, alert at/above 78, ignore below |
 | `/blocklist on\|off` | Opt this group in or out of the cross-group blocklist |
 | `/protect "Some Name"` | Protect an external identity by name (optionally with a photo) |
+| `/ban` / `/unban` | Manually ban (reply or ID) or unban by ID. A `/ban` in a trusted group feeds the cross-group blocklist |
+| `/removekeyword` / `/listkeywords` | Remove a reserved keyword / list them all |
 
 All commands work from a **private DM** with the bot — select a group via the picker, then manage it without posting in the group chat.
 
