@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-DOC_FILES = ["README.md", "OVERVIEW.md", "DOCUMENTATION.md", "INTERNAL_DOCS.md"]
+DOC_FILES = ["README.md", "OVERVIEW.md", "DOCUMENTATION.md"]
 
 
 def _docs_text() -> str:

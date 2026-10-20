@@ -586,10 +586,9 @@ There is no separate migration tool (Alembic, etc.) — the bot is small enough 
 - **No global whitelist.** Each group maintains its own. There's no way to share a whitelist across groups.
 - **Bio scanning requires Pyrogram.** The Bot API doesn't expose user bios — only the MTProto client can read them.
 - **PFP is a tiebreaker, not a primary signal.** A matching photo alone never triggers a ban (except for group-identity matches, which also require a weak name match).
-- **Seen-cache is persistent.** A user who passed their initial check won't be re-scanned via messages until either the Pyrogram watcher resets their `seen` flag (profile change) or the 6 h sweep runs.
+- **Seen-cache is persistent.** A user who passed their initial check won't be re-scanned via messages until either the Pyrogram watcher resets their `seen` flag (profile change) or the periodic sweep runs (`SWEEP_INTERVAL_HOURS`, default 24 h).
 - **Sweep requires the Pyrogram session to be a member of the target group.** The MTProto API enumerates members from a participant's perspective.
 - **False-positive grace expires.** After 30 days, detection resumes. Re-clear them or whitelist them properly if needed.
-- **Per-call DB connections.** Each DB-touching function opens a fresh connection. Fine at current load; future versions may add a connection pool.
 - **PicklePersistence is local-disk.** If you run multiple bot instances behind a load balancer, group-picker state will desync. Single-instance deployment is assumed.
 
 ---
@@ -618,7 +617,7 @@ There is no separate migration tool (Alembic, etc.) — the bot is small enough 
 | --- | --- | --- |
 | `python-telegram-bot` | v21+ | Bot API client, command handlers, message handlers, `CallbackQueryHandler`, persistence |
 | `pyrogram` | v2+ | MTProto userbot — profile-change events, member enumeration |
-| `psycopg` | v3 | PostgreSQL driver (synchronous; one connection per call) |
+| `psycopg` | v3 | PostgreSQL driver (synchronous, via a process-wide `psycopg_pool` connection pool) |
 | `rapidfuzz` | latest | Fuzzy string similarity (`fuzz.ratio`, `fuzz.token_sort_ratio`) |
 | `Pillow` + `imagehash` | latest | Perceptual profile-photo hashing (`phash`) |
 | `confusable_homoglyphs` | latest | Unicode lookalike detection |
@@ -719,7 +718,6 @@ where an admin actually needs them.
 ├── DOCUMENTATION.md          ← this file
 ├── OVERVIEW.md               ← short user-facing pitch
 ├── README.md                 ← quick-start setup
-├── INTERNAL_DOCS.md          ← older technical notes; THIS file is canonical
 ├── Dockerfile
 ├── docker-compose.yml        ← LOCAL dev only; see Local development below
 ├── .env.dev.example          ← template for the above (the real .env is prod)
