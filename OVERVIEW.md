@@ -86,4 +86,4 @@ One bot instance covers unlimited groups. Each group has completely independent 
 5. Point it at a private log channel
 6. Done
 
-Full technical documentation: [`INTERNAL_DOCS.md`](INTERNAL_DOCS.md)
+Full technical documentation: [`DOCUMENTATION.md`](DOCUMENTATION.md)

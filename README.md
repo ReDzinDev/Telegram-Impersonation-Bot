@@ -230,5 +230,4 @@ The watcher account must also be a **member of each group** you want swept;
 
 For full architecture, database schema, detection internals, and operational
 details → see [`DOCUMENTATION.md`](DOCUMENTATION.md), which is the canonical
-reference. [`INTERNAL_DOCS.md`](INTERNAL_DOCS.md) covers similar ground and is
-kept for its internals detail.
+reference.
