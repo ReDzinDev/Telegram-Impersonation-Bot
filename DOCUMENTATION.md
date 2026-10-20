@@ -60,7 +60,7 @@ The bot is a single Python process that runs **two Telegram clients concurrently
 
 State lives in **PostgreSQL** (psycopg v3). Hot reads (whitelist, group config, keywords, false-positive grace) are cached in-process; every cache is invalidated immediately on the relevant admin write.
 
-The process is deployed on **Railway** with Docker (see `Dockerfile`, `start.sh`, `railway.json`). A built-in keep-alive task pings Postgres every 270 seconds so Railway's Hobby plan doesn't put the DB to sleep between bursts of activity.
+The process is deployed on **Railway** with Docker (see `Dockerfile`, `railway.json`). A built-in keep-alive task pings Postgres every 270 seconds so Railway's Hobby plan doesn't put the DB to sleep between bursts of activity.
 
 ---
 
@@ -622,7 +622,7 @@ There is no separate migration tool (Alembic, etc.) — the bot is small enough 
 | `Pillow` + `imagehash` | latest | Perceptual profile-photo hashing (`phash`) |
 | `confusable_homoglyphs` | latest | Unicode lookalike detection |
 
-Python 3.11+. Deployed on Railway via Docker; see `Dockerfile`, `start.sh`, `railway.json`.
+Python 3.11+. Deployed on Railway via Docker; see `Dockerfile` and `railway.json`.
 
 ---
 
@@ -722,7 +722,6 @@ where an admin actually needs them.
 ├── docker-compose.yml        ← LOCAL dev only; see Local development below
 ├── .env.dev.example          ← template for the above (the real .env is prod)
 ├── railway.json
-├── start.sh
 ├── requirements.txt
 ├── run.py                    ← entry point: asyncio.run(main())
 └── src/
